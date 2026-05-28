@@ -3,7 +3,7 @@
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import '../services/connection_manager.dart';
-import '../services/ws_client.dart';
+
 import '../utils/responsive.dart';
 import 'chat_screen.dart';
 import 'settings_screen.dart';
@@ -59,8 +59,8 @@ class _SessionListScreenState extends State<SessionListScreen> {
   }
 
   /// Create a new chat session via WebSocket, then navigate to it.
+  /// Create a new chat session via REST.
   Future<void> _createNewSession() async {
-    // Ask for a name first
     final nameController = TextEditingController(text: 'New Chat');
     final name = await showDialog<String>(
       context: context,
@@ -88,16 +88,9 @@ class _SessionListScreenState extends State<SessionListScreen> {
     if (name == null || !mounted) return;
 
     try {
-      // Create the session server-side via WebSocket
-      final token = await _client!.getToken(widget.connection.baseUrl);
-      final ws = WsClient(widget.connection.baseUrl, token: token);
-      await ws.connect();
-      final sessionId = await ws.createSession();
-      ws.close();
-
-      if (!mounted) return;
+      final sessionId = await _client!.restCreateSession(widget.connection.baseUrl);
+      if (sessionId.isEmpty || !mounted) return;
       await _fetchSessions();
-
       final session = Session(
         id: sessionId,
         title: name,
@@ -107,7 +100,6 @@ class _SessionListScreenState extends State<SessionListScreen> {
         preview: '',
         createdAt: DateTime.now().toIso8601String(),
       );
-
       if (!mounted) return;
       Navigator.push(
         context,
@@ -119,41 +111,10 @@ class _SessionListScreenState extends State<SessionListScreen> {
         ),
       );
     } catch (e) {
-      if (!mounted) return;
-      final errStr = e.toString();
-      // If WS is unavailable, fall back to client-side UUID with warning
-      if (errStr.contains('Connection closed') || errStr.contains('Not connected')) {
+      if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: const Text('WS unavailable — creating offline session. '
-                'Ensure dashboard is running with --tui'),
-            backgroundColor: Colors.orange,
-            duration: const Duration(seconds: 5),
-          ),
-        );
-        // Fall back to direct navigation with UUID
-        final session = Session(
-          id: '${DateTime.now().millisecondsSinceEpoch}',
-          title: name,
-          model: '',
-          messageCount: 0,
-          isActive: true,
-          preview: '',
-          createdAt: DateTime.now().toIso8601String(),
-        );
-        Navigator.push(
-          context,
-          MaterialPageRoute(
-            builder: (_) => ChatScreen(
-              connection: widget.connection,
-              session: session,
-            ),
-          ),
-        );
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Failed: $errStr'),
+            content: Text('Failed: $e'),
             backgroundColor: Colors.orange,
           ),
         );
