@@ -1,7 +1,8 @@
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:uuid/uuid.dart';
+import 'dart:async';
 import 'dart:convert';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:uuid/uuid.dart';
 import '../models/connection.dart';
 import '../models/session.dart';
 
@@ -25,15 +26,30 @@ class ConnectionManager {
     }).toList();
   }
 
-  void saveConnection(String label, String host, int port) {
+  void saveConnection(String label, String host, int port, String apiKey) {
     final conn = SavedConnection(
       id: _uuid.v4(),
       label: label,
       host: host,
       port: port,
+      apiKey: apiKey,
     );
     final current = getConnections();
     current.insert(0, conn);
+    _saveAll(current);
+  }
+
+  void updateApiKey(String connId, String apiKey) {
+    final current = getConnections();
+    final idx = current.indexWhere((c) => c.id == connId);
+    if (idx < 0) return;
+    current[idx] = SavedConnection(
+      id: current[idx].id,
+      label: current[idx].label,
+      host: current[idx].host,
+      port: current[idx].port,
+      apiKey: apiKey,
+    );
     _saveAll(current);
   }
 
@@ -51,245 +67,198 @@ class ConnectionManager {
   }
 }
 
-/// HTTP client for the Hermes dashboard REST API.
+/// HTTP client for the Hermes Gateway API Server (port 8642).
 ///
-/// Automatically discovers the ephemeral session token by fetching the
-/// dashboard SPA page (GET /) and extracting the embedded
-/// `window.__HERMES_SESSION_TOKEN__` value.
+/// Uses Bearer token auth. Same pattern as hermes-desktop.
 class ApiClient {
   final http.Client _http;
-  // Per-connection token cache: baseUrl -> token
-  final Map<String, String> _tokenCache = {};
+  final String baseUrl;
+  final String _apiKey;
 
-  ApiClient() : _http = http.Client();
+  ApiClient({required String baseUrl, required String apiKey})
+    : baseUrl = baseUrl.endsWith('/') ? baseUrl.substring(0, baseUrl.length - 1) : baseUrl,
+      _apiKey = apiKey,
+      _http = http.Client();
 
-  /// Auto-discover the session token by fetching the SPA page.
-  Future<String> _getSessionToken(String baseUrl) async {
-    final cached = _tokenCache[baseUrl];
-    if (cached != null) return cached;
+  Map<String, String> get _headers => {
+    'Authorization': 'Bearer $_apiKey',
+    'Content-Type': 'application/json',
+  };
 
-    final url = '$baseUrl/';
-    final res = await _http.get(Uri.parse(url));
-    if (res.statusCode != 200) {
-      throw Exception('HTTP ${res.statusCode} on /: ${res.body}');
-    }
+  // ── Session listing ──────────────────────────────────────────────────
 
-    // Extract window.__HERMES_SESSION_TOKEN__="..." from the <script> tag
-    final body = res.body;
-    final match = RegExp(r'window\.__HERMES_SESSION_TOKEN__="([^"]+)";').firstMatch(body);
-    if (match == null) {
-      throw Exception('Session token not found in SPA page');
-    }
-
-    final token = match.group(1)!;
-    _tokenCache[baseUrl] = token;
-    return token;
-  }
-
-  /// Public access to the session token for WebSocket auth.
-  Future<String> getToken(String baseUrl) => _getSessionToken(baseUrl);
-
-  Future<Map<String, dynamic>> apiGet(String baseUrl, String endpoint) async {
-    final token = await _getSessionToken(baseUrl);
-    final url = '$baseUrl/api/$endpoint';
-    final res = await _http.get(Uri.parse(url), headers: {
-      'X-Hermes-Session-Token': token,
-    });
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      // If we get a 401, invalidate the cached token and retry once
-      if (res.statusCode == 401) {
-        _tokenCache.remove(baseUrl);
-        final newToken = await _getSessionToken(baseUrl);
-        final retryRes = await _http.get(Uri.parse(url), headers: {
-          'X-Hermes-Session-Token': newToken,
-        });
-        if (retryRes.statusCode < 200 || retryRes.statusCode >= 300) {
-          throw Exception('HTTP ${retryRes.statusCode}: ${retryRes.body}');
-        }
-        return jsonDecode(retryRes.body) as Map<String, dynamic>;
-      }
-      throw Exception('HTTP ${res.statusCode}: ${res.body}');
-    }
-    return jsonDecode(res.body) as Map<String, dynamic>;
-  }
-
-  Future<List<Session>> getSessions(String baseUrl) async {
-    final data = await apiGet(baseUrl, 'sessions');
-    final list = data['data'] as List? ?? [];
-    return list.map((s) => Session.fromJson(s as Map<String, dynamic>)).toList();
-  }
-
-  Future<List<Map<String, dynamic>>> getMessages(String baseUrl, String sessionId) async {
-    final data = await apiGet(baseUrl, 'sessions/$sessionId/messages');
-    final list = data['data'] as List? ?? [];
-    return list.cast<Map<String, dynamic>>();
-  }
-
-  Future<Map<String, dynamic>> getModelInfo(String baseUrl) async {
-    return await apiGet(baseUrl, 'model/info');
-  }
-
-  Future<Map<String, dynamic>> getModelOptions(String baseUrl) async {
-    return await apiGet(baseUrl, 'model/options');
-  }
-
-  Future<Map<String, dynamic>> setModel(String baseUrl, String provider, String model,
-      {String scope = 'main', String task = ''}) async {
-    return await apiPost(baseUrl, 'model/set', {
-      'scope': scope,
-      'provider': provider,
-      'model': model,
-      'task': task,
-    });
-  }
-
-  Future<Map<String, dynamic>> getConfig(String baseUrl) async {
-    return await apiGet(baseUrl, 'config');
-  }
-
-  Future<List<dynamic>> getSkills(String baseUrl) async {
-    final token = await _getSessionToken(baseUrl);
-    final url = '$baseUrl/api/skills';
-    final res = await _http.get(Uri.parse(url), headers: {
-      'X-Hermes-Session-Token': token,
-    });
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('HTTP ${res.statusCode}: ${res.body}');
-    }
-    return jsonDecode(res.body) as List<dynamic>;
-  }
-
-  Future<Map<String, dynamic>> searchSessions(String baseUrl, String query) async {
-    final token = await _getSessionToken(baseUrl);
-    final encoded = Uri.encodeQueryComponent(query);
-    final url = '$baseUrl/api/sessions/search?q=$encoded';
-    final res = await _http.get(Uri.parse(url), headers: {
-      'X-Hermes-Session-Token': token,
-    });
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      if (res.statusCode == 401) {
-        _tokenCache.remove(baseUrl);
-        final newToken = await _getSessionToken(baseUrl);
-        final retryRes = await _http.get(
-          Uri.parse('$baseUrl/api/sessions/search?q=$encoded'),
-          headers: {'X-Hermes-Session-Token': newToken},
-        );
-        if (retryRes.statusCode < 200 || retryRes.statusCode >= 300) {
-          throw Exception('HTTP ${retryRes.statusCode}: ${retryRes.body}');
-        }
-        return jsonDecode(retryRes.body) as Map<String, dynamic>;
-      }
-      throw Exception('HTTP ${res.statusCode}: ${res.body}');
-    }
-    return jsonDecode(res.body) as Map<String, dynamic>;
-  }
-
-  Future<void> deleteSession(String baseUrl, String sessionId) async {
-    final token = await _getSessionToken(baseUrl);
-    final url = '$baseUrl/api/sessions/$sessionId';
-    final res = await _http.delete(Uri.parse(url), headers: {
-      'X-Hermes-Session-Token': token,
-    });
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('HTTP ${res.statusCode}: ${res.body}');
-    }
-  }
-
-  Future<Map<String, dynamic>> apiPost(String baseUrl, String endpoint, Map<String, dynamic> body) async {
-    final token = await _getSessionToken(baseUrl);
-    final url = '$baseUrl/api/$endpoint';
-    final res = await _http.post(
-      Uri.parse(url),
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Hermes-Session-Token': token,
-      },
-      body: jsonEncode(body),
+  Future<List<Session>> getSessions() async {
+    final res = await _http.get(
+      Uri.parse('$baseUrl/api/sessions'),
+      headers: _headers,
     );
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      if (res.statusCode == 401) {
-        _tokenCache.remove(baseUrl);
-        final newToken = await _getSessionToken(baseUrl);
-        final retryRes = await _http.post(
-          Uri.parse(url),
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Hermes-Session-Token': newToken,
-          },
-          body: jsonEncode(body),
-        );
-        if (retryRes.statusCode < 200 || retryRes.statusCode >= 300) {
-          throw Exception('HTTP ${retryRes.statusCode}: ${retryRes.body}');
-        }
-        return jsonDecode(retryRes.body) as Map<String, dynamic>;
-      }
+    if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
     }
-    return jsonDecode(res.body) as Map<String, dynamic>;
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final list = data['data'] as List? ?? [];
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map((s) => Session.fromJson(s))
+        .toList();
+  }
+
+  // ── Messages ─────────────────────────────────────────────────────────
+
+  Future<List<Map<String, dynamic>>> getMessages(String sessionId) async {
+    final res = await _http.get(
+      Uri.parse('$baseUrl/api/sessions/$sessionId/messages'),
+      headers: _headers,
+    );
+    if (res.statusCode != 200) {
+      throw Exception('HTTP ${res.statusCode}: ${res.body}');
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final list = data['data'] as List? ?? [];
+    return list.whereType<Map<String, dynamic>>().toList();
+  }
+
+  // ── Models ───────────────────────────────────────────────────────────
+
+  Future<List<String>> getModels() async {
+    final res = await _http.get(
+      Uri.parse('$baseUrl/v1/models'),
+      headers: _headers,
+    );
+    if (res.statusCode != 200) {
+      return ['hermes-agent'];
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final list = data['data'] as List? ?? [];
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map((m) => (m['id'] as String?) ?? 'hermes-agent')
+        .toList();
+  }
+
+  // ── Health check ─────────────────────────────────────────────────────
+
+  Future<bool> healthCheck() async {
+    try {
+      final res = await _http
+          .get(Uri.parse('$baseUrl/health'))
+          .timeout(const Duration(seconds: 5));
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
   }
 
   void close() => _http.close();
+}
 
-  /// GET that returns a JSON array (for endpoints like /api/cron/jobs).
-  Future<List<dynamic>> apiGetList(String baseUrl, String endpoint) async {
-    final token = await _getSessionToken(baseUrl);
-    final url = '$baseUrl/api/$endpoint';
-    final res = await _http.get(Uri.parse(url), headers: {
-      'X-Hermes-Session-Token': token,
-    });
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      if (res.statusCode == 401) {
-        _tokenCache.remove(baseUrl);
-        final newToken = await _getSessionToken(baseUrl);
-        final retryRes = await _http.get(Uri.parse(url), headers: {
-          'X-Hermes-Session-Token': newToken,
-        });
-        if (retryRes.statusCode < 200 || retryRes.statusCode >= 300) {
-          throw Exception('HTTP ${retryRes.statusCode}: ${retryRes.body}');
-        }
-        return jsonDecode(retryRes.body) as List<dynamic>;
-      }
-      throw Exception('HTTP ${res.statusCode}: ${res.body}');
-    }
-    return jsonDecode(res.body) as List<dynamic>;
+/// SSE streaming chat client for the Gateway API Server.
+class GatewayChatClient {
+  final ApiClient _api;
+  final String _baseUrl;
+
+  GatewayChatClient(this._api) : _baseUrl = _api.baseUrl;
+
+  /// Generate a client-side session ID: mob-<timestamp>-<uuid>
+  static String generateSessionId() {
+    return 'mob-${DateTime.now().millisecondsSinceEpoch}-${const Uuid().v4()}';
   }
 
-  /// DELETE request.
-  Future<void> apiDelete(String baseUrl, String endpoint) async {
-    final token = await _getSessionToken(baseUrl);
-    final url = '$baseUrl/api/$endpoint';
-    final res = await _http.delete(Uri.parse(url), headers: {
-      'X-Hermes-Session-Token': token,
-    });
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      if (res.statusCode == 401) {
-        _tokenCache.remove(baseUrl);
-        final newToken = await _getSessionToken(baseUrl);
-        final retryRes = await _http.delete(Uri.parse(url), headers: {
-          'X-Hermes-Session-Token': newToken,
+  /// Send a message and stream the assistant response token-by-token.
+  Future<void> sendMessageStreaming({
+    required String message,
+    required String sessionId,
+    String? model,
+    List<Map<String, dynamic>>? history,
+    required void Function(String token) onToken,
+    required void Function() onDone,
+    required void Function(String error) onError,
+  }) async {
+    final messages = <Map<String, dynamic>>[];
+    if (history != null && history.isNotEmpty) {
+      for (final msg in history) {
+        final role = (msg['role'] == 'agent' || msg['role'] == 'assistant')
+            ? 'assistant'
+            : 'user';
+        messages.add({
+          'role': role,
+          'content': msg['content'] ?? '',
         });
-        if (retryRes.statusCode < 200 || retryRes.statusCode >= 300) {
-          throw Exception('HTTP ${retryRes.statusCode}: ${retryRes.body}');
+      }
+    }
+    messages.add({'role': 'user', 'content': message});
+
+    final body = {
+      'model': model ?? 'hermes-agent',
+      'messages': messages,
+      'stream': true,
+    };
+
+    final headers = {
+      ..._api._headers,
+      'X-Hermes-Session-Id': sessionId,
+    };
+
+    try {
+      final request = http.Request('POST', Uri.parse('$_baseUrl/v1/chat/completions'));
+      request.headers.addAll(headers);
+      request.body = jsonEncode(body);
+
+      final response = await _api._http.send(request);
+
+      if (response.statusCode != 200) {
+        final errorBody = await response.stream.bytesToString();
+        String errorMsg;
+        try {
+          final err = jsonDecode(errorBody);
+          errorMsg = err['error']?['message'] ?? err['message'] ?? 'HTTP ${response.statusCode}';
+        } catch (_) {
+          errorMsg = 'HTTP ${response.statusCode}';
         }
+        onError(errorMsg);
         return;
       }
-      throw Exception('HTTP ${res.statusCode}: ${res.body}');
+
+      String buffer = '';
+      await response.stream
+          .transform(utf8.decoder)
+          .forEach((chunk) {
+        buffer += chunk;
+        while (buffer.contains('\n\n')) {
+          final eventEnd = buffer.indexOf('\n\n');
+          final event = buffer.substring(0, eventEnd);
+          buffer = buffer.substring(eventEnd + 2);
+
+          for (final line in event.split('\n')) {
+            if (line.startsWith('data: ')) {
+              final data = line.substring(6).trim();
+              if (data == '[DONE]') continue;
+
+              try {
+                final parsed = jsonDecode(data);
+                final choices = parsed['choices'] as List?;
+                if (choices != null && choices.isNotEmpty) {
+                  final delta = choices[0]['delta'];
+                  if (delta != null) {
+                    final content = delta['content'];
+                    if (content != null && content.toString().isNotEmpty) {
+                      onToken(content.toString());
+                    }
+                  }
+                }
+              } catch (_) {}
+            }
+          }
+        }
+      });
+
+      onDone();
+    } catch (e) {
+      onError(e.toString());
     }
   }
 
-  /// Create a new session via REST (POST /api/sessions).
-  Future<String> restCreateSession(String baseUrl, {String? model}) async {
-    Map<String, dynamic> body = {};
-    if (model != null) body['model'] = model;
-    final data = await apiPost(baseUrl, 'sessions', body);
-    // API returns {"object": "hermes.session", "session": {"id": "...", ...}}
-    final session = data['session'] as Map<String, dynamic>?;
-    return session?['id'] as String? ?? '';
-  }
-
-  /// Send a message to a session via REST (synchronous).
-  Future<Map<String, dynamic>> restSendMessage(
-      String baseUrl, String sessionId, String message) async {
-    return await apiPost(baseUrl, 'sessions/$sessionId/chat', {'message': message});
+  void abort() {
+    _api.close();
   }
 }
