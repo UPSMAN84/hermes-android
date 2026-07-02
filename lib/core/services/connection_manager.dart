@@ -33,6 +33,9 @@ class ConnectionManager {
     String host,
     int port,
     String apiKey, {
+    String? gatewayPrefix,
+    String? dashboardPrefix,
+    bool dashboardProxied = false,
     int? dashboardPort,
     String? dashboardUsername,
     String? dashboardPassword,
@@ -45,6 +48,9 @@ class ConnectionManager {
       port: normalized.port,
       apiKey: apiKey,
       useHttps: normalized.useHttps,
+      gatewayPrefix: gatewayPrefix,
+      dashboardPrefix: dashboardPrefix,
+      dashboardProxied: dashboardProxied,
       dashboardPortOverride: dashboardPort,
       dashboardUsername: dashboardUsername,
       dashboardPassword: dashboardPassword,
@@ -61,13 +67,25 @@ class ConnectionManager {
     int? dashboardPort,
     required String username,
     required String password,
+    String? gatewayPrefix,
+    String? dashboardPrefix,
+    bool? dashboardProxied,
   }) {
     final current = getConnections();
     final idx = current.indexWhere((c) => c.id == connId);
     if (idx < 0) return;
     final u = username.trim();
     final p = password.trim();
+    final gateway = gatewayPrefix?.trim();
+    final dashboard = dashboardPrefix?.trim();
     current[idx] = current[idx].copyWith(
+      gatewayPrefix: gateway == null || gateway.isEmpty ? null : gateway,
+      clearGatewayPrefix: gateway != null && gateway.isEmpty,
+      dashboardPrefix: dashboard == null || dashboard.isEmpty
+          ? null
+          : dashboard,
+      clearDashboardPrefix: dashboard != null && dashboard.isEmpty,
+      dashboardProxied: dashboardProxied,
       dashboardPortOverride: dashboardPort,
       clearDashboardPort: dashboardPort == null,
       dashboardUsername: u.isEmpty ? null : u,
@@ -109,11 +127,10 @@ class ApiClient {
   ApiClient({
     required String baseUrl,
     required String apiKey,
+    String pathPrefix = '',
     http.Client? httpClient,
   }) : _apiKey = apiKey,
-       baseUrl = baseUrl.endsWith('/')
-           ? baseUrl.substring(0, baseUrl.length - 1)
-           : baseUrl,
+       baseUrl = SavedConnection.joinBaseUrl(baseUrl, pathPrefix),
        _http = httpClient ?? http.Client();
 
   Map<String, String> get _headers => {
@@ -428,8 +445,11 @@ class GatewayChatClient {
 
 /// Client for the Hermes Dashboard REST API.
 ///
-/// Two auth modes, picked by whether dashboard credentials are supplied:
+/// Three auth modes, picked by proxy configuration and supplied credentials:
 ///
+///  * **Proxied dashboard** — when [proxied] is true, upstream infrastructure
+///    injects auth and the app sends clean JSON requests with no dashboard
+///    session token or cookie.
 ///  * **Password (gated) dashboard** — when [username] and [password] are set,
 ///    performs the `/auth/password-login` flow (provider `basic`) and
 ///    authenticates subsequent `/api/` calls with the returned
@@ -443,6 +463,7 @@ class GatewayChatClient {
 class DashboardClient {
   final http.Client _http;
   final String _baseUrl;
+  final bool _proxied;
   final String? _username;
   final String? _password;
   String? _token;
@@ -462,12 +483,18 @@ class DashboardClient {
     required String host,
     int port = 9119,
     bool useHttps = false,
+    String pathPrefix = '',
+    bool proxied = false,
     String? username,
     String? password,
     http.Client? httpClient,
-  }) : _baseUrl = '${useHttps ? 'https' : 'http'}://$host:$port',
+  }) : _proxied = proxied,
        _username = username,
        _password = password,
+       _baseUrl = SavedConnection.joinBaseUrl(
+         '${useHttps ? 'https' : 'http'}://$host:$port',
+         pathPrefix,
+       ),
        _http = httpClient ?? http.Client();
 
   /// Clears any cached auth state so the next request re-authenticates.
@@ -514,7 +541,9 @@ class DashboardClient {
         r'((?:__Host-|__Secure-)?hermes_session_at)=([^;,\s]+)',
       ).firstMatch(setCookie);
       if (match == null) {
-        throw Exception('Dashboard login succeeded but no session cookie found');
+        throw Exception(
+          'Dashboard login succeeded but no session cookie found',
+        );
       }
       _cookie = '${match.group(1)}=${match.group(2)}';
       return _cookie!;
@@ -546,11 +575,9 @@ class DashboardClient {
   }
 
   Future<Map<String, String>> _authHeaders() async {
+    if (_proxied) return {'Content-Type': 'application/json'};
     if (_usesPasswordAuth) {
-      return {
-        'Cookie': await _getCookie(),
-        'Content-Type': 'application/json',
-      };
+      return {'Cookie': await _getCookie(), 'Content-Type': 'application/json'};
     }
     return {
       'X-Hermes-Session-Token': await _getToken(),
