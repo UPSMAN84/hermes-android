@@ -1,8 +1,9 @@
 // Settings screen for model selection, theme toggle, and app info.
 import 'package:flutter/material.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/connection_manager.dart';
+import '../services/comfyui.dart';
+import '../services/xtts_service.dart';
 import '../../main.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
@@ -320,6 +321,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
         // ---- Section: Voice ----
         _buildSectionHeader('Voice'),
         _VoicePicker(),
+        const SizedBox(height: 8),
+        _TtsParamsCard(),
+        const SizedBox(height: 16),
+
+        // ---- Section: Media ----
+        _buildSectionHeader('Media'),
+        _ComfyUrlField(),
         const SizedBox(height: 16),
 
         // ---- Section: Connection ----
@@ -551,16 +559,25 @@ class _ThemeToggleState extends State<_ThemeToggle> {
   }
 }
 
+/// Voice settings backed by the XTTS-v2 server: server URL, speaker, and
+/// language. Speakers and languages are fetched live from the server so the
+/// dropdowns reflect what's actually installed.
 class _VoicePicker extends StatefulWidget {
   @override
   State<_VoicePicker> createState() => _VoicePickerState();
 }
 
 class _VoicePickerState extends State<_VoicePicker> {
-  final FlutterTts _tts = FlutterTts();
-  final List<Map<String, String>> _voices = [];
-  String? _selectedVoiceName;
+  final XttsService _xtts = XttsService();
+  final TextEditingController _urlController = TextEditingController();
+
+  List<String> _speakers = [];
+  List<String> _languages = [];
+  String? _selectedSpeaker;
+  String _selectedLanguage = XttsPrefs.defaultLanguage;
+
   bool _loading = true;
+  String? _error;
 
   @override
   void initState() {
@@ -568,128 +585,447 @@ class _VoicePickerState extends State<_VoicePicker> {
     _load();
   }
 
+  @override
+  void dispose() {
+    _xtts.dispose();
+    _urlController.dispose();
+    super.dispose();
+  }
+
   Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+
     final prefs = await SharedPreferences.getInstance();
-    _selectedVoiceName = prefs.getString('voice_name');
+    _urlController.text =
+        prefs.getString(XttsPrefs.baseUrl) ?? XttsPrefs.defaultBaseUrl;
+    _selectedSpeaker = prefs.getString(XttsPrefs.speaker);
+    _selectedLanguage =
+        prefs.getString(XttsPrefs.language) ?? XttsPrefs.defaultLanguage;
 
     try {
-      final raw = await _tts.getVoices;
-      if (raw is List && raw.isNotEmpty) {
-        for (final item in raw) {
-          if (item is Map) {
-            final m = <String, String>{};
-            m['name'] = (item['name'] ?? '').toString();
-            m['locale'] = (item['locale'] ?? '').toString();
-            if (m['name']!.isNotEmpty) _voices.add(m);
-          }
+      final results = await Future.wait([
+        _xtts.getSpeakers(baseUrlOverride: _urlController.text),
+        _xtts.getLanguages(baseUrlOverride: _urlController.text),
+      ]);
+      if (!mounted) return;
+      setState(() {
+        _speakers = results[0];
+        _languages = results[1];
+        // Drop a stale saved speaker that the server no longer offers.
+        if (_selectedSpeaker != null &&
+            !_speakers.contains(_selectedSpeaker)) {
+          _selectedSpeaker = null;
         }
-      }
-    } catch (_) {}
-
-    if (_voices.isEmpty) {
-      try {
-        final raw = await _tts.getLanguages;
-        final seen = <String>{};
-        if (raw is List) {
-          for (final item in raw) {
-            final lang = item.toString();
-            if (lang.isNotEmpty && seen.add(lang)) {
-              _voices.add({'name': lang, 'locale': lang});
-            }
-          }
+        if (!_languages.contains(_selectedLanguage) && _languages.isNotEmpty) {
+          _selectedLanguage = _languages.contains(XttsPrefs.defaultLanguage)
+              ? XttsPrefs.defaultLanguage
+              : _languages.first;
         }
-      } catch (_) {}
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
     }
-
-    _voices.sort(
-      (a, b) => (a['locale'] ?? '').compareTo(b['locale'] ?? ''),
-    );
-
-    if (!mounted) return;
-    setState(() => _loading = false);
   }
 
-  Future<void> _set(Map<String, String>? voice) async {
+  Future<void> _saveUrl() async {
     final prefs = await SharedPreferences.getInstance();
-    if (voice == null) {
-      await prefs.remove('voice_name');
-      await prefs.remove('voice_locale');
-      setState(() => _selectedVoiceName = null);
-    } else {
-      final name = voice['name'] ?? '';
-      final locale = voice['locale'] ?? '';
-      await prefs.setString('voice_name', name);
-      await prefs.setString('voice_locale', locale);
-      setState(() => _selectedVoiceName = name);
-    }
+    final normalized = XttsService.normalizeBaseUrl(_urlController.text);
+    await prefs.setString(XttsPrefs.baseUrl, normalized);
+    _urlController.text = normalized;
+    await _load();
   }
 
-  String _voiceLabel(Map<String, String> voice) {
-    final name = voice['name'] ?? '';
-    final locale = voice['locale'] ?? '';
-    if (name == locale) return locale;
-    final gender = name.contains('male')
-        ? '(male)'
-        : name.contains('female')
-            ? '(female)'
-            : '';
-    return '$locale $gender  [$name]';
+  Future<void> _setSpeaker(String? speaker) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (speaker == null) {
+      await prefs.remove(XttsPrefs.speaker);
+    } else {
+      await prefs.setString(XttsPrefs.speaker, speaker);
+    }
+    setState(() => _selectedSpeaker = speaker);
+  }
+
+  Future<void> _setLanguage(String? language) async {
+    if (language == null) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(XttsPrefs.language, language);
+    setState(() => _selectedLanguage = language);
   }
 
   @override
   Widget build(BuildContext context) {
-    if (_loading) {
-      return const Card(
-        child: Padding(
-          padding: EdgeInsets.all(16),
-          child: Center(child: CircularProgressIndicator()),
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // XTTS server URL + reload
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _urlController,
+                    decoration: const InputDecoration(
+                      labelText: 'XTTS server URL',
+                      hintText: 'http://0.0.0.0:8020',
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 10,
+                      ),
+                      isDense: true,
+                    ),
+                    keyboardType: TextInputType.url,
+                    autocorrect: false,
+                    onSubmitted: (_) => _saveUrl(),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.refresh),
+                  tooltip: 'Connect / reload voices',
+                  onPressed: _loading ? null : _saveUrl,
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+
+            if (_loading)
+              const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(8),
+                  child: CircularProgressIndicator(),
+                ),
+              )
+            else if (_error != null)
+              Text(
+                'Could not reach XTTS server:\n$_error',
+                style: const TextStyle(color: Colors.orange),
+              )
+            else ...[
+              // Speaker picker
+              DropdownButtonFormField<String?>(
+                initialValue: _selectedSpeaker,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'Speaker',
+                  border: OutlineInputBorder(),
+                  contentPadding: EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                ),
+                items: [
+                  const DropdownMenuItem(
+                    value: null,
+                    child: Text('None (spoken replies off)'),
+                  ),
+                  ..._speakers.map(
+                    (s) => DropdownMenuItem(
+                      value: s,
+                      child: Text(s, overflow: TextOverflow.ellipsis),
+                    ),
+                  ),
+                ],
+                onChanged: _setSpeaker,
+              ),
+              const SizedBox(height: 12),
+
+              // Language picker
+              DropdownButtonFormField<String>(
+                initialValue: _languages.contains(_selectedLanguage)
+                    ? _selectedLanguage
+                    : null,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'Language',
+                  border: OutlineInputBorder(),
+                  contentPadding: EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                ),
+                items: _languages
+                    .map(
+                      (l) => DropdownMenuItem(value: l, child: Text(l)),
+                    )
+                    .toList(),
+                onChanged: _setLanguage,
+              ),
+            ],
+          ],
         ),
-      );
+      ),
+    );
+  }
+}
+
+/// ComfyUI server URL — the app fetches generated images from its /view
+/// endpoint. Defaults to the local bind; override with a LAN/Tailscale address
+/// reachable from the phone.
+class _ComfyUrlField extends StatefulWidget {
+  @override
+  State<_ComfyUrlField> createState() => _ComfyUrlFieldState();
+}
+
+class _ComfyUrlFieldState extends State<_ComfyUrlField> {
+  final TextEditingController _urlController = TextEditingController();
+  bool _saved = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _urlController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    _urlController.text =
+        prefs.getString(ComfyUiPrefs.baseUrl) ?? ComfyUiPrefs.defaultBaseUrl;
+  }
+
+  Future<void> _save() async {
+    final prefs = await SharedPreferences.getInstance();
+    final normalized = ComfyUi.normalizeBaseUrl(_urlController.text);
+    await prefs.setString(ComfyUiPrefs.baseUrl, normalized);
+    _urlController.text = normalized;
+    if (!mounted) return;
+    setState(() => _saved = true);
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _saved = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(
+          children: [
+            Expanded(
+              child: TextField(
+                controller: _urlController,
+                decoration: const InputDecoration(
+                  labelText: 'ComfyUI server URL',
+                  hintText: 'http://0.0.0.0:8188',
+                  border: OutlineInputBorder(),
+                  contentPadding: EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 10,
+                  ),
+                  isDense: true,
+                ),
+                keyboardType: TextInputType.url,
+                autocorrect: false,
+                onSubmitted: (_) => _save(),
+              ),
+            ),
+            const SizedBox(width: 8),
+            FilledButton.icon(
+              onPressed: _save,
+              icon: Icon(_saved ? Icons.check : Icons.save),
+              label: Text(_saved ? 'Saved' : 'Save'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// XTTS generation parameters (POST /set_tts_settings). Empty field = server
+/// default. Applied before each spoken reply, so changes take effect next speak.
+class _TtsParamsCard extends StatefulWidget {
+  @override
+  State<_TtsParamsCard> createState() => _TtsParamsCardState();
+}
+
+class _TtsParamsCardState extends State<_TtsParamsCard> {
+  final _temp = TextEditingController();
+  final _lengthPenalty = TextEditingController();
+  final _repetitionPenalty = TextEditingController();
+  final _topP = TextEditingController();
+  final _topK = TextEditingController();
+  bool _saved = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    for (final c in [_temp, _lengthPenalty, _repetitionPenalty, _topP, _topK]) {
+      c.dispose();
+    }
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    _temp.text = _fmt(prefs.getDouble(XttsPrefs.temperature));
+    _lengthPenalty.text = _fmt(prefs.getDouble(XttsPrefs.lengthPenalty));
+    _repetitionPenalty.text = _fmt(prefs.getDouble(XttsPrefs.repetitionPenalty));
+    _topP.text = _fmt(prefs.getDouble(XttsPrefs.topP));
+    _topK.text = prefs.getInt(XttsPrefs.topK)?.toString() ?? '';
+    if (mounted) setState(() {});
+  }
+
+  String _fmt(double? v) => v?.toString() ?? '';
+
+  Future<void> _save() async {
+    final prefs = await SharedPreferences.getInstance();
+    double? d(String s) {
+      final t = s.trim();
+      if (t.isEmpty) return null;
+      return double.tryParse(t);
     }
 
-    if (_voices.isEmpty) {
-      return const Card(
-        child: Padding(
-          padding: EdgeInsets.all(16),
-          child: Text(
-            'No TTS voices found.\\n'
-            'Install Google Text-to-Speech and download voice data.',
-            style: TextStyle(color: Colors.grey),
-          ),
-        ),
-      );
-    }
+    final temp = d(_temp.text);
+    final lp = d(_lengthPenalty.text);
+    final rp = d(_repetitionPenalty.text);
+    final tp = d(_topP.text);
+    final tk = _topK.text.trim().isEmpty ? null : int.tryParse(_topK.text.trim());
 
-    final items = <DropdownMenuItem<Map<String, String>?>>[
-      const DropdownMenuItem(
-        value: null,
-        child: Text('Auto (device default)'),
-      ),
-      ..._voices.map(
-        (v) => DropdownMenuItem(
-          value: v,
-          child: Text(
-            _voiceLabel(v),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-        ),
-      ),
+    // Validate: non-empty but unparseable is an error.
+    final bad = [
+      if (_temp.text.trim().isNotEmpty && temp == null) 'temperature',
+      if (_lengthPenalty.text.trim().isNotEmpty && lp == null) 'length_penalty',
+      if (_repetitionPenalty.text.trim().isNotEmpty && rp == null)
+        'repetition_penalty',
+      if (_topP.text.trim().isNotEmpty && tp == null) 'top_p',
+      if (_topK.text.trim().isNotEmpty && tk == null) 'top_k',
     ];
 
-    final current = _selectedVoiceName != null
-        ? _voices.where((v) => v['name'] == _selectedVoiceName).firstOrNull
-        : null;
+    if (bad.isNotEmpty) {
+      setState(() => _error = 'Invalid number: ${bad.join(', ')}');
+      return;
+    }
 
-    return DropdownButtonFormField<Map<String, String>?>(
-      initialValue: current,
-      decoration: const InputDecoration(
-        labelText: 'Voice',
-        border: OutlineInputBorder(),
-        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+    Future<void> setDouble(String key, double? v) async {
+      if (v == null) {
+        await prefs.remove(key);
+      } else {
+        await prefs.setDouble(key, v);
+      }
+    }
+
+    await setDouble(XttsPrefs.temperature, temp);
+    await setDouble(XttsPrefs.lengthPenalty, lp);
+    await setDouble(XttsPrefs.repetitionPenalty, rp);
+    await setDouble(XttsPrefs.topP, tp);
+    if (tk == null) {
+      await prefs.remove(XttsPrefs.topK);
+    } else {
+      await prefs.setInt(XttsPrefs.topK, tk);
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _error = null;
+      _saved = true;
+    });
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _saved = false);
+    });
+  }
+
+  Widget _field(String label, TextEditingController c, String hint) {
+    return Expanded(
+      child: TextField(
+        controller: c,
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: hint,
+          border: const OutlineInputBorder(),
+          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          isDense: true,
+        ),
+        keyboardType: const TextInputType.numberWithOptions(decimal: true),
       ),
-      items: items,
-      onChanged: _set,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'Generation parameters',
+              style: TextStyle(fontWeight: FontWeight.w500),
+            ),
+            const SizedBox(height: 4),
+            const Text(
+              'Empty = server default. Applied before each reply.',
+              style: TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                _field('Temperature', _temp, '0.75'),
+                const SizedBox(width: 8),
+                _field('Length penalty', _lengthPenalty, '1.0'),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                _field('Repetition pen.', _repetitionPenalty, '5.0'),
+                const SizedBox(width: 8),
+                _field('Top P', _topP, '0.85'),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                _field('Top K', _topK, '50'),
+                const SizedBox(width: 8),
+                const Spacer(),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                FilledButton.icon(
+                  onPressed: _save,
+                  icon: Icon(_saved ? Icons.check : Icons.save),
+                  label: Text(_saved ? 'Saved' : 'Save'),
+                ),
+                if (_error != null) ...[
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Text(
+                      _error!,
+                      style: const TextStyle(color: Colors.orange, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ],
+        ),
+      ),
     );
   }
 }

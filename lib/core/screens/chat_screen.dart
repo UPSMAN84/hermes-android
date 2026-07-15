@@ -3,13 +3,15 @@
 // GET /api/sessions/{id}/messages.
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
-import 'package:flutter_tts/flutter_tts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:video_player/video_player.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
 import '../services/connection_manager.dart';
+import '../services/comfyui.dart';
+import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -41,16 +43,22 @@ class _ChatScreenState extends State<ChatScreen> {
 
   // Voice input / spoken replies
   final SpeechToText _speechToText = SpeechToText();
-  final FlutterTts _flutterTts = FlutterTts();
+  final XttsService _xtts = XttsService();
   bool _speechAvailable = false;
   bool _listening = false;
   bool _voiceReplyEnabled = true;
   bool _awaitingVoiceReply = false;
   String? _voiceStatus;
   String? _sttLocaleId;
+  // The assistant message currently being spoken by a manual replay tap.
+  // Null when idle. Compared by identity against the message maps in _messages.
+  Map<String, dynamic>? _speakingMessage;
 
   // Verbose mode
   bool _verboseMode = false;
+
+  // ComfyUI base URL — used to fetch images referenced in tool results.
+  String _comfyBaseUrl = ComfyUiPrefs.defaultBaseUrl;
 
   // Scroll management
   final _scrollController = ScrollController();
@@ -70,7 +78,14 @@ class _ChatScreenState extends State<ChatScreen> {
     _fetchMessages();
     _loadVerboseMode();
     _initVoice();
+    _loadComfyUrl();
     _scrollController.addListener(_onScroll);
+  }
+
+  Future<void> _loadComfyUrl() async {
+    final url = await ComfyUi.loadBaseUrl();
+    if (!mounted) return;
+    setState(() => _comfyBaseUrl = url);
   }
 
   Future<void> _loadVerboseMode() async {
@@ -82,7 +97,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void dispose() {
     _savedPositions[widget.session.id] = _lastPixels;
     _speechToText.cancel();
-    _flutterTts.stop();
+    _xtts.dispose();
     _client.close();
     _textController.dispose();
     _scrollController.removeListener(_onScroll);
@@ -92,26 +107,13 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _initVoice() async {
     try {
+      // Voice + language are handled by the XTTS server (see Settings → Voice).
+      // Here we only derive the speech-to-text locale from the saved language.
       final prefs = await SharedPreferences.getInstance();
-      final voiceName = prefs.getString('voice_name');
-      final voiceLocale = prefs.getString('voice_locale');
-
-      if (voiceName != null && voiceName.isNotEmpty) {
-        if (voiceName == voiceLocale) {
-          await _flutterTts.setLanguage(voiceName);
-        } else {
-          await _flutterTts.setVoice({
-            'name': voiceName,
-            'locale': voiceLocale ?? '',
-          });
-        }
-        _sttLocaleId = voiceLocale?.replaceAll('-', '_');
-      } else {
-        _sttLocaleId = null;
-      }
-      await _flutterTts.setSpeechRate(0.48);
-      await _flutterTts.setVolume(1.0);
-      await _flutterTts.setPitch(1.0);
+      final language = prefs.getString(XttsPrefs.language);
+      _sttLocaleId = (language != null && language.isNotEmpty)
+          ? language.replaceAll('-', '_')
+          : null;
 
       final available = await _speechToText.initialize(
         onStatus: _handleSpeechStatus,
@@ -175,7 +177,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     }
 
-    await _flutterTts.stop();
+    await _xtts.stop();
     if (!mounted) return;
     setState(() => _voiceStatus = 'Listening…');
     await _speechToText.listen(
@@ -208,8 +210,78 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _speakAssistantText(String text) async {
     final spokenText = text.trim();
     if (spokenText.isEmpty || !_voiceReplyEnabled) return;
-    await _flutterTts.stop();
-    await _flutterTts.speak(spokenText);
+    try {
+      await _xtts.speak(spokenText);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('TTS failed: $e'),
+          backgroundColor: Colors.orange,
+          duration: const Duration(seconds: 4),
+        ),
+      );
+    }
+  }
+
+  /// Re-speaks an assistant message on demand (the per-message replay button).
+  /// Independent of [_voiceReplyEnabled] — manual replay works even when spoken
+  /// replies are off — but requires an XTTS speaker to be configured.
+  /// Tapping the message currently speaking stops it (toggle).
+  Future<void> _replayMessage(Map<String, dynamic> msg) async {
+    // Capture before stop(): stop() fires the prior speak()'s onComplete,
+    // which clears _speakingMessage, so we must read it first to detect a toggle.
+    final wasSpeaking = identical(msg, _speakingMessage);
+
+    await _xtts.stop();
+    if (!mounted) return;
+
+    // Toggle off if this is the message that was speaking.
+    if (wasSpeaking) return;
+
+    final content = (msg['content'] as String?) ?? '';
+
+    // Need a configured speaker before we can speak.
+    final prefs = await SharedPreferences.getInstance();
+    final speaker = prefs.getString(XttsPrefs.speaker) ?? '';
+    if (speaker.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Set a voice in Settings → Voice to replay'),
+          duration: Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
+
+    // Nothing speakable in this message -> silent no-op (don't set state).
+    final dialog = XttsService.extractDialog(content);
+    final speakable =
+        dialog.isNotEmpty ? dialog : XttsService.stripForSpeech(content);
+    if (speakable.isEmpty) return;
+
+    if (!mounted) return;
+    setState(() => _speakingMessage = msg);
+
+    try {
+      await _xtts.speak(
+        content,
+        onComplete: () {
+          if (mounted) setState(() => _speakingMessage = null);
+        },
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _speakingMessage = null);
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Can\'t reach XTTS server'),
+          backgroundColor: Colors.orange,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
   }
 
   void _onScroll() {
@@ -348,7 +420,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_sending || _streaming) return;
 
     _textController.text = '';
-    _awaitingVoiceReply = speakResponse && _voiceReplyEnabled;
+    // Speak the reply whenever spoken replies are toggled on, regardless of
+    // whether the message was typed or dictated.
+    _awaitingVoiceReply = _voiceReplyEnabled;
 
     // Build conversation history for SSE request
     final history = <Map<String, dynamic>>[];
@@ -610,7 +684,7 @@ class _ChatScreenState extends State<ChatScreen> {
               onPressed: () {
                 setState(() => _voiceReplyEnabled = !_voiceReplyEnabled);
                 if (!_voiceReplyEnabled) {
-                  _flutterTts.stop();
+                  _xtts.stop();
                 }
               },
               tooltip: _voiceReplyEnabled
@@ -673,14 +747,21 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     // Build display list: consecutive tool messages grouped into cards,
-    // interleaved with user/assistant bubbles.
+    // interleaved with user/assistant bubbles. Images rendered by the ComfyUI
+    // tool are detected by filename in the tool content and shown inline.
     final toolQueue = List<Map<String, dynamic>>.from(_toolMessages);
     final displayMessages = <dynamic>[];
     final currentGroup = <Map<String, dynamic>>[];
+    final groupImages = <String>{};
 
     for (final msg in _messages) {
       final role = (msg['role'] as String?) ?? 'assistant';
       if (role == 'tool') {
+        // Harvest generated-image filenames from the raw tool content.
+        final raw = (msg['content'] as String?) ?? '';
+        for (final name in ComfyUi.extractMediaFilenames(raw)) {
+          groupImages.add(ComfyUi.viewUrl(_comfyBaseUrl, name));
+        }
         if (toolQueue.isNotEmpty) {
           currentGroup.add(toolQueue.removeAt(0));
         }
@@ -694,10 +775,17 @@ class _ChatScreenState extends State<ChatScreen> {
         displayMessages.add(currentGroup.toList());
         currentGroup.clear();
       }
+      if (groupImages.isNotEmpty) {
+        displayMessages.add(groupImages.toList());
+        groupImages.clear();
+      }
       displayMessages.add(msg);
     }
     if (currentGroup.isNotEmpty) {
       displayMessages.add(currentGroup.toList());
+    }
+    if (groupImages.isNotEmpty) {
+      displayMessages.add(groupImages.toList());
     }
 
     // Tools from SSE events that arrived during streaming but haven't been
@@ -717,6 +805,11 @@ class _ChatScreenState extends State<ChatScreen> {
           return _ToolProgressCard(items: item, verbose: _verboseMode);
         }
 
+        if (item is List<String>) {
+          // Generated media (images/videos) extracted from tool results.
+          return _MediaRow(urls: item);
+        }
+
         final msg = item as Map<String, dynamic>;
         final role = (msg['role'] as String?) ?? 'assistant';
         final content = (msg['content'] as String?) ?? '';
@@ -727,6 +820,8 @@ class _ChatScreenState extends State<ChatScreen> {
           isUser: isUser,
           verbose: _verboseMode,
           metadata: msg,
+          isSpeaking: identical(msg, _speakingMessage),
+          onReplay: isUser ? null : () => _replayMessage(msg),
         );
       },
     );
@@ -738,12 +833,16 @@ class _MessageBubble extends StatelessWidget {
   final bool isUser;
   final bool verbose;
   final Map<String, dynamic> metadata;
+  final bool isSpeaking;
+  final VoidCallback? onReplay;
 
   const _MessageBubble({
     required this.content,
     required this.isUser,
     this.verbose = false,
     this.metadata = const {},
+    this.isSpeaking = false,
+    this.onReplay,
   });
 
   @override
@@ -877,6 +976,24 @@ class _MessageBubble extends StatelessWidget {
                     ),
             ),
           ),
+          // Per-message TTS replay (assistant messages only).
+          if (!isUser && onReplay != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: IconButton(
+                  padding: EdgeInsets.zero,
+                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
+                  icon: Icon(
+                    isSpeaking ? Icons.stop_rounded : Icons.volume_up_rounded,
+                  ),
+                  tooltip: isSpeaking ? 'Stop' : 'Replay',
+                  color: isDark ? Colors.white54 : Colors.black45,
+                  onPressed: onReplay,
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -953,6 +1070,205 @@ class _ToolProgressCard extends StatelessWidget {
             ),
         ],
       ),
+    );
+  }
+}
+
+/// A column of generated media (images and/or videos) from tool results.
+class _MediaRow extends StatelessWidget {
+  final List<String> urls;
+  const _MediaRow({required this.urls});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: urls.map((u) {
+        final filename = Uri.parse(u).queryParameters['filename'] ?? '';
+        return ComfyUi.isVideo(filename)
+            ? _VideoBubble(url: u)
+            : _ImageBubble(url: u);
+      }).toList(),
+    );
+  }
+}
+
+/// One generated image, fetched from ComfyUI's /view endpoint. Tappable to
+/// open full-screen with pinch-zoom.
+class _ImageBubble extends StatelessWidget {
+  final String url;
+  const _ImageBubble({required this.url});
+
+  @override
+  Widget build(BuildContext context) {
+    final maxW = MediaQuery.of(context).size.width - 80;
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      constraints: BoxConstraints(maxWidth: maxW),
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(18),
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      ),
+      child: GestureDetector(
+        onTap: () => _openFull(context),
+        child: Image.network(
+          url,
+          fit: BoxFit.contain,
+          loadingBuilder: (context, child, progress) {
+            if (progress == null) return child;
+            final total = progress.expectedTotalBytes;
+            return SizedBox(
+              height: 160,
+              child: Center(
+                child: CircularProgressIndicator(
+                  value: total != null && total > 0
+                      ? progress.cumulativeBytesLoaded / total
+                      : null,
+                ),
+              ),
+            );
+          },
+          errorBuilder: (context, _, _) => const SizedBox(
+            height: 80,
+            child: Center(
+              child: Text(
+                'image unavailable',
+                style: TextStyle(color: Colors.grey),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _openFull(BuildContext context) {
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => Scaffold(
+          backgroundColor: Colors.black,
+          appBar: AppBar(backgroundColor: Colors.black),
+          body: SafeArea(
+            child: Center(
+              child: InteractiveViewer(child: Image.network(url)),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// One generated video, streamed from ComfyUI's /view endpoint. Tap toggles
+/// play/pause; initialized paused so clips don't all autoplay at once.
+class _VideoBubble extends StatefulWidget {
+  final String url;
+  const _VideoBubble({required this.url});
+
+  @override
+  State<_VideoBubble> createState() => _VideoBubbleState();
+}
+
+class _VideoBubbleState extends State<_VideoBubble> {
+  VideoPlayerController? _controller;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _init();
+  }
+
+  Future<void> _init() async {
+    final c = VideoPlayerController.networkUrl(Uri.parse(widget.url));
+    try {
+      await c.initialize();
+      if (!mounted) {
+        c.dispose();
+        return;
+      }
+      setState(() => _controller = c);
+    } catch (_) {
+      if (mounted) setState(() => _failed = true);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final maxW = MediaQuery.of(context).size.width - 80;
+    Widget body;
+    if (_failed) {
+      body = const SizedBox(
+        height: 100,
+        child: Center(
+          child: Text('video unavailable', style: TextStyle(color: Colors.grey)),
+        ),
+      );
+    } else if (_controller == null) {
+      body = const SizedBox(
+        height: 160,
+        child: Center(child: CircularProgressIndicator()),
+      );
+    } else {
+      final c = _controller!;
+      final aspect = c.value.aspectRatio;
+      body = GestureDetector(
+        onTap: () => setState(() {
+          c.value.isPlaying ? c.pause() : c.play();
+        }),
+        child: Stack(
+          alignment: Alignment.center,
+          children: [
+            AspectRatio(aspectRatio: aspect, child: VideoPlayer(c)),
+            if (!c.value.isPlaying)
+              Container(
+                decoration: const BoxDecoration(
+                  color: Colors.black54,
+                  shape: BoxShape.circle,
+                ),
+                padding: const EdgeInsets.all(12),
+                child: const Icon(
+                  Icons.play_arrow,
+                  color: Colors.white,
+                  size: 32,
+                ),
+              ),
+            // progress bar
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              child: VideoProgressIndicator(
+                c,
+                allowScrubbing: true,
+                colors: const VideoProgressColors(
+                  playedColor: Colors.white,
+                  bufferedColor: Colors.white38,
+                  backgroundColor: Colors.white24,
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+      constraints: BoxConstraints(maxWidth: maxW),
+      clipBehavior: Clip.antiAlias,
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(18),
+        color: Colors.black,
+      ),
+      child: body,
     );
   }
 }

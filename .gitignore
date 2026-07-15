@@ -49,3 +49,5 @@ app.*.map.json
 # Local keystore properties
 /key.properties
 /release.keystore
+/hermes-release.jks
+*.jks
