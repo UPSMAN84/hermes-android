@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'core/services/connection_manager.dart';
@@ -7,6 +8,25 @@ import 'core/utils/responsive.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Foreground service used by phone-call-mode to keep the voice loop alive
+  // when the app is backgrounded / screen locks.
+  FlutterForegroundTask.initCommunicationPort();
+  FlutterForegroundTask.init(
+    androidNotificationOptions: AndroidNotificationOptions(
+      channelId: 'hermes_call',
+      channelName: 'Hermes Call',
+      channelDescription: 'Shown during an active Hermes voice call.',
+      onlyAlertOnce: true,
+    ),
+    iosNotificationOptions: const IOSNotificationOptions(),
+    foregroundTaskOptions: ForegroundTaskOptions(
+      eventAction: ForegroundTaskEventAction.nothing(),
+      autoRunOnBoot: false,
+      autoRunOnMyPackageReplaced: false,
+      allowWakeLock: true,
+      allowWifiLock: true,
+    ),
+  );
   final prefs = await SharedPreferences.getInstance();
   final connManager = ConnectionManager(prefs);
   runApp(HermesApp(connManager: connManager));

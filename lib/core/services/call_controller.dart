@@ -3,6 +3,7 @@
 // (XTTS) -> listen again, until hang-up. State machine exposed as [CallState]
 // for the call screen to render.
 import 'package:flutter/foundation.dart';
+import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
@@ -10,6 +11,26 @@ import 'package:speech_to_text/speech_to_text.dart';
 
 import 'connection_manager.dart';
 import 'xtts_service.dart';
+
+/// Entry point for the foreground-service task isolate. The call's actual loop
+/// runs in the main isolate; this handler just lets the service exist
+/// (notification + foreground status + wake lock) so background mic access and
+/// playback keep working. It does no repetitive work.
+@pragma('vm:entry-point')
+void callTaskStartCallback() {
+  FlutterForegroundTask.setTaskHandler(_CallTaskHandler());
+}
+
+class _CallTaskHandler extends TaskHandler {
+  @override
+  Future<void> onStart(DateTime timestamp, TaskStarter starter) async {}
+
+  @override
+  void onRepeatEvent(DateTime timestamp) {}
+
+  @override
+  Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
+}
 
 /// Coarse phase of the call loop, for the UI.
 enum CallState { connecting, listening, thinking, speaking, error }
@@ -75,7 +96,32 @@ class CallController extends ChangeNotifier {
     _sttLocaleId = _localeFor(lang);
 
     _active = true;
+    await _startForegroundService();
     _listen();
+  }
+
+  /// Start the microphone-type foreground service so the call survives
+  /// backgrounding and screen lock. Called after the mic permission is granted
+  /// (speech_to_text.initialize), which Android 14+ requires for a microphone
+  /// foreground service. Best-effort: a failure does not block the call, only
+  /// background persistence.
+  Future<void> _startForegroundService() async {
+    try {
+      final notifPerm =
+          await FlutterForegroundTask.checkNotificationPermission();
+      if (notifPerm != NotificationPermission.granted) {
+        await FlutterForegroundTask.requestNotificationPermission();
+      }
+      await FlutterForegroundTask.startService(
+        serviceId: 256,
+        notificationTitle: 'Hermes call',
+        notificationText: 'Voice call in progress',
+        serviceTypes: const [ForegroundServiceTypes.microphone],
+        callback: callTaskStartCallback,
+      );
+    } catch (e) {
+      debugPrint('[Call] foreground service start failed: $e');
+    }
   }
 
   /// Start one listening turn.
@@ -182,6 +228,9 @@ class CallController extends ChangeNotifier {
   Future<void> hangUp() async {
     _active = false;
     try {
+      await FlutterForegroundTask.stopService();
+    } catch (_) {}
+    try {
       await _speech.stop();
     } catch (_) {}
     try {
@@ -225,6 +274,9 @@ class CallController extends ChangeNotifier {
   @override
   void dispose() {
     _active = false;
+    try {
+      FlutterForegroundTask.stopService();
+    } catch (_) {}
     _speech.cancel();
     _xtts.dispose();
     try {

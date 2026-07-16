@@ -46,6 +46,7 @@ dependencies:
 
   # Inline video playback for generated .mp4 clips (ComfyUI /view)
   video_player: ^2.9.0
+  flutter_foreground_task: ^10.0.0
 
 dev_dependencies:
   flutter_test:
