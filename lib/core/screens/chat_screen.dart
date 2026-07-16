@@ -13,6 +13,7 @@ import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
 import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
+import 'call_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   final SavedConnection connection;
@@ -232,12 +233,19 @@ class _ChatScreenState extends State<ChatScreen> {
     // Capture before stop(): stop() fires the prior speak()'s onComplete,
     // which clears _speakingMessage, so we must read it first to detect a toggle.
     final wasSpeaking = identical(msg, _speakingMessage);
+    debugPrint(
+      '[Replay] tapped: ${((msg['content'] as String?) ?? '').length} chars, '
+      'wasSpeaking=$wasSpeaking',
+    );
 
     await _xtts.stop();
     if (!mounted) return;
 
     // Toggle off if this is the message that was speaking.
-    if (wasSpeaking) return;
+    if (wasSpeaking) {
+      debugPrint('[Replay] toggle OFF (stop)');
+      return;
+    }
 
     final content = (msg['content'] as String?) ?? '';
 
@@ -245,6 +253,7 @@ class _ChatScreenState extends State<ChatScreen> {
     final prefs = await SharedPreferences.getInstance();
     final speaker = prefs.getString(XttsPrefs.speaker) ?? '';
     if (speaker.isEmpty) {
+      debugPrint('[Replay] no XTTS speaker configured -> snackbar');
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -259,19 +268,25 @@ class _ChatScreenState extends State<ChatScreen> {
     final dialog = XttsService.extractDialog(content);
     final speakable =
         dialog.isNotEmpty ? dialog : XttsService.stripForSpeech(content);
-    if (speakable.isEmpty) return;
+    if (speakable.isEmpty) {
+      debugPrint('[Replay] no speakable text -> no-op');
+      return;
+    }
 
     if (!mounted) return;
     setState(() => _speakingMessage = msg);
+    debugPrint('[Replay] requesting speak (${speakable.length} chars)...');
 
     try {
       await _xtts.speak(
         content,
         onComplete: () {
+          debugPrint('[Replay] playback complete');
           if (mounted) setState(() => _speakingMessage = null);
         },
       );
     } catch (e) {
+      debugPrint('[Replay] FAILED: $e');
       if (!mounted) return;
       setState(() => _speakingMessage = null);
       ScaffoldMessenger.of(context).showSnackBar(
@@ -594,6 +609,19 @@ class _ChatScreenState extends State<ChatScreen> {
           overflow: TextOverflow.ellipsis,
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.call),
+            tooltip: 'Phone call mode',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => CallScreen(
+                  connection: widget.connection,
+                  session: widget.session,
+                ),
+              ),
+            ),
+          ),
           if (_streaming)
             const Padding(
               padding: EdgeInsets.only(right: 8),

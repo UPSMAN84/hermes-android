@@ -7,6 +7,7 @@ import 'dart:convert';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/foundation.dart';
 
 /// Persisted-preference keys shared with the settings voice picker.
 class XttsPrefs {
@@ -255,8 +256,13 @@ class XttsService {
       throw Exception('No XTTS speaker selected. Pick one in Settings → Voice.');
     }
 
+    debugPrint(
+      '[XTTS] speak: base=$base speaker="$speaker" lang=$language '
+      'text=${spoken.length} chars',
+    );
     await _applySettings(base, prefs);
 
+    final sw = Stopwatch()..start();
     try {
       final res = await _http.post(
         Uri.parse('$base/tts_to_audio/'),
@@ -267,14 +273,21 @@ class XttsService {
           'language': language,
         }),
       );
+      sw.stop();
+      debugPrint(
+        '[XTTS] POST /tts_to_audio/ -> HTTP ${res.statusCode}, '
+        '${res.bodyBytes.length} bytes in ${sw.elapsedMilliseconds}ms',
+      );
       if (res.statusCode < 200 || res.statusCode >= 300) {
         throw Exception('XTTS HTTP ${res.statusCode}: ${res.body}');
       }
 
       await _player.stop();
       await _player.play(BytesSource(res.bodyBytes, mimeType: 'audio/wav'));
+      debugPrint('[XTTS] playback started');
     } catch (e) {
       // Reset any "speaking" UI before propagating the failure.
+      debugPrint('[XTTS] speak FAILED: $e');
       _complete();
       rethrow;
     }
@@ -282,6 +295,7 @@ class XttsService {
 
   /// Stops any in-progress playback and resets "speaking" UI.
   Future<void> stop() {
+    debugPrint('[XTTS] stop()');
     _complete();
     return _player.stop();
   }
