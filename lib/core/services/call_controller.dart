@@ -2,6 +2,7 @@
 // chat session. listen (speech_to_text) -> send (Gateway SSE stream) -> speak
 // (XTTS) -> listen again, until hang-up. State machine exposed as [CallState]
 // for the call screen to render.
+import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -9,7 +10,9 @@ import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
+import 'call_audio.dart';
 import 'connection_manager.dart';
+import 'tts_provider.dart';
 import 'xtts_service.dart';
 
 /// Entry point for the foreground-service task isolate. The call's actual loop
@@ -47,7 +50,7 @@ class CallController extends ChangeNotifier {
   CallController({required this.connection, required this.session});
 
   final SpeechToText _speech = SpeechToText();
-  final XttsService _xtts = XttsService();
+  TtsProvider _xtts = XttsService();
   late final ApiClient _api;
   late final GatewayChatClient _gateway;
 
@@ -56,6 +59,12 @@ class CallController extends ChangeNotifier {
 
   bool _muted = false;
   bool get muted => _muted;
+
+  // Bumped on every _listen() call. Speech callbacks check this to avoid
+  // re-arming listen() based on stale `done`/`notListening` events from a
+  // previous listen session (e.g. one already superseded by a speak→listen
+  // transition that happened to fire its own status event).
+  int _listenEpoch = 0;
 
   /// Speaker is always on in v1 (audioplayers media channel). Kept as a field
   /// so the UI can show/toggle it later without an API change.
@@ -95,9 +104,42 @@ class CallController extends ChangeNotifier {
     final lang = prefs.getString(XttsPrefs.language) ?? XttsPrefs.defaultLanguage;
     _sttLocaleId = _localeFor(lang);
 
+    // Use the TTS backend selected in Settings (default XTTS).
+    final tts = await ttsProviderForPrefs(prefs);
+    if (tts is! XttsService) {
+      _xtts.dispose();
+      _xtts = tts;
+    }
+
     _active = true;
+    await _applyCallAudio();
     await _startForegroundService();
     _listen();
+  }
+
+  /// Route mic + playback through a connected Bluetooth earpiece: ask native
+  /// AudioManager to enter call mode + open Bluetooth SCO, wait for SCO to
+  /// actually connect. The order matters — starting the recognizer before SCO
+  /// is up makes Android grab the phone mic and ignore the BT earpiece. We
+  /// intentionally do NOT push an audioplayers AudioContext here: the native
+  /// AudioManager already set MODE_IN_COMMUNICATION + routed to SCO, and a
+  /// competing AudioContextAndroid call from the Dart side would race the
+  /// Kotlin route and can flip speaker back on.
+  Future<void> _applyCallAudio() async {
+    final scoOn = await CallAudio.startCallAudio();
+    debugPrint('[Call] SCO ready: $scoOn');
+  }
+
+  /// Undo [_applyCallAudio]: stop SCO, return to normal mode + media playback.
+  Future<void> _restoreAudio() async {
+    await CallAudio.stopCallAudio();
+    try {
+      await AudioPlayer.global.setAudioContext(
+        AudioContext(
+          android: AudioContextAndroid(usageType: AndroidUsageType.media),
+        ),
+      );
+    } catch (_) {}
   }
 
   /// Start the microphone-type foreground service so the call survives
@@ -127,12 +169,24 @@ class CallController extends ChangeNotifier {
   /// Start one listening turn.
   void _listen() {
     if (!_active || _muted || !_speechAvailable) return;
+    // Don't open the mic while TTS is still playing — we'd capture our own
+    // reply and send it as the next turn. If TTS is busy, schedule a re-arm
+    // for after it finishes (caller's onComplete path will re-call _listen).
+    if (_xtts.isPlaying) {
+      debugPrint('[Call] defer listen: TTS still playing');
+      return;
+    }
+    final epoch = ++_listenEpoch;
     _setState(CallState.listening);
     _speech.listen(
-      onResult: _onResult,
+      onResult: (r) => _onResult(r, epoch),
       listenOptions: SpeechListenOptions(
+        // 60s hard cap per turn so a stuck-open mic can't hang the call.
         listenFor: const Duration(seconds: 60),
-        pauseFor: const Duration(seconds: 3),
+        // 1.5s end-of-turn silence. The chat screen uses 3s, but a real call
+        // needs a tighter window or back-and-forth feels dead. speech_to_text
+        // does energy-based VAD internally — this is the only knob we have.
+        pauseFor: const Duration(milliseconds: 1500),
         localeId: _sttLocaleId,
         listenMode: ListenMode.dictation,
         partialResults: false,
@@ -140,8 +194,8 @@ class CallController extends ChangeNotifier {
     );
   }
 
-  void _onResult(SpeechRecognitionResult result) {
-    if (!_active) return;
+  void _onResult(SpeechRecognitionResult result, int epoch) {
+    if (!_active || epoch != _listenEpoch) return;
     final text = result.recognizedWords.trim();
     if (text.isEmpty || !result.finalResult) return;
     _send(text);
@@ -191,9 +245,12 @@ class CallController extends ChangeNotifier {
   }
 
   void _onSpeechStatus(String status) {
-    debugPrint('[Call] speech status: $status');
+    debugPrint('[Call] speech status: $status (epoch $_listenEpoch)');
     // Mic stopped. If we were mid-listen with no turn in flight (e.g. the 60s
     // listen window elapsed with no speech), re-arm so the call stays live.
+    // Guard with the current epoch so a stale `done` from a listen session
+    // that was already superseded doesn't trigger a second listen() racing
+    // with the one that's actually live.
     if ((status == 'done' || status == 'notListening') &&
         _active &&
         !_muted &&
@@ -203,7 +260,7 @@ class CallController extends ChangeNotifier {
   }
 
   void _onSpeechError(SpeechRecognitionError error) {
-    debugPrint('[Call] speech error: ${error.errorMsg}');
+    debugPrint('[Call] speech error: ${error.errorMsg} (epoch $_listenEpoch)');
     if (_active && !_muted) {
       Future.delayed(const Duration(milliseconds: 500), _listen);
     }
@@ -227,6 +284,7 @@ class CallController extends ChangeNotifier {
   /// End the call: stop mic + TTS, release the Gateway client.
   Future<void> hangUp() async {
     _active = false;
+    await _restoreAudio();
     try {
       await FlutterForegroundTask.stopService();
     } catch (_) {}
@@ -277,6 +335,7 @@ class CallController extends ChangeNotifier {
     try {
       FlutterForegroundTask.stopService();
     } catch (_) {}
+    CallAudio.stopCallAudio();
     _speech.cancel();
     _xtts.dispose();
     try {

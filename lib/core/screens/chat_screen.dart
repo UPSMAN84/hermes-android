@@ -11,6 +11,7 @@ import 'package:speech_to_text/speech_to_text.dart';
 
 import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
+import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
 import 'call_screen.dart';
@@ -44,7 +45,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   // Voice input / spoken replies
   final SpeechToText _speechToText = SpeechToText();
-  final XttsService _xtts = XttsService();
+  TtsProvider _xtts = XttsService();
   bool _speechAvailable = false;
   bool _listening = false;
   bool _voiceReplyEnabled = true;
@@ -80,7 +81,21 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadVerboseMode();
     _initVoice();
     _loadComfyUrl();
+    _initTtsProvider();
     _scrollController.addListener(_onScroll);
+  }
+
+  /// Swap the default XTTS backend for the one chosen in Settings (Chatterbox)
+  /// once prefs are available. speak()/stop() read [_xtts] fresh each call, so
+  /// a mid-init swap is safe.
+  Future<void> _initTtsProvider() async {
+    final prefs = await SharedPreferences.getInstance();
+    final selected = await ttsProviderForPrefs(prefs);
+    if (!mounted) return;
+    if (selected is! XttsService) {
+      _xtts.dispose();
+      _xtts = selected;
+    }
   }
 
   Future<void> _loadComfyUrl() async {
@@ -155,6 +170,18 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Future<void> _toggleVoiceInput() async {
     if (_streaming || _sending || _loading) return;
+    // Don't capture our own TTS reply as a "turn". Stop the player first and
+    // bail if it was mid-playback.
+    if (_xtts.isPlaying) {
+      await _xtts.stop();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Stopped reply to listen'),
+          duration: Duration(seconds: 1),
+        ),
+      );
+    }
     if (_listening) {
       await _speechToText.stop();
       if (!mounted) return;
@@ -230,22 +257,25 @@ class _ChatScreenState extends State<ChatScreen> {
   /// replies are off — but requires an XTTS speaker to be configured.
   /// Tapping the message currently speaking stops it (toggle).
   Future<void> _replayMessage(Map<String, dynamic> msg) async {
-    // Capture before stop(): stop() fires the prior speak()'s onComplete,
-    // which clears _speakingMessage, so we must read it first to detect a toggle.
     final wasSpeaking = identical(msg, _speakingMessage);
     debugPrint(
       '[Replay] tapped: ${((msg['content'] as String?) ?? '').length} chars, '
       'wasSpeaking=$wasSpeaking',
     );
 
-    await _xtts.stop();
-    if (!mounted) return;
-
-    // Toggle off if this is the message that was speaking.
+    // If this is the message currently speaking, stop and bail BEFORE doing
+    // any other work. Doing it after the stop() awaiting leaves a window
+    // where the prior speak()'s onComplete has already cleared _speakingMessage
+    // and the "set then check toggle" no longer matches the user's intent.
     if (wasSpeaking) {
       debugPrint('[Replay] toggle OFF (stop)');
+      setState(() => _speakingMessage = null);
+      await _xtts.stop();
       return;
     }
+
+    await _xtts.stop();
+    if (!mounted) return;
 
     final content = (msg['content'] as String?) ?? '';
 
@@ -434,6 +464,9 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     if (_sending || _streaming) return;
 
+    // Keep the user's text in case send fails — the controller is cleared
+    // below and without this the typed message is gone for good on error.
+    final pending = text;
     _textController.text = '';
     // Speak the reply whenever spoken replies are toggled on, regardless of
     // whether the message was typed or dictated.
@@ -532,7 +565,7 @@ class _ChatScreenState extends State<ChatScreen> {
             _messages.removeLast();
           }
         });
-        _handleSendError(text, error);
+        _handleSendError(pending, error);
       },
     );
   }
@@ -547,6 +580,10 @@ class _ChatScreenState extends State<ChatScreen> {
           _messages.last['content'] == text) {
         _messages.removeLast();
       }
+      // Restore the typed text so the user doesn't lose their message on a
+      // transient failure. Put the cursor at the end of the restored text.
+      _textController.text = text;
+      _textController.selection = TextSelection.collapsed(offset: text.length);
     });
 
     if (mounted) {

@@ -2,7 +2,9 @@
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../services/connection_manager.dart';
+import '../services/chatterbox_service.dart';
 import '../services/comfyui.dart';
+import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../../main.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -29,6 +31,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
   List<String> _providers = [];
   Map<String, List<Map<String, dynamic>>> _providerModels = {};
 
+  // Active TTS backend for the Voice section ('xtts' | 'chatterbox').
+  String _ttsProvider = 'xtts';
+
   @override
   void initState() {
     super.initState();
@@ -42,6 +47,21 @@ class _SettingsScreenState extends State<SettingsScreen> {
       password: widget.connection.dashboardPassword,
     );
     _loadData();
+    _loadTtsProvider();
+  }
+
+  Future<void> _loadTtsProvider() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _ttsProvider = prefs.getString(ttsProviderPrefKey) ?? 'xtts';
+    });
+  }
+
+  Future<void> _setTtsProvider(String provider) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(ttsProviderPrefKey, provider);
+    setState(() => _ttsProvider = provider);
   }
 
   @override
@@ -320,9 +340,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
         // ---- Section: Voice ----
         _buildSectionHeader('Voice'),
-        _VoicePicker(),
+        // TTS engine selector.
+        Card(
+          child: Padding(
+            padding:
+                const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            child: Row(
+              children: [
+                const Text('TTS engine'),
+                const Spacer(),
+                DropdownButton<String>(
+                  value: _ttsProvider,
+                  items: const [
+                    DropdownMenuItem(value: 'xtts', child: Text('XTTS-v2')),
+                    DropdownMenuItem(
+                        value: 'chatterbox', child: Text('Chatterbox')),
+                  ],
+                  onChanged: (v) {
+                    if (v != null) _setTtsProvider(v);
+                  },
+                ),
+              ],
+            ),
+          ),
+        ),
         const SizedBox(height: 8),
-        _TtsParamsCard(),
+        _ttsProvider == 'chatterbox'
+            ? _ChatterboxPicker()
+            : Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _VoicePicker(),
+                  const SizedBox(height: 8),
+                  _TtsParamsCard(),
+                ],
+              ),
         const SizedBox(height: 16),
 
         // ---- Section: Media ----
@@ -841,6 +893,256 @@ class _ComfyUrlFieldState extends State<_ComfyUrlField> {
               icon: Icon(_saved ? Icons.check : Icons.save),
               label: Text(_saved ? 'Saved' : 'Save'),
             ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// Chatterbox backend settings: server URL, voice (filename from the server's
+/// voices/ folder, fetched via GET /voices), language id, and the two
+/// generation params the /tts endpoint accepts (cfg_weight, exaggeration).
+class _ChatterboxPicker extends StatefulWidget {
+  @override
+  State<_ChatterboxPicker> createState() => _ChatterboxPickerState();
+}
+
+class _ChatterboxPickerState extends State<_ChatterboxPicker> {
+  final ChatterboxService _chatterbox = ChatterboxService();
+  final TextEditingController _urlController = TextEditingController();
+  final TextEditingController _langController = TextEditingController();
+  final TextEditingController _cfgController = TextEditingController();
+  final TextEditingController _exagController = TextEditingController();
+
+  List<String> _voices = [];
+  String? _selectedVoice;
+  String _model = ChatterboxPrefs.defaultModel;
+  bool _loading = true;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _chatterbox.dispose();
+    _urlController.dispose();
+    _langController.dispose();
+    _cfgController.dispose();
+    _exagController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    final prefs = await SharedPreferences.getInstance();
+    _urlController.text = prefs.getString(ChatterboxPrefs.baseUrl) ??
+        ChatterboxPrefs.defaultBaseUrl;
+    _model = prefs.getString(ChatterboxPrefs.model) ??
+        ChatterboxPrefs.defaultModel;
+    _selectedVoice = prefs.getString(ChatterboxPrefs.voice);
+    _langController.text = prefs.getString(ChatterboxPrefs.languageId) ??
+        ChatterboxPrefs.defaultLanguage;
+    final cfg = prefs.getDouble(ChatterboxPrefs.cfgWeight);
+    _cfgController.text =
+        (cfg ?? ChatterboxPrefs.defaultCfgWeight).toString();
+    final exag = prefs.getDouble(ChatterboxPrefs.exaggeration);
+    _exagController.text =
+        (exag ?? ChatterboxPrefs.defaultExaggeration).toString();
+
+    try {
+      _voices =
+          await _chatterbox.getVoices(baseUrlOverride: _urlController.text);
+      if (!mounted) return;
+      if (_selectedVoice != null && !_voices.contains(_selectedVoice)) {
+        _selectedVoice = null;
+      }
+      setState(() => _loading = false);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.toString();
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _saveUrl() async {
+    final prefs = await SharedPreferences.getInstance();
+    final normalized = ChatterboxService.normalizeBaseUrl(_urlController.text);
+    await prefs.setString(ChatterboxPrefs.baseUrl, normalized);
+    _urlController.text = normalized;
+    await _load();
+  }
+
+  Future<void> _setModel(String model) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(ChatterboxPrefs.model, model);
+    setState(() => _model = model);
+  }
+
+  Future<void> _setVoice(String? voice) async {
+    final prefs = await SharedPreferences.getInstance();
+    if (voice == null) {
+      await prefs.remove(ChatterboxPrefs.voice);
+    } else {
+      await prefs.setString(ChatterboxPrefs.voice, voice);
+    }
+    setState(() => _selectedVoice = voice);
+  }
+
+  Future<void> _saveParams() async {
+    final prefs = await SharedPreferences.getInstance();
+    final lang = _langController.text.trim();
+    if (lang.isNotEmpty) await prefs.setString(ChatterboxPrefs.languageId, lang);
+    final cfg = double.tryParse(_cfgController.text.trim());
+    if (cfg != null) await prefs.setDouble(ChatterboxPrefs.cfgWeight, cfg);
+    final exag = double.tryParse(_exagController.text.trim());
+    if (exag != null) await prefs.setDouble(ChatterboxPrefs.exaggeration, exag);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: _urlController,
+                    decoration: const InputDecoration(
+                      labelText: 'Chatterbox server URL',
+                      hintText: 'http://0.0.0.0:8420',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    keyboardType: TextInputType.url,
+                    autocorrect: false,
+                    onSubmitted: (_) => _saveUrl(),
+                  ),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.refresh),
+                  tooltip: 'Connect / reload voices',
+                  onPressed: _loading ? null : _saveUrl,
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            DropdownButtonFormField<String>(
+              initialValue: _model,
+              isExpanded: true,
+              decoration: const InputDecoration(
+                labelText: 'Model',
+                border: OutlineInputBorder(),
+              ),
+              items: const [
+                DropdownMenuItem(
+                    value: 'v3', child: Text('V3 (multilingual)')),
+                DropdownMenuItem(
+                    value: 'turbo', child: Text('Turbo (English only)')),
+              ],
+              onChanged: (v) {
+                if (v != null) _setModel(v);
+              },
+            ),
+            const SizedBox(height: 12),
+            if (_loading)
+              const Center(
+                child: Padding(
+                  padding: EdgeInsets.all(8),
+                  child: CircularProgressIndicator(),
+                ),
+              )
+            else if (_error != null)
+              Text(
+                'Could not reach Chatterbox server:\n$_error',
+                style: const TextStyle(color: Colors.orange),
+              )
+            else ...[
+              DropdownButtonFormField<String?>(
+                initialValue: _selectedVoice,
+                isExpanded: true,
+                decoration: const InputDecoration(
+                  labelText: 'Voice',
+                  border: OutlineInputBorder(),
+                ),
+                items: [
+                  const DropdownMenuItem(
+                    value: null,
+                    child: Text('None (server default)'),
+                  ),
+                  ..._voices.map(
+                    (v) => DropdownMenuItem(
+                      value: v,
+                      child: Text(v, overflow: TextOverflow.ellipsis),
+                    ),
+                  ),
+                ],
+                onChanged: _setVoice,
+              ),
+              // Turbo is English-only and ignores cfg_weight/exaggeration
+              // server-side, so only show these for V3.
+              if (_model != 'turbo') ...[
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _langController,
+                  decoration: const InputDecoration(
+                    labelText: 'Language ID',
+                    hintText: 'en',
+                    border: OutlineInputBorder(),
+                    isDense: true,
+                  ),
+                  autocorrect: false,
+                  onSubmitted: (_) => _saveParams(),
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _cfgController,
+                        decoration: const InputDecoration(
+                          labelText: 'cfg_weight',
+                          hintText: '0.5',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true),
+                        onSubmitted: (_) => _saveParams(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: _exagController,
+                        decoration: const InputDecoration(
+                          labelText: 'exaggeration',
+                          hintText: '0.5',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true),
+                        onSubmitted: (_) => _saveParams(),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ],
           ],
         ),
       ),

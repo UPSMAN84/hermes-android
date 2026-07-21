@@ -8,6 +8,7 @@ import 'package:audioplayers/audioplayers.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
+import 'tts_provider.dart';
 
 /// Persisted-preference keys shared with the settings voice picker.
 class XttsPrefs {
@@ -34,23 +35,36 @@ class XttsPrefs {
 /// One instance per screen that needs playback. Call [dispose] to release the
 /// audio player. All config is read fresh from SharedPreferences on each
 /// [speak] so changes in Settings take effect without recreating the service.
-class XttsService {
+class XttsService implements TtsProvider {
   final http.Client _http;
   final AudioPlayer _player = AudioPlayer();
 
   // Notifies the owner (e.g. chat screen) when playback ends, is stopped, or
   // fails — so per-message "speaking" UI can reset. Set fresh on each speak().
   void Function()? _onComplete;
+  int _speakEpoch = 0;
+  bool _isPlaying = false;
+
+  @override
+  bool get isPlaying => _isPlaying;
 
   XttsService({http.Client? httpClient}) : _http = httpClient ?? http.Client() {
     _player.onPlayerComplete.listen((_) => _complete());
+    _player.onPlayerStateChanged.listen((state) {
+      _isPlaying = state == PlayerState.playing;
+    });
   }
 
   // Fires the current completion callback once, then clears it. Safe to call
-  // repeatedly (subsequent calls are no-ops).
-  void _complete() {
+  // repeatedly (subsequent calls are no-ops). [epoch] gates stale callbacks:
+  // if a new speak() bumped the epoch, this complete() is from a prior session
+  // and is ignored — prevents the prior speak's onComplete firing after the
+  // new speak has registered its own callback.
+  void _complete({int? epoch}) {
+    if (epoch != null && epoch != _speakEpoch) return;
     final cb = _onComplete;
     _onComplete = null;
+    _isPlaying = false;
     if (cb != null) cb();
   }
 
@@ -237,6 +251,7 @@ class XttsService {
   /// language from SharedPreferences each call. A null/empty speaker means no
   /// voice is configured yet — we skip rather than send an invalid request.
   /// Generation settings are pushed before synthesis if they've changed.
+  @override
   Future<void> speak(String text, {void Function()? onComplete}) async {
     // Prefer quoted dialog; fall back to the action-stripped reply so a reply
     // with no quotes still speaks (instead of going silent).
@@ -244,6 +259,7 @@ class XttsService {
     final spoken = dialog.isNotEmpty ? dialog : stripForSpeech(text);
     if (spoken.isEmpty) return;
 
+    final epoch = ++_speakEpoch;
     _onComplete = onComplete;
 
     final prefs = await SharedPreferences.getInstance();
@@ -253,6 +269,7 @@ class XttsService {
         prefs.getString(XttsPrefs.language) ?? XttsPrefs.defaultLanguage;
 
     if (speaker.isEmpty) {
+      _complete(epoch: epoch);
       throw Exception('No XTTS speaker selected. Pick one in Settings → Voice.');
     }
 
@@ -283,23 +300,36 @@ class XttsService {
       }
 
       await _player.stop();
-      await _player.play(BytesSource(res.bodyBytes, mimeType: 'audio/wav'));
-      debugPrint('[XTTS] playback started');
+      // Bump epoch again so any onPlayerComplete from the prior stop() (which
+      // races with our speak()) is treated as stale and ignored.
+      final playEpoch = ++_speakEpoch;
+      try {
+        await _player.play(BytesSource(res.bodyBytes, mimeType: 'audio/wav'));
+        _isPlaying = true;
+        debugPrint('[XTTS] playback started');
+      } catch (e) {
+        debugPrint('[XTTS] play() failed: $e');
+        _complete(epoch: playEpoch);
+        rethrow;
+      }
     } catch (e) {
       // Reset any "speaking" UI before propagating the failure.
       debugPrint('[XTTS] speak FAILED: $e');
-      _complete();
+      _complete(epoch: epoch);
       rethrow;
     }
   }
 
   /// Stops any in-progress playback and resets "speaking" UI.
+  @override
   Future<void> stop() {
     debugPrint('[XTTS] stop()');
-    _complete();
+    final epoch = ++_speakEpoch;
+    _complete(epoch: epoch);
     return _player.stop();
   }
 
+  @override
   void dispose() {
     _player.dispose();
     _http.close();
