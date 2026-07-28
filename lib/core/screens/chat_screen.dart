@@ -62,6 +62,12 @@ class _ChatScreenState extends State<ChatScreen> {
   // ComfyUI base URL — used to fetch images referenced in tool results.
   String _comfyBaseUrl = ComfyUiPrefs.defaultBaseUrl;
 
+  // Bumped whenever a new turn starts, the messages are manually refetched, or
+  // the screen is disposed. A late-media poll captures this at launch and stops
+  // if it changes, so a stale poll from a previous turn can't clobber newer
+  // state.
+  int _mediaPollGen = 0;
+
   // Scroll management
   final _scrollController = ScrollController();
   bool _showScrollToBottom = false;
@@ -111,6 +117,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    // Stop any in-flight late-media poll from touching state after teardown.
+    _mediaPollGen++;
     _savedPositions[widget.session.id] = _lastPixels;
     _speechToText.cancel();
     _xtts.dispose();
@@ -353,6 +361,8 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _fetchMessages() async {
+    // A manual/refresh fetch supersedes any in-flight late-media poll.
+    _mediaPollGen++;
     setState(() {
       _loading = true;
       _error = null;
@@ -398,6 +408,50 @@ class _ChatScreenState extends State<ChatScreen> {
         _error = errStr;
         _loading = false;
       });
+    }
+  }
+
+  /// All generated-media URLs currently derivable from a message list — the
+  /// same harvest the build() path uses (tool messages → filenames → view URL).
+  Set<String> _mediaUrlsIn(List<Map<String, dynamic>> messages) {
+    final urls = <String>{};
+    for (final msg in messages) {
+      if ((msg['role'] as String?) != 'tool') continue;
+      final raw = (msg['content'] as String?) ?? '';
+      for (final name in ComfyUi.extractMediaFilenames(raw)) {
+        urls.add(ComfyUi.viewUrl(_comfyBaseUrl, name));
+      }
+    }
+    return urls;
+  }
+
+  /// Work around a read-after-write race: the image tool can persist its
+  /// tool-result message (which carries the rendered file path) a beat after
+  /// the SSE stream signals done, so the single refetch in [onDone] sometimes
+  /// misses it and the image only appears after leaving and re-opening the
+  /// chat. Re-pull a few times with a short delay; adopt the first fetch whose
+  /// media set is larger than what we're already showing, then stop.
+  Future<void> _pollForLateMedia() async {
+    final gen = _mediaPollGen;
+    var known = _mediaUrlsIn(_messages).length;
+    for (var attempt = 0; attempt < 4; attempt++) {
+      await Future.delayed(const Duration(milliseconds: 1500));
+      // Abort if a new turn started, a manual refetch ran, or we left/streamed.
+      if (!mounted || gen != _mediaPollGen || _streaming) return;
+      List<Map<String, dynamic>> messages;
+      try {
+        messages = await _client.getMessages(widget.session.id);
+      } catch (_) {
+        continue;
+      }
+      if (!mounted || gen != _mediaPollGen || _streaming) return;
+      final fresh = _mediaUrlsIn(messages).length;
+      if (fresh > known) {
+        _extractToolMessages(messages);
+        setState(() => _messages = messages);
+        known = fresh;
+        return;
+      }
     }
   }
 
@@ -490,6 +544,8 @@ class _ChatScreenState extends State<ChatScreen> {
       });
     }
 
+    // Invalidate any in-flight late-media poll from the previous turn.
+    _mediaPollGen++;
     setState(() {
       _sending = true;
       _streaming = true;
@@ -532,6 +588,10 @@ class _ChatScreenState extends State<ChatScreen> {
             _sending = false;
             _showScrollToBottom = false;
           });
+          // The image tool's result row may land just after this refetch;
+          // poll briefly so a freshly generated image doesn't require leaving
+          // and reopening the chat to appear.
+          _pollForLateMedia();
           if (_awaitingVoiceReply) {
             _awaitingVoiceReply = false;
             final assistant = messages.reversed.firstWhere(
