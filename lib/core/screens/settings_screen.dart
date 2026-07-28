@@ -286,7 +286,17 @@ class _SettingsScreenState extends State<SettingsScreen> {
             _providerModels.containsKey(_selectedProvider)) ...[
           _buildDropdown<String>(
             label: 'Model',
-            value: _selectedModel,
+            // Guard like the Provider dropdown above: DropdownButtonFormField
+            // asserts if `value` doesn't exactly match one entry in `items`.
+            // The server's active model can be stale/renamed relative to the
+            // current provider's model list (e.g. after switching providers or
+            // a model rename upstream) — fall back to null rather than crash.
+            value:
+                _providerModels[_selectedProvider]!.any(
+                  (m) => m['id'] == _selectedModel,
+                )
+                ? _selectedModel
+                : null,
             items: _providerModels[_selectedProvider]!.map((m) {
               final id = m['id'] as String? ?? '';
               final name = m['name'] as String? ?? id;
