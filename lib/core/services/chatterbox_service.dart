@@ -26,6 +26,14 @@ class ChatterboxPrefs {
   /// ignores cfg_weight/exaggeration/language_id server-side).
   static const model = 'chatterbox_model';
 
+  // Turbo-only sampling params (Turbo ignores cfg_weight/exaggeration/
+  // language_id but reads these instead).
+  static const repetitionPenalty = 'chatterbox_repetition_penalty';
+  static const minP = 'chatterbox_min_p';
+  static const topP = 'chatterbox_top_p';
+  static const temperature = 'chatterbox_temperature';
+  static const topK = 'chatterbox_top_k';
+
   /// Local server bind; override in Settings with a LAN/Tailscale address
   /// reachable from the phone.
   static const defaultBaseUrl = 'http://0.0.0.0:8420';
@@ -33,6 +41,11 @@ class ChatterboxPrefs {
   static const defaultCfgWeight = 0.5;
   static const defaultExaggeration = 0.5;
   static const defaultModel = 'v3';
+  static const defaultRepetitionPenalty = 1.2;
+  static const defaultMinP = 0.0;
+  static const defaultTopP = 0.95;
+  static const defaultTemperature = 0.8;
+  static const defaultTopK = 1000;
 }
 
 /// Speaks assistant replies through the Chatterbox server.
@@ -142,6 +155,18 @@ class ChatterboxService implements TtsProvider {
     final model =
         prefs.getString(ChatterboxPrefs.model) ?? ChatterboxPrefs.defaultModel;
     final isTurbo = model == 'turbo';
+    final repetitionPenalty =
+        prefs.getDouble(ChatterboxPrefs.repetitionPenalty) ??
+            ChatterboxPrefs.defaultRepetitionPenalty;
+    final minP =
+        prefs.getDouble(ChatterboxPrefs.minP) ?? ChatterboxPrefs.defaultMinP;
+    final topP =
+        prefs.getDouble(ChatterboxPrefs.topP) ?? ChatterboxPrefs.defaultTopP;
+    final temperature =
+        prefs.getDouble(ChatterboxPrefs.temperature) ??
+            ChatterboxPrefs.defaultTemperature;
+    final topK =
+        prefs.getInt(ChatterboxPrefs.topK) ?? ChatterboxPrefs.defaultTopK;
 
     debugPrint(
       '[Chatterbox] speak: base=$base model=$model voice="$voice" lang=$language '
@@ -151,9 +176,15 @@ class ChatterboxService implements TtsProvider {
     final request = http.MultipartRequest('POST', Uri.parse('$base/tts'))
       ..fields['text'] = spoken
       ..fields['model'] = model;
-    // Turbo is English-only and ignores cfg_weight/exaggeration server-side;
-    // omit them so it never 422s on language or warns on ignored params.
-    if (!isTurbo) {
+    // Turbo is English-only and ignores cfg_weight/exaggeration/language_id
+    // server-side; it reads its own sampling params instead.
+    if (isTurbo) {
+      request.fields['repetition_penalty'] = repetitionPenalty.toString();
+      request.fields['min_p'] = minP.toString();
+      request.fields['top_p'] = topP.toString();
+      request.fields['temperature'] = temperature.toString();
+      request.fields['top_k'] = topK.toString();
+    } else {
       request.fields['language_id'] = language;
       request.fields['cfg_weight'] = cfgWeight.toString();
       request.fields['exaggeration'] = exaggeration.toString();

@@ -929,6 +929,12 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
   final TextEditingController _langController = TextEditingController();
   final TextEditingController _cfgController = TextEditingController();
   final TextEditingController _exagController = TextEditingController();
+  final TextEditingController _repetitionPenaltyController =
+      TextEditingController();
+  final TextEditingController _minPController = TextEditingController();
+  final TextEditingController _topPController = TextEditingController();
+  final TextEditingController _temperatureController = TextEditingController();
+  final TextEditingController _topKController = TextEditingController();
 
   List<String> _voices = [];
   String? _selectedVoice;
@@ -949,6 +955,11 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
     _langController.dispose();
     _cfgController.dispose();
     _exagController.dispose();
+    _repetitionPenaltyController.dispose();
+    _minPController.dispose();
+    _topPController.dispose();
+    _temperatureController.dispose();
+    _topKController.dispose();
     super.dispose();
   }
 
@@ -971,6 +982,20 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
     final exag = prefs.getDouble(ChatterboxPrefs.exaggeration);
     _exagController.text =
         (exag ?? ChatterboxPrefs.defaultExaggeration).toString();
+    final repetitionPenalty =
+        prefs.getDouble(ChatterboxPrefs.repetitionPenalty);
+    _repetitionPenaltyController.text =
+        (repetitionPenalty ?? ChatterboxPrefs.defaultRepetitionPenalty)
+            .toString();
+    final minP = prefs.getDouble(ChatterboxPrefs.minP);
+    _minPController.text = (minP ?? ChatterboxPrefs.defaultMinP).toString();
+    final topP = prefs.getDouble(ChatterboxPrefs.topP);
+    _topPController.text = (topP ?? ChatterboxPrefs.defaultTopP).toString();
+    final temperature = prefs.getDouble(ChatterboxPrefs.temperature);
+    _temperatureController.text =
+        (temperature ?? ChatterboxPrefs.defaultTemperature).toString();
+    final topK = prefs.getInt(ChatterboxPrefs.topK);
+    _topKController.text = (topK ?? ChatterboxPrefs.defaultTopK).toString();
 
     try {
       _voices =
@@ -1021,6 +1046,24 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
     if (cfg != null) await prefs.setDouble(ChatterboxPrefs.cfgWeight, cfg);
     final exag = double.tryParse(_exagController.text.trim());
     if (exag != null) await prefs.setDouble(ChatterboxPrefs.exaggeration, exag);
+    final repetitionPenalty =
+        double.tryParse(_repetitionPenaltyController.text.trim());
+    if (repetitionPenalty != null) {
+      await prefs.setDouble(
+        ChatterboxPrefs.repetitionPenalty,
+        repetitionPenalty,
+      );
+    }
+    final minP = double.tryParse(_minPController.text.trim());
+    if (minP != null) await prefs.setDouble(ChatterboxPrefs.minP, minP);
+    final topP = double.tryParse(_topPController.text.trim());
+    if (topP != null) await prefs.setDouble(ChatterboxPrefs.topP, topP);
+    final temperature = double.tryParse(_temperatureController.text.trim());
+    if (temperature != null) {
+      await prefs.setDouble(ChatterboxPrefs.temperature, temperature);
+    }
+    final topK = int.tryParse(_topKController.text.trim());
+    if (topK != null) await prefs.setInt(ChatterboxPrefs.topK, topK);
   }
 
   @override
@@ -1151,6 +1194,92 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                         ),
                         keyboardType: const TextInputType.numberWithOptions(
                             decimal: true),
+                        onSubmitted: (_) => _saveParams(),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+              // Turbo ignores cfg_weight/exaggeration/language_id and reads
+              // these sampling params instead.
+              if (_model == 'turbo') ...[
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _temperatureController,
+                        decoration: const InputDecoration(
+                          labelText: 'temperature',
+                          hintText: '0.8',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true),
+                        onSubmitted: (_) => _saveParams(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: _repetitionPenaltyController,
+                        decoration: const InputDecoration(
+                          labelText: 'repetition_penalty',
+                          hintText: '1.2',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true),
+                        onSubmitted: (_) => _saveParams(),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                Row(
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        controller: _topPController,
+                        decoration: const InputDecoration(
+                          labelText: 'top_p',
+                          hintText: '0.95',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true),
+                        onSubmitted: (_) => _saveParams(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: _minPController,
+                        decoration: const InputDecoration(
+                          labelText: 'min_p',
+                          hintText: '0.00',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        keyboardType: const TextInputType.numberWithOptions(
+                            decimal: true),
+                        onSubmitted: (_) => _saveParams(),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: TextField(
+                        controller: _topKController,
+                        decoration: const InputDecoration(
+                          labelText: 'top_k',
+                          hintText: '1000',
+                          border: OutlineInputBorder(),
+                          isDense: true,
+                        ),
+                        keyboardType: TextInputType.number,
                         onSubmitted: (_) => _saveParams(),
                       ),
                     ),
