@@ -37,4 +37,22 @@ class CallAudio {
       // Ignore.
     }
   }
+
+  /// Toggle the device loudspeaker while in call mode. The native side keeps
+  /// MODE_IN_COMMUNICATION intact and only flips `isSpeakerphoneOn`. Returns
+  /// the resulting speakerphone state, or `false` if the channel is missing /
+  /// the call threw — the UI treats that as "switch failed".
+  static Future<bool> setSpeakerphone({required bool enabled}) async {
+    try {
+      final ok = await _channel.invokeMethod<bool>(
+        'setSpeakerphone',
+        {'enabled': enabled},
+      );
+      return ok ?? false;
+    } on PlatformException catch (_) {
+      return false;
+    } on MissingPluginException catch (_) {
+      return false;
+    }
+  }
 }

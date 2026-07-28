@@ -82,6 +82,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _client.getModelOptions(),
       ]);
 
+      if (!mounted) return;
       setState(() {
         _modelInfo = results[0];
         _modelOptions = results[1];
@@ -89,6 +90,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         _parseModelOptions();
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = e.toString();
         _loading = false;
@@ -480,8 +482,10 @@ class _AboutCardState extends State<_AboutCard> {
   Future<void> _loadVersion() async {
     try {
       final info = await PackageInfo.fromPlatform();
+      if (!mounted) return;
       setState(() => _version = '${info.version}+${info.buildNumber}');
     } catch (_) {
+      if (!mounted) return;
       setState(() => _version = 'unknown');
     }
   }
@@ -530,6 +534,7 @@ class _VerboseToggleState extends State<_VerboseToggle> {
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() => _verbose = prefs.getBool('verbose_mode') ?? false);
   }
 

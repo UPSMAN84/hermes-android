@@ -307,6 +307,10 @@ class GatewayChatClient {
 
   /// Build OpenAI chat-completions messages, preserving prior history and
   /// ensuring the newly typed user message is present exactly once at the end.
+  ///
+  /// Unknown roles (e.g. 'tool') are skipped — silently rewriting them to
+  /// 'user' would feed the model the raw tool output as if the user had
+  /// typed it, corrupting subsequent replies.
   static List<Map<String, dynamic>> buildChatCompletionMessages({
     required String message,
     List<Map<String, dynamic>>? history,
@@ -314,12 +318,18 @@ class GatewayChatClient {
     final messages = <Map<String, dynamic>>[];
     if (history != null && history.isNotEmpty) {
       for (final msg in history) {
-        final role = (msg['role'] == 'agent' || msg['role'] == 'assistant')
-            ? 'assistant'
-            : 'user';
-        final content = msg['content']?.toString() ?? '';
+        final rawRole = msg['role'];
+        if (rawRole != 'user' &&
+            rawRole != 'assistant' &&
+            rawRole != 'agent') {
+          continue;
+        }
+        final content = msg['content']?.toString().trim() ?? '';
         if (content.isEmpty) continue;
-        messages.add({'role': role, 'content': content});
+        messages.add({
+          'role': rawRole == 'agent' ? 'assistant' : rawRole,
+          'content': content,
+        });
       }
     }
 
@@ -434,17 +444,29 @@ class GatewayChatClient {
       }
 
       String buffer = '';
+      // SSE frames are separated by a blank line. RFC 8895 mandates CRLF but
+      // servers (and proxies) frequently emit LF or a mix — accept any.
+      final frameDelimiter = RegExp(r'\r?\n\r?\n');
+      final flushFrame = () {
+        final m = frameDelimiter.firstMatch(buffer);
+        if (m == null) return false;
+        final frame = buffer.substring(0, m.start);
+        buffer = buffer.substring(m.end);
+        final token = parseSseFrame(frame, onToolProgress: onToolProgress);
+        if (token != null && token.isNotEmpty) onToken(token);
+        return true;
+      };
+
       await response.stream.transform(utf8.decoder).forEach((chunk) {
         buffer += chunk;
-        while (buffer.contains('\n\n')) {
-          final eventEnd = buffer.indexOf('\n\n');
-          final frame = buffer.substring(0, eventEnd);
-          buffer = buffer.substring(eventEnd + 2);
-
-          final token = parseSseFrame(frame, onToolProgress: onToolProgress);
-          if (token != null && token.isNotEmpty) onToken(token);
-        }
+        while (flushFrame()) {}
       });
+      // Stream ended: flush any final frame whose terminator was lost (some
+      // servers close without the trailing blank line).
+      if (buffer.trim().isNotEmpty) {
+        final token = parseSseFrame(buffer, onToolProgress: onToolProgress);
+        if (token != null && token.isNotEmpty) onToken(token);
+      }
 
       onDone();
     } catch (e) {

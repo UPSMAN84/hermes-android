@@ -79,7 +79,12 @@ class _CallScreenState extends State<CallScreen> {
               speakerOn: _controller.speakerOn,
               onToggleMute: () =>
                   _controller.setMuted(!_controller.muted),
-              onToggleSpeaker: _controller.toggleSpeaker,
+              onToggleSpeaker: () {
+                // Fire-and-forget: the controller updates _speakerOn via
+                // notifyListeners, which _onChanged picks up to setState the
+                // whole screen.
+                _controller.toggleSpeaker();
+              },
               onHangUp: _hangUp,
             ),
             const SizedBox(height: 48),

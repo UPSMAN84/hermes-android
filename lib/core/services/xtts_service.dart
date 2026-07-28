@@ -257,7 +257,13 @@ class XttsService implements TtsProvider {
     // with no quotes still speaks (instead of going silent).
     final dialog = extractDialog(text);
     final spoken = dialog.isNotEmpty ? dialog : stripForSpeech(text);
-    if (spoken.isEmpty) return;
+    if (spoken.isEmpty) {
+      // Nothing to narrate (stage directions only, media-only reply, blocked
+      // phrase, etc.). Still signal completion so callers like the call-mode
+      // controller don't stay stuck in "Speaking…" forever.
+      onComplete?.call();
+      return;
+    }
 
     final epoch = ++_speakEpoch;
     _onComplete = onComplete;

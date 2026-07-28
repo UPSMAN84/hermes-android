@@ -36,6 +36,7 @@ class _SessionListScreenState extends State<SessionListScreen> {
 
   Future<void> _checkHealth() async {
     final ok = await _client.healthCheck();
+    if (!mounted) return;
     setState(() => _healthOk = ok);
     if (ok) _fetchSessions();
   }

@@ -116,7 +116,13 @@ class ChatterboxService implements TtsProvider {
     // action-stripped fallback, so a reply with no quotes still speaks.
     final dialog = XttsService.extractDialog(text);
     final spoken = dialog.isNotEmpty ? dialog : XttsService.stripForSpeech(text);
-    if (spoken.isEmpty) return;
+    if (spoken.isEmpty) {
+      // Nothing to narrate (stage directions only, media-only reply, blocked
+      // phrase, etc.). Still signal completion so callers like the call-mode
+      // controller don't stay stuck in "Speaking…" forever.
+      onComplete?.call();
+      return;
+    }
 
     final epoch = ++_speakEpoch;
     _onComplete = onComplete;

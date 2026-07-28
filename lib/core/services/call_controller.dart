@@ -66,8 +66,9 @@ class CallController extends ChangeNotifier {
   // transition that happened to fire its own status event).
   int _listenEpoch = 0;
 
-  /// Speaker is always on in v1 (audioplayers media channel). Kept as a field
-  /// so the UI can show/toggle it later without an API change.
+  /// Reflects the device loudspeaker state for the active call. Seeded from
+  /// `AudioManager.isSpeakerphoneOn` after `_applyCallAudio` so the UI matches
+  /// the actual route on first render; updated by [toggleSpeaker].
   bool _speakerOn = true;
   bool get speakerOn => _speakerOn;
 
@@ -76,6 +77,9 @@ class CallController extends ChangeNotifier {
 
   bool _speechAvailable = false;
   bool _active = false;
+  // Guards against a second native stopCallAudio: both hangUp() and dispose()
+  // restore audio, and a normal exit runs both. Set on first teardown.
+  bool _audioStopped = false;
   String _sttLocaleId = 'en-US';
   final StringBuffer _replyBuffer = StringBuffer();
 
@@ -125,13 +129,22 @@ class CallController extends ChangeNotifier {
   /// AudioManager already set MODE_IN_COMMUNICATION + routed to SCO, and a
   /// competing AudioContextAndroid call from the Dart side would race the
   /// Kotlin route and can flip speaker back on.
+  ///
+  /// On exit, native sets `isSpeakerphoneOn = false` (`MODE_IN_COMMUNICATION`).
+  /// We seed `_speakerOn` from the actual native state so the UI matches audio
+  /// routing on first render — toggling works the same regardless.
   Future<void> _applyCallAudio() async {
     final scoOn = await CallAudio.startCallAudio();
     debugPrint('[Call] SCO ready: $scoOn');
+    final speakerState = await CallAudio.setSpeakerphone(enabled: false);
+    _speakerOn = speakerState;
   }
 
   /// Undo [_applyCallAudio]: stop SCO, return to normal mode + media playback.
+  /// Idempotent — a second call (hangUp then dispose) is a no-op.
   Future<void> _restoreAudio() async {
+    if (_audioStopped) return;
+    _audioStopped = true;
     await CallAudio.stopCallAudio();
     try {
       await AudioPlayer.global.setAudioContext(
@@ -166,7 +179,9 @@ class CallController extends ChangeNotifier {
     }
   }
 
-  /// Start one listening turn.
+  /// Start one listening turn. This front guard is the single gate for
+  /// re-arming — callers (onComplete, onError, status/error handlers) may call
+  /// bare _listen() without repeating the active/muted checks.
   void _listen() {
     if (!_active || _muted || !_speechAvailable) return;
     // Don't open the mic while TTS is still playing — we'd capture our own
@@ -177,28 +192,53 @@ class CallController extends ChangeNotifier {
       return;
     }
     final epoch = ++_listenEpoch;
+    _lastTranscript = '';
     _setState(CallState.listening);
     _speech.listen(
       onResult: (r) => _onResult(r, epoch),
       listenOptions: SpeechListenOptions(
         // 60s hard cap per turn so a stuck-open mic can't hang the call.
         listenFor: const Duration(seconds: 60),
-        // 1.5s end-of-turn silence. The chat screen uses 3s, but a real call
-        // needs a tighter window or back-and-forth feels dead. speech_to_text
-        // does energy-based VAD internally — this is the only knob we have.
-        pauseFor: const Duration(milliseconds: 1500),
+        // 4s end-of-turn silence. Maps to
+        // EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS — hard session
+        // close after this much silence, not an energy-VAD knob. 4s (up from 3s)
+        // gives room for a mid-sentence pause without cutting the turn short.
+        pauseFor: const Duration(milliseconds: 4000),
         localeId: _sttLocaleId,
         listenMode: ListenMode.dictation,
-        partialResults: false,
+        // Enable partial results so we see the running transcript as Android
+        // decodes it. With this off the recognizer only reports once at the
+        // silence-timeout final — and at that exact moment the last ~200ms of
+        // audio is often still in the decoder buffer, so trailing words get
+        // truncated. With partials on we get intermediate results that
+        // include those trailing words before the session closes.
+        partialResults: true,
+        // Use the on-device recognizer when available (Android 12+). This
+        // routes through createOnDeviceSpeechRecognizer + EXTRA_PREFER_OFFLINE
+        // — sidesteps the network recognizer's start/stop beep on devices
+        // that ship an offline model (most modern Pixels/Samsungs). Falls
+        // back to the cloud recognizer with a beep if no offline model.
+        onDevice: true,
       ),
     );
   }
 
+  // Latest non-empty transcript for the current listen session. Updated on
+  // every onResult so we always send the freshest text when final fires.
+  String _lastTranscript = '';
+
   void _onResult(SpeechRecognitionResult result, int epoch) {
     if (!_active || epoch != _listenEpoch) return;
     final text = result.recognizedWords.trim();
-    if (text.isEmpty || !result.finalResult) return;
-    _send(text);
+    if (text.isNotEmpty) _lastTranscript = text;
+    // partialResults: true → Android emits partials while speaking AND a final
+    // at session close. Send on final; ignore empty finals (some recognizers
+    // emit a final with empty text on pure silence).
+    if (!result.finalResult) return;
+    if (_lastTranscript.isEmpty) return;
+    final toSend = _lastTranscript;
+    _lastTranscript = '';
+    _send(toSend);
   }
 
   /// Send a recognized turn to the Gateway and stream the reply.
@@ -262,7 +302,16 @@ class CallController extends ChangeNotifier {
   void _onSpeechError(SpeechRecognitionError error) {
     debugPrint('[Call] speech error: ${error.errorMsg} (epoch $_listenEpoch)');
     if (_active && !_muted) {
-      Future.delayed(const Duration(milliseconds: 500), _listen);
+      Future.delayed(const Duration(milliseconds: 500), () {
+        // Only re-arm if we're still in a listening phase. Without this a stale
+        // error scheduled during a prior turn could fire while we're speaking or
+        // thinking — and if TTS is between request and playback (isPlaying still
+        // false), _listen wouldn't defer and would open the mic onto our own
+        // reply. onComplete/onError already own the resume in those phases.
+        if (_state != CallState.speaking && _state != CallState.thinking) {
+          _listen();
+        }
+      });
     }
   }
 
@@ -276,8 +325,18 @@ class CallController extends ChangeNotifier {
     }
   }
 
-  void toggleSpeaker() {
-    _speakerOn = !_speakerOn;
+  Future<void> toggleSpeaker() async {
+    // No-op once the call has ended: flipping isSpeakerphoneOn in MODE_NORMAL
+    // would fight the restored media route.
+    if (!_active) return;
+    final next = !_speakerOn;
+    final ok = await CallAudio.setSpeakerphone(enabled: next);
+    if (!ok) {
+      _status = 'Speaker switch failed';
+      notifyListeners();
+      return;
+    }
+    _speakerOn = next;
     notifyListeners();
   }
 
@@ -335,7 +394,11 @@ class CallController extends ChangeNotifier {
     try {
       FlutterForegroundTask.stopService();
     } catch (_) {}
-    CallAudio.stopCallAudio();
+    // Idempotent: skips the native call if hangUp() already restored audio.
+    if (!_audioStopped) {
+      _audioStopped = true;
+      CallAudio.stopCallAudio();
+    }
     _speech.cancel();
     _xtts.dispose();
     try {

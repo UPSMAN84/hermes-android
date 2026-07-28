@@ -71,6 +71,7 @@ class HermesAppState extends State<HermesApp> {
 
     return MaterialApp(
       title: 'Hermes Agent',
+      debugShowCheckedModeBanner: false,
       themeMode: HermesApp.getThemeMode(widget.connManager.prefs),
       theme: ThemeData(
         colorSchemeSeed: gold,

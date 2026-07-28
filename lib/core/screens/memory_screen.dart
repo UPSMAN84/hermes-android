@@ -55,6 +55,7 @@ class _MemoryScreenState extends State<MemoryScreen> {
       // Try dedicated /api/memory endpoint first
       try {
         final memData = await _client.apiGet('memory');
+        if (!mounted) return;
         final items =
             memData['entries'] as List? ?? memData['memory'] as List? ?? [];
         if (items.isNotEmpty) {
@@ -71,6 +72,7 @@ class _MemoryScreenState extends State<MemoryScreen> {
 
       // Fallback: read memory from /api/config
       final config = await _client.apiGet('config');
+      if (!mounted) return;
       final mem = config['memory'];
 
       if (mem is List) {
@@ -99,6 +101,7 @@ class _MemoryScreenState extends State<MemoryScreen> {
         });
       }
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = e.toString();
         _loading = false;

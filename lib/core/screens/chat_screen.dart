@@ -472,11 +472,22 @@ class _ChatScreenState extends State<ChatScreen> {
     // whether the message was typed or dictated.
     _awaitingVoiceReply = _voiceReplyEnabled;
 
-    // Build conversation history for SSE request
+    // Build conversation history for the SSE request. Must be chronological
+    // (oldest first) and must only contain roles the model understands — a
+    // raw 'tool' message would otherwise be sent as if the user typed the
+    // tool's raw output, polluting subsequent replies.
     final history = <Map<String, dynamic>>[];
-    for (var i = _messages.length - 1; i >= 0; i--) {
-      final m = _messages[i];
-      history.add({'role': m['role'] ?? 'user', 'content': m['content'] ?? ''});
+    for (final m in _messages) {
+      final rawRole = m['role'];
+      if (rawRole != 'user' && rawRole != 'assistant' && rawRole != 'agent') {
+        continue;
+      }
+      final content = m['content']?.toString().trim() ?? '';
+      if (content.isEmpty) continue;
+      history.add({
+        'role': rawRole == 'agent' ? 'assistant' : rawRole,
+        'content': content,
+      });
     }
 
     setState(() {
