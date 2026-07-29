@@ -253,10 +253,9 @@ class XttsService implements TtsProvider {
   /// Generation settings are pushed before synthesis if they've changed.
   @override
   Future<void> speak(String text, {void Function()? onComplete}) async {
-    // Prefer quoted dialog; fall back to the action-stripped reply so a reply
-    // with no quotes still speaks (instead of going silent).
-    final dialog = extractDialog(text);
-    final spoken = dialog.isNotEmpty ? dialog : stripForSpeech(text);
+    // Speak the whole cleaned reply (markdown/action-stripped), not just
+    // quoted dialog — the full chat text is already sanitized upstream.
+    final spoken = stripForSpeech(text);
     if (spoken.isEmpty) {
       // Nothing to narrate (stage directions only, media-only reply, blocked
       // phrase, etc.). Still signal completion so callers like the call-mode

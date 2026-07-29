@@ -143,11 +143,25 @@ class _SkillsScreenState extends State<SkillsScreen> {
                       style: const TextStyle(fontSize: 12),
                     )
                   : null,
-              trailing: Icon(
-                enabled ? Icons.check_circle : Icons.block,
-                color: enabled ? Colors.green : Colors.orange,
-                size: 18,
+              trailing: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    enabled ? Icons.check_circle : Icons.block,
+                    color: enabled ? Colors.green : Colors.orange,
+                    size: 18,
+                  ),
+                  if (enabled) ...[
+                    const SizedBox(width: 4),
+                    const Icon(Icons.chevron_right, size: 18),
+                  ],
+                ],
               ),
+              onTap: enabled
+                  ? () => Navigator.pop(context, name)
+                  : () => ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('"$name" is disabled')),
+                    ),
             ),
           );
         },

@@ -403,6 +403,7 @@ class GatewayChatClient {
     ToolProgressCallback? onToolProgress,
     required void Function() onDone,
     required void Function(String error) onError,
+    StreamCancelToken? cancelToken,
   }) async {
     final messages = buildChatCompletionMessages(
       message: message,
@@ -418,26 +419,49 @@ class GatewayChatClient {
     final headers = {..._api._headers, 'X-Hermes-Session-Id': sessionId};
 
     try {
-      final request = http.Request(
-        'POST',
-        Uri.parse('$_baseUrl/v1/chat/completions'),
-      );
-      request.headers.addAll(headers);
-      request.body = jsonEncode(body);
+      // Retry with backoff only covers establishing the connection — once a
+      // single byte of the response has streamed, the server has already
+      // accepted (and is likely persisting) this session's message, so a
+      // resend here would risk duplicating it. Ladder mirrors the gateway's
+      // own Telegram reconnect backoff (gateway/platforms/telegram/adapter.py):
+      // base delay doubling up to a cap, few attempts since this is a
+      // foreground user-initiated send, not a background poll.
+      const maxConnectAttempts = 4;
+      const baseDelay = Duration(seconds: 1);
+      const maxDelay = Duration(seconds: 8);
 
-      final response = await _api._http.send(request);
+      http.StreamedResponse? response;
+      for (var attempt = 1; attempt <= maxConnectAttempts; attempt++) {
+        final request = http.Request(
+          'POST',
+          Uri.parse('$_baseUrl/v1/chat/completions'),
+        );
+        request.headers.addAll(headers);
+        request.body = jsonEncode(body);
 
-      if (response.statusCode != 200) {
-        final errorBody = await response.stream.bytesToString();
+        try {
+          response = await _api._http.send(request);
+          break;
+        } catch (e) {
+          if (attempt >= maxConnectAttempts) rethrow;
+          final delayMs = (baseDelay.inMilliseconds * (1 << (attempt - 1)))
+              .clamp(0, maxDelay.inMilliseconds);
+          await Future.delayed(Duration(milliseconds: delayMs));
+        }
+      }
+
+      final resp = response!;
+      if (resp.statusCode != 200) {
+        final errorBody = await resp.stream.bytesToString();
         String errorMsg;
         try {
           final err = jsonDecode(errorBody);
           errorMsg =
               err['error']?['message'] ??
               err['message'] ??
-              'HTTP ${response.statusCode}';
+              'HTTP ${resp.statusCode}';
         } catch (_) {
-          errorMsg = 'HTTP ${response.statusCode}';
+          errorMsg = 'HTTP ${resp.statusCode}';
         }
         onError(errorMsg);
         return;
@@ -457,18 +481,44 @@ class GatewayChatClient {
         return true;
       };
 
-      await response.stream.transform(utf8.decoder).forEach((chunk) {
-        buffer += chunk;
-        while (flushFrame()) {}
-      });
-      // Stream ended: flush any final frame whose terminator was lost (some
-      // servers close without the trailing blank line).
-      if (buffer.trim().isNotEmpty) {
-        final token = parseSseFrame(buffer, onToolProgress: onToolProgress);
-        if (token != null && token.isNotEmpty) onToken(token);
-      }
+      final completer = Completer<void>();
+      late StreamSubscription<String> sub;
+      sub = resp.stream.transform(utf8.decoder).listen(
+        (chunk) {
+          buffer += chunk;
+          while (flushFrame()) {}
+        },
+        onDone: () {
+          // Stream ended: flush any final frame whose terminator was lost
+          // (some servers close without the trailing blank line).
+          if (buffer.trim().isNotEmpty) {
+            final token = parseSseFrame(buffer, onToolProgress: onToolProgress);
+            if (token != null && token.isNotEmpty) onToken(token);
+          }
+          onDone();
+          if (!completer.isCompleted) completer.complete();
+        },
+        onError: (e) {
+          onError(e.toString());
+          if (!completer.isCompleted) completer.complete();
+        },
+        cancelOnError: true,
+      );
 
-      onDone();
+      // Wiring a cancel into the subscription lets the caller abort an
+      // in-flight generation (e.g. a "Stop" button). Cancelling the
+      // subscription drops the connection, which the gateway's SSE writer
+      // treats the same as any other client disconnect: it calls
+      // agent.interrupt() and persists whatever was generated so far (see
+      // gateway/platforms/api_server.py) — the same server-side behavior
+      // Telegram's cancel button relies on.
+      cancelToken?._bind(() {
+        sub.cancel();
+        onDone();
+        if (!completer.isCompleted) completer.complete();
+      });
+
+      await completer.future;
     } catch (e) {
       onError(e.toString());
     }
@@ -476,6 +526,27 @@ class GatewayChatClient {
 
   void abort() {
     _api.close();
+  }
+}
+
+/// Lets a caller cancel an in-flight [GatewayChatClient.sendMessageStreaming]
+/// call — e.g. a "Stop" button while the assistant is replying.
+class StreamCancelToken {
+  void Function()? _onCancel;
+  bool _cancelled = false;
+
+  void _bind(void Function() onCancel) {
+    if (_cancelled) {
+      onCancel();
+      return;
+    }
+    _onCancel = onCancel;
+  }
+
+  void cancel() {
+    if (_cancelled) return;
+    _cancelled = true;
+    _onCancel?.call();
   }
 }
 

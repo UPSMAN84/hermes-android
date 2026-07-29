@@ -1,6 +1,8 @@
 // Chat screen with real-time streaming via REST API.
 // Uses REST endpoints: POST /api/sessions/{id}/chat and
 // GET /api/sessions/{id}/messages.
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -15,6 +17,7 @@ import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
 import 'call_screen.dart';
+import 'skills_screen.dart';
 
 class ChatScreen extends StatefulWidget {
   final SavedConnection connection;
@@ -42,6 +45,7 @@ class _ChatScreenState extends State<ChatScreen> {
   final _textController = TextEditingController();
   bool _sending = false;
   bool _streaming = false;
+  StreamCancelToken? _streamCancelToken;
 
   // Voice input / spoken replies
   final SpeechToText _speechToText = SpeechToText();
@@ -74,6 +78,40 @@ class _ChatScreenState extends State<ChatScreen> {
   double _lastPixels = 0;
   static final Map<String, double> _savedPositions = {};
 
+  // Streaming-token batching: coalesce onToken callbacks into periodic
+  // setState flushes instead of rebuilding on every token. Mirrors the
+  // gateway's own Telegram adapter text-batch delay (adapter.py
+  // _flush_text_batch) — a short fixed delay smooths bursty output into a
+  // steady cadence without the UI feeling laggy.
+  static const _tokenFlushDelay = Duration(milliseconds: 120);
+  final StringBuffer _pendingTokens = StringBuffer();
+  Timer? _tokenFlushTimer;
+
+  // In-chat "/" commands, mirroring a small subset of the Telegram gateway
+  // adapter's slash-command menu (/model, /new, /skills). These are handled
+  // entirely client-side — the API server endpoint this screen talks to is
+  // stateless and doesn't dispatch slash commands the way the gateway's
+  // platform adapters do, so a match here short-circuits before anything is
+  // sent to the model.
+  static const Map<String, String> _slashCommands = {
+    '/new': 'Start a new chat',
+    '/model': 'Switch model',
+    '/skills': 'View skills',
+  };
+  DashboardClient? _dashboard;
+
+  DashboardClient _dashboardClient() {
+    return _dashboard ??= DashboardClient(
+      host: widget.connection.host,
+      port: widget.connection.dashboardPort,
+      pathPrefix: widget.connection.dashboardPrefix ?? '',
+      proxied: widget.connection.dashboardProxied,
+      useHttps: widget.connection.useHttps,
+      username: widget.connection.dashboardUsername,
+      password: widget.connection.dashboardPassword,
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -89,6 +127,28 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadComfyUrl();
     _initTtsProvider();
     _scrollController.addListener(_onScroll);
+    _textController.addListener(_onTextChanged);
+  }
+
+  /// Rebuilds only when the slash-command suggestion row should appear or
+  /// disappear, so this doesn't add a rebuild per keystroke on ordinary text.
+  bool _showingSlashSuggestions = false;
+  void _onTextChanged() {
+    final showing = _slashSuggestions().isNotEmpty;
+    if (showing != _showingSlashSuggestions) {
+      setState(() => _showingSlashSuggestions = showing);
+    }
+  }
+
+  /// Slash commands whose name starts with the current input, shown only
+  /// while the user is still typing the command name (no space yet).
+  List<MapEntry<String, String>> _slashSuggestions() {
+    final text = _textController.text;
+    if (!text.startsWith('/') || text.contains(' ')) return const [];
+    final query = text.toLowerCase();
+    return _slashCommands.entries
+        .where((e) => e.key.startsWith(query))
+        .toList();
   }
 
   /// Swap the default XTTS backend for the one chosen in Settings (Chatterbox)
@@ -120,9 +180,13 @@ class _ChatScreenState extends State<ChatScreen> {
     // Stop any in-flight late-media poll from touching state after teardown.
     _mediaPollGen++;
     _savedPositions[widget.session.id] = _lastPixels;
+    _tokenFlushTimer?.cancel();
+    _streamCancelToken?.cancel();
     _speechToText.cancel();
     _xtts.dispose();
     _client.close();
+    _dashboard?.close();
+    _textController.removeListener(_onTextChanged);
     _textController.dispose();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
@@ -287,25 +351,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
     final content = (msg['content'] as String?) ?? '';
 
-    // Need a configured speaker before we can speak.
-    final prefs = await SharedPreferences.getInstance();
-    final speaker = prefs.getString(XttsPrefs.speaker) ?? '';
-    if (speaker.isEmpty) {
-      debugPrint('[Replay] no XTTS speaker configured -> snackbar');
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Set a voice in Settings → Voice to replay'),
-          duration: Duration(seconds: 3),
-        ),
-      );
-      return;
-    }
-
     // Nothing speakable in this message -> silent no-op (don't set state).
-    final dialog = XttsService.extractDialog(content);
-    final speakable =
-        dialog.isNotEmpty ? dialog : XttsService.stripForSpeech(content);
+    final speakable = XttsService.stripForSpeech(content);
     if (speakable.isEmpty) {
       debugPrint('[Replay] no speakable text -> no-op');
       return;
@@ -329,7 +376,7 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _speakingMessage = null);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: const Text('Can\'t reach XTTS server'),
+          content: Text('Voice playback failed: $e'),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 3),
         ),
@@ -348,6 +395,22 @@ class _ChatScreenState extends State<ChatScreen> {
     if (atBottom != !_showScrollToBottom && _streaming) {
       setState(() => _showScrollToBottom = !atBottom);
     }
+  }
+
+  /// Applies buffered streaming tokens to the placeholder assistant message
+  /// in one setState, then clears the timer so the next onToken schedules
+  /// a fresh flush.
+  void _flushPendingTokens() {
+    _tokenFlushTimer = null;
+    if (_pendingTokens.isEmpty) return;
+    final chunk = _pendingTokens.toString();
+    _pendingTokens.clear();
+    if (!mounted) return;
+    setState(() {
+      if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
+        _messages.last['content'] = (_messages.last['content'] as String) + chunk;
+      }
+    });
   }
 
   void _scrollToBottom() {
@@ -513,10 +576,166 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   /// Send message via SSE streaming (Gateway API Server).
+  Future<void> _handleSlashCommand(String command) async {
+    switch (command) {
+      case '/new':
+        _cmdNewChat();
+        break;
+      case '/model':
+        await _cmdSwitchModel();
+        break;
+      case '/skills':
+        await _cmdSkills();
+        break;
+    }
+  }
+
+  void _cmdNewChat() {
+    final sessionId = GatewayChatClient.generateSessionId();
+    final session = Session(
+      id: sessionId,
+      title: 'New Chat',
+      model: 'hermes-agent',
+      source: 'mobile',
+      messageCount: 0,
+      isActive: true,
+      preview: '',
+      startedAt: DateTime.now().millisecondsSinceEpoch.toDouble() / 1000,
+    );
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) =>
+            ChatScreen(connection: widget.connection, session: session),
+      ),
+    );
+  }
+
+  Future<void> _cmdSkills() async {
+    // SkillsScreen pops back the tapped skill's name (enabled skills only).
+    // There's no client-callable "run this skill" endpoint — skills are
+    // invoked by the agent's own skill_view/skill_load tool calls, not by a
+    // slash command the API server understands (that expansion only exists
+    // in gateway/run.py's platform-adapter dispatch, which api_server.py
+    // doesn't go through). So this just seeds the composer with a prompt
+    // that nudges the model to pull the skill in, rather than pretending to
+    // invoke it directly.
+    final selected = await Navigator.push<String>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SkillsScreen(connection: widget.connection),
+      ),
+    );
+    if (selected == null || !mounted) return;
+    final prompt = 'Use the "$selected" skill: ';
+    _textController.text = prompt;
+    _textController.selection = TextSelection.collapsed(
+      offset: prompt.length,
+    );
+  }
+
+  Future<void> _cmdSwitchModel() async {
+    final dashboard = _dashboardClient();
+    Map<String, dynamic> info;
+    Map<String, dynamic> options;
+    try {
+      info = await dashboard.getModelInfo();
+      options = await dashboard.getModelOptions();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not load models: $e')),
+      );
+      return;
+    }
+    if (!mounted) return;
+
+    final currentProvider = (info['provider'] as String?) ?? '';
+    final currentModel = (info['model'] as String?) ?? '';
+    final providers = (options['providers'] as List<dynamic>? ?? [])
+        .whereType<Map<String, dynamic>>()
+        .toList();
+
+    final selection = await showModalBottomSheet<(String, String)>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) {
+        return SafeArea(
+          child: ListView(
+            shrinkWrap: true,
+            children: [
+              const Padding(
+                padding: EdgeInsets.all(16),
+                child: Text(
+                  'Switch model',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+              ),
+              for (final p in providers)
+                ..._modelTiles(sheetContext, p, currentProvider, currentModel),
+            ],
+          ),
+        );
+      },
+    );
+    if (selection == null || !mounted) return;
+
+    final (provider, model) = selection;
+    try {
+      await dashboard.setModel('main', provider, model);
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Model set to $model — applies to new sessions')),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not set model: $e')),
+      );
+    }
+  }
+
+  List<Widget> _modelTiles(
+    BuildContext sheetContext,
+    Map<String, dynamic> provider,
+    String currentProvider,
+    String currentModel,
+  ) {
+    final providerId =
+        (provider['slug'] as String?) ?? (provider['id'] as String?) ?? '';
+    final rawModels = provider['models'] as List<dynamic>? ?? [];
+    if (providerId.isEmpty || rawModels.isEmpty) return const [];
+    return [
+      Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
+        child: Text(
+          providerId,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
+      ),
+      for (final m in rawModels)
+        if (m is String)
+          ListTile(
+            dense: true,
+            title: Text(m),
+            trailing: providerId == currentProvider && m == currentModel
+                ? const Icon(Icons.check, size: 18)
+                : null,
+            onTap: () => Navigator.pop(sheetContext, (providerId, m)),
+          ),
+    ];
+  }
+
   Future<void> _sendMessage({bool speakResponse = false}) async {
     final text = _textController.text.trim();
     if (text.isEmpty) return;
     if (_sending || _streaming) return;
+
+    if (_slashCommands.containsKey(text.toLowerCase())) {
+      _textController.text = '';
+      await _handleSlashCommand(text.toLowerCase());
+      return;
+    }
 
     // Keep the user's text in case send fails — the controller is cleared
     // below and without this the typed message is gone for good on error.
@@ -558,24 +777,29 @@ class _ChatScreenState extends State<ChatScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
 
     // Accumulate tokens into the streaming placeholder
+    _streamCancelToken = StreamCancelToken();
     await _gateway.sendMessageStreaming(
       message: text,
       sessionId: widget.session.id,
       history: history,
+      cancelToken: _streamCancelToken,
       onToken: (token) {
         if (!mounted) return;
-        setState(() {
-          if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
-            _messages.last['content'] =
-                (_messages.last['content'] as String) + token;
-          }
-        });
+        _pendingTokens.write(token);
+        _tokenFlushTimer ??= Timer(_tokenFlushDelay, _flushPendingTokens);
       },
       onToolProgress: (progress) {
         if (!mounted) return;
         _upsertToolProgress(progress);
       },
       onDone: () async {
+        // Server-side history is about to replace _messages wholesale — drop
+        // any buffered tokens instead of letting a stray delayed flush write
+        // them onto the freshly fetched list.
+        _tokenFlushTimer?.cancel();
+        _tokenFlushTimer = null;
+        _pendingTokens.clear();
+        _streamCancelToken = null;
         if (!mounted) return;
         // Refresh messages to get the final server-side state
         try {
@@ -603,24 +827,7 @@ class _ChatScreenState extends State<ChatScreen> {
               await _speakAssistantText(assistantText);
             }
           }
-          final saved = _savedPositions[widget.session.id];
-      if (saved != null) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scrollController.hasClients) {
-            _scrollController.jumpTo(
-              saved.clamp(0.0, _scrollController.position.maxScrollExtent),
-            );
-          }
-        });
-      } else {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          if (_scrollController.hasClients) {
-            _scrollController.jumpTo(
-              _scrollController.position.maxScrollExtent,
-            );
-          }
-        });
-      }
+          WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
         } catch (e) {
           setState(() {
             _streaming = false;
@@ -629,6 +836,10 @@ class _ChatScreenState extends State<ChatScreen> {
         }
       },
       onError: (error) {
+        _tokenFlushTimer?.cancel();
+        _tokenFlushTimer = null;
+        _pendingTokens.clear();
+        _streamCancelToken = null;
         if (!mounted) return;
         // Remove the placeholder assistant message
         setState(() {
@@ -639,6 +850,15 @@ class _ChatScreenState extends State<ChatScreen> {
         _handleSendError(pending, error);
       },
     );
+  }
+
+  // Aborts the in-flight SSE connection. The gateway treats a dropped
+  // connection the same as any other client disconnect: it interrupts the
+  // agent and persists whatever was generated so far, so onDone's history
+  // refetch picks up the partial reply — mirrors the Telegram adapter's
+  // /stop command, which also just interrupts the running agent.
+  void _stopStreaming() {
+    _streamCancelToken?.cancel();
   }
 
   void _handleSendError(String text, Object e) {
@@ -731,18 +951,16 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
           ),
           if (_streaming)
-            const Padding(
-              padding: EdgeInsets.only(right: 8),
-              child: Row(
-                children: [
-                  SizedBox(
-                    width: 20,
-                    height: 20,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  ),
-                  SizedBox(width: 8),
-                  Text('Responding…', style: TextStyle(fontSize: 13)),
-                ],
+            Padding(
+              padding: const EdgeInsets.only(right: 4),
+              child: TextButton.icon(
+                onPressed: _stopStreaming,
+                icon: const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                ),
+                label: const Text('Stop', style: TextStyle(fontSize: 13)),
               ),
             )
           else
@@ -761,10 +979,32 @@ class _ChatScreenState extends State<ChatScreen> {
           child: Column(
             children: [
               Expanded(child: _buildBody()),
+              if (_showingSlashSuggestions) _buildSlashSuggestions(),
               _buildInputBar(),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  Widget _buildSlashSuggestions() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      color: Theme.of(context).colorScheme.surface,
+      child: Wrap(
+        spacing: 8,
+        children: [
+          for (final entry in _slashSuggestions())
+            ActionChip(
+              label: Text('${entry.key} — ${entry.value}'),
+              onPressed: () async {
+                _textController.text = '';
+                await _handleSlashCommand(entry.key);
+              },
+            ),
+        ],
       ),
     );
   }

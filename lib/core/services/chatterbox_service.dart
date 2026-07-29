@@ -125,10 +125,9 @@ class ChatterboxService implements TtsProvider {
 
   @override
   Future<void> speak(String text, {void Function()? onComplete}) async {
-    // Reuse the XTTS text cleaning: speak quoted dialog, else the
-    // action-stripped fallback, so a reply with no quotes still speaks.
-    final dialog = XttsService.extractDialog(text);
-    final spoken = dialog.isNotEmpty ? dialog : XttsService.stripForSpeech(text);
+    // Reuse the XTTS text cleaning, but speak the whole cleaned reply — not
+    // just quoted dialog.
+    final spoken = XttsService.stripForSpeech(text);
     if (spoken.isEmpty) {
       // Nothing to narrate (stage directions only, media-only reply, blocked
       // phrase, etc.). Still signal completion so callers like the call-mode
