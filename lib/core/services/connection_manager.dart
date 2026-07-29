@@ -294,6 +294,41 @@ class ApiClient {
 typedef ToolProgressCallback = void Function(Map<String, dynamic> progress);
 
 /// SSE streaming chat client for the Gateway API Server.
+/// A chat message's `content` split into plain text and any image URLs.
+/// `content` is either a plain String, or an OpenAI-style multimodal list
+/// of `{type: "text", text: ...}` / `{type: "image_url", image_url: {url}}`
+/// parts (what a message with an attached image round-trips as once the
+/// gateway persists and returns it).
+class MessageContent {
+  final String text;
+  final List<String> imageUrls;
+  const MessageContent(this.text, this.imageUrls);
+}
+
+MessageContent parseMessageContent(dynamic content) {
+  if (content is String) return MessageContent(content, const []);
+  if (content is List) {
+    final textParts = <String>[];
+    final images = <String>[];
+    for (final part in content) {
+      if (part is! Map) continue;
+      final type = part['type'];
+      if (type == 'text') {
+        final t = part['text']?.toString() ?? '';
+        if (t.isNotEmpty) textParts.add(t);
+      } else if (type == 'image_url' || type == 'input_image') {
+        final imageUrl = part['image_url'];
+        final url = imageUrl is Map
+            ? imageUrl['url']?.toString()
+            : imageUrl?.toString();
+        if (url != null && url.isNotEmpty) images.add(url);
+      }
+    }
+    return MessageContent(textParts.join('\n'), images);
+  }
+  return MessageContent(content?.toString() ?? '', const []);
+}
+
 class GatewayChatClient {
   final ApiClient _api;
   final String _baseUrl;
@@ -314,6 +349,14 @@ class GatewayChatClient {
   static List<Map<String, dynamic>> buildChatCompletionMessages({
     required String message,
     List<Map<String, dynamic>>? history,
+    // data: URLs (base64-encoded) for images attached to the message being
+    // sent right now. When non-empty, the latest user message becomes
+    // OpenAI-style multimodal content (a list of text/image_url parts)
+    // instead of a plain string. Only the *current* turn carries images —
+    // when continuing a session (X-Hermes-Session-Id set) the gateway
+    // reloads history from its own DB and ignores this `history` list
+    // entirely, so there's no need to re-serialize past images here.
+    List<String>? imageDataUrls,
   }) {
     final messages = <Map<String, dynamic>>[];
     if (history != null && history.isNotEmpty) {
@@ -324,7 +367,12 @@ class GatewayChatClient {
             rawRole != 'agent') {
           continue;
         }
-        final content = msg['content']?.toString().trim() ?? '';
+        // Prior multimodal messages are represented as a List in local
+        // state; only plain text is meaningful in the (server-ignored)
+        // history payload, so anything else is skipped here.
+        final rawContent = msg['content'];
+        if (rawContent is! String) continue;
+        final content = rawContent.trim();
         if (content.isEmpty) continue;
         messages.add({
           'role': rawRole == 'agent' ? 'assistant' : rawRole,
@@ -338,7 +386,17 @@ class GatewayChatClient {
         messages.isNotEmpty &&
         messages.last['role'] == 'user' &&
         messages.last['content'] == latest;
-    if (latest.isNotEmpty && !alreadyLast) {
+    if (imageDataUrls != null && imageDataUrls.isNotEmpty) {
+      final parts = <Map<String, dynamic>>[];
+      if (latest.isNotEmpty) parts.add({'type': 'text', 'text': latest});
+      for (final url in imageDataUrls) {
+        parts.add({
+          'type': 'image_url',
+          'image_url': {'url': url},
+        });
+      }
+      messages.add({'role': 'user', 'content': parts});
+    } else if (latest.isNotEmpty && !alreadyLast) {
       messages.add({'role': 'user', 'content': latest});
     }
     return messages;
@@ -399,6 +457,7 @@ class GatewayChatClient {
     required String sessionId,
     String? model,
     List<Map<String, dynamic>>? history,
+    List<String>? imageDataUrls,
     required void Function(String token) onToken,
     ToolProgressCallback? onToolProgress,
     required void Function() onDone,
@@ -408,6 +467,7 @@ class GatewayChatClient {
     final messages = buildChatCompletionMessages(
       message: message,
       history: history,
+      imageDataUrls: imageDataUrls,
     );
 
     final body = {

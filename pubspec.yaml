@@ -48,6 +48,9 @@ dependencies:
   video_player: ^2.9.0
   flutter_foreground_task: ^10.0.0
 
+  # User-side image attach (gallery picker) for multimodal chat messages
+  image_picker: ^1.1.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

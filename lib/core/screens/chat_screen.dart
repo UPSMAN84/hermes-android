@@ -2,9 +2,13 @@
 // Uses REST endpoints: POST /api/sessions/{id}/chat and
 // GET /api/sessions/{id}/messages.
 import 'dart:async';
+import 'dart:convert';
+import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:video_player/video_player.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
@@ -17,6 +21,7 @@ import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
 import 'call_screen.dart';
+import 'media_gallery_screen.dart';
 import 'skills_screen.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -47,6 +52,12 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _streaming = false;
   StreamCancelToken? _streamCancelToken;
 
+  // Image attach (gallery picker) — one pending image per send, mirroring
+  // Telegram's attach-then-caption flow.
+  final ImagePicker _imagePicker = ImagePicker();
+  Uint8List? _pickedImageBytes;
+  String? _pickedImageMimeType;
+
   // Voice input / spoken replies
   final SpeechToText _speechToText = SpeechToText();
   TtsProvider _xtts = XttsService();
@@ -71,6 +82,21 @@ class _ChatScreenState extends State<ChatScreen> {
   // if it changes, so a stale poll from a previous turn can't clobber newer
   // state.
   int _mediaPollGen = 0;
+
+  // Auto-continue: after a reply finishes (voice playback done, or a short
+  // fixed delay if voice reply is off), automatically send another turn at a
+  // random interval, indefinitely, until toggled off or Stop is hit. The
+  // continuation turn is a fixed, content-neutral nudge — this only drives
+  // the send loop, it never picks or steers what gets said.
+  bool _autoContinueEnabled = false;
+  Timer? _autoContinueTimer;
+  final _autoContinueRandom = Random();
+
+  // Images discovered mid-stream (via a completed image_generate tool call)
+  // that haven't landed in a getMessages() refetch yet — rendered as their
+  // own row right under the in-progress reply so a generated image shows up
+  // as soon as it's ready instead of waiting for the whole turn to finish.
+  final List<String> _liveMediaUrls = [];
 
   // Scroll management
   final _scrollController = ScrollController();
@@ -182,6 +208,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _savedPositions[widget.session.id] = _lastPixels;
     _tokenFlushTimer?.cancel();
     _streamCancelToken?.cancel();
+    _autoContinueTimer?.cancel();
     _speechToText.cancel();
     _xtts.dispose();
     _client.close();
@@ -307,12 +334,16 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _speakAssistantText(String text) async {
+  Future<void> _speakAssistantText(String text, {void Function()? onComplete}) async {
     final spokenText = text.trim();
-    if (spokenText.isEmpty || !_voiceReplyEnabled) return;
+    if (spokenText.isEmpty || !_voiceReplyEnabled) {
+      onComplete?.call();
+      return;
+    }
     try {
-      await _xtts.speak(spokenText);
+      await _xtts.speak(spokenText, onComplete: onComplete);
     } catch (e) {
+      onComplete?.call();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -513,6 +544,33 @@ class _ChatScreenState extends State<ChatScreen> {
         _extractToolMessages(messages);
         setState(() => _messages = messages);
         known = fresh;
+        return;
+      }
+    }
+  }
+
+  /// Fired the moment an `image_generate` tool call reports "completed"
+  /// mid-stream. The tool-result message carrying the rendered file path
+  /// lands in the DB a beat later, so poll briefly and, as soon as it shows
+  /// up, surface it via [_liveMediaUrls] instead of waiting for the whole
+  /// turn to finish and the [onDone] refetch to happen.
+  Future<void> _pollForLiveMedia() async {
+    final gen = _mediaPollGen;
+    final known = _mediaUrlsIn(_messages)..addAll(_liveMediaUrls);
+    for (var attempt = 0; attempt < 5; attempt++) {
+      await Future.delayed(const Duration(milliseconds: 800));
+      if (!mounted || gen != _mediaPollGen) return;
+      List<Map<String, dynamic>> messages;
+      try {
+        messages = await _client.getMessages(widget.session.id);
+      } catch (_) {
+        continue;
+      }
+      if (!mounted || gen != _mediaPollGen) return;
+      final fresh = _mediaUrlsIn(messages).difference(known);
+      if (fresh.isNotEmpty) {
+        setState(() => _liveMediaUrls.addAll(fresh));
+        WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
         return;
       }
     }
@@ -726,12 +784,12 @@ class _ChatScreenState extends State<ChatScreen> {
     ];
   }
 
-  Future<void> _sendMessage({bool speakResponse = false}) async {
-    final text = _textController.text.trim();
+  Future<void> _sendMessage({bool speakResponse = false, String? textOverride}) async {
+    final text = (textOverride ?? _textController.text).trim();
     if (text.isEmpty) return;
     if (_sending || _streaming) return;
 
-    if (_slashCommands.containsKey(text.toLowerCase())) {
+    if (textOverride == null && _slashCommands.containsKey(text.toLowerCase())) {
       _textController.text = '';
       await _handleSlashCommand(text.toLowerCase());
       return;
@@ -740,7 +798,7 @@ class _ChatScreenState extends State<ChatScreen> {
     // Keep the user's text in case send fails — the controller is cleared
     // below and without this the typed message is gone for good on error.
     final pending = text;
-    _textController.text = '';
+    if (textOverride == null) _textController.text = '';
     // Speak the reply whenever spoken replies are toggled on, regardless of
     // whether the message was typed or dictated.
     _awaitingVoiceReply = _voiceReplyEnabled;
@@ -755,7 +813,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (rawRole != 'user' && rawRole != 'assistant' && rawRole != 'agent') {
         continue;
       }
-      final content = m['content']?.toString().trim() ?? '';
+      final content = parseMessageContent(m['content']).text.trim();
       if (content.isEmpty) continue;
       history.add({
         'role': rawRole == 'agent' ? 'assistant' : rawRole,
@@ -763,15 +821,38 @@ class _ChatScreenState extends State<ChatScreen> {
       });
     }
 
+    // Attach the pending picked photo (if any) as a data: URL. Only the
+    // current turn carries the image — see buildChatCompletionMessages.
+    List<String>? imageDataUrls;
+    final pickedBytes = _pickedImageBytes;
+    if (pickedBytes != null) {
+      final dataUrl =
+          'data:${_pickedImageMimeType ?? 'image/jpeg'};base64,${base64Encode(pickedBytes)}';
+      imageDataUrls = [dataUrl];
+    }
+    final localContent = imageDataUrls != null
+        ? <Map<String, dynamic>>[
+            if (text.isNotEmpty) {'type': 'text', 'text': text},
+            for (final url in imageDataUrls)
+              {
+                'type': 'image_url',
+                'image_url': {'url': url},
+              },
+          ]
+        : text;
+
     // Invalidate any in-flight late-media poll from the previous turn.
     _mediaPollGen++;
     setState(() {
       _sending = true;
       _streaming = true;
       _showScrollToBottom = false;
-      _messages.add({'role': 'user', 'content': text});
+      _messages.add({'role': 'user', 'content': localContent});
       // Insert a placeholder streaming message
       _messages.add({'role': 'assistant', 'content': ''});
+      _pickedImageBytes = null;
+      _pickedImageMimeType = null;
+      _liveMediaUrls.clear();
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
@@ -782,6 +863,7 @@ class _ChatScreenState extends State<ChatScreen> {
       message: text,
       sessionId: widget.session.id,
       history: history,
+      imageDataUrls: imageDataUrls,
       cancelToken: _streamCancelToken,
       onToken: (token) {
         if (!mounted) return;
@@ -811,6 +893,9 @@ class _ChatScreenState extends State<ChatScreen> {
             _streaming = false;
             _sending = false;
             _showScrollToBottom = false;
+            // The real message list now carries whatever _liveMediaUrls was
+            // standing in for — drop it so nothing renders twice.
+            _liveMediaUrls.clear();
           });
           // The image tool's result row may land just after this refetch;
           // poll briefly so a freshly generated image doesn't require leaving
@@ -824,8 +909,17 @@ class _ChatScreenState extends State<ChatScreen> {
             );
             final assistantText = assistant['content']?.toString();
             if (assistantText != null) {
-              await _speakAssistantText(assistantText);
+              await _speakAssistantText(
+                assistantText,
+                onComplete: _autoContinueEnabled ? _scheduleAutoContinue : null,
+              );
+            } else if (_autoContinueEnabled) {
+              _scheduleAutoContinue();
             }
+          } else if (_autoContinueEnabled) {
+            // Voice reply is off, so there's no playback-finished signal to
+            // wait on — just pace on a fixed delay instead.
+            _scheduleAutoContinue();
           }
           WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
         } catch (e) {
@@ -857,8 +951,40 @@ class _ChatScreenState extends State<ChatScreen> {
   // agent and persists whatever was generated so far, so onDone's history
   // refetch picks up the partial reply — mirrors the Telegram adapter's
   // /stop command, which also just interrupts the running agent.
+  //
+  // Also the kill switch for auto-continue: hitting Stop ends the
+  // automatic-reply loop, not just the in-flight response.
   void _stopStreaming() {
     _streamCancelToken?.cancel();
+    _autoContinueTimer?.cancel();
+    _autoContinueTimer = null;
+    if (_autoContinueEnabled && mounted) {
+      setState(() => _autoContinueEnabled = false);
+    }
+  }
+
+  void _toggleAutoContinue() {
+    setState(() => _autoContinueEnabled = !_autoContinueEnabled);
+    if (!_autoContinueEnabled) {
+      _autoContinueTimer?.cancel();
+      _autoContinueTimer = null;
+    }
+  }
+
+  /// Schedules the next automatic turn at a random interval (30s–3min),
+  /// fired once the previous reply's audio has finished playing (or
+  /// immediately-ish if voice reply is off). The continuation text is a
+  /// fixed, neutral nudge — content is entirely whatever the user steered
+  /// the conversation toward themselves.
+  void _scheduleAutoContinue() {
+    if (!_autoContinueEnabled || !mounted) return;
+    _autoContinueTimer?.cancel();
+    final delay = Duration(seconds: 30 + _autoContinueRandom.nextInt(151));
+    _autoContinueTimer = Timer(delay, () {
+      _autoContinueTimer = null;
+      if (!_autoContinueEnabled || !mounted || _sending || _streaming) return;
+      _sendMessage(textOverride: 'Continue.');
+    });
   }
 
   void _handleSendError(String text, Object e) {
@@ -925,6 +1051,10 @@ class _ChatScreenState extends State<ChatScreen> {
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+
+    if (done && tool == 'image_generate') {
+      _pollForLiveMedia();
+    }
   }
 
   @override
@@ -937,6 +1067,31 @@ class _ChatScreenState extends State<ChatScreen> {
           overflow: TextOverflow.ellipsis,
         ),
         actions: [
+          IconButton(
+            icon: Icon(
+              _autoContinueEnabled ? Icons.repeat_on : Icons.repeat,
+            ),
+            color: _autoContinueEnabled
+                ? Theme.of(context).colorScheme.primary
+                : null,
+            tooltip: _autoContinueEnabled
+                ? 'Auto-continue on — tap to stop'
+                : 'Auto-continue: send another turn automatically after each reply',
+            onPressed: _toggleAutoContinue,
+          ),
+          IconButton(
+            icon: const Icon(Icons.photo_library_outlined),
+            tooltip: 'Image gallery',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(
+                builder: (_) => MediaGalleryScreen(
+                  messages: _messages,
+                  comfyBaseUrl: _comfyBaseUrl,
+                ),
+              ),
+            ),
+          ),
           IconButton(
             icon: const Icon(Icons.call),
             tooltip: 'Phone call mode',
@@ -1019,8 +1174,20 @@ class _ChatScreenState extends State<ChatScreen> {
         ],
       ),
       child: SafeArea(
-        child: Row(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            if (_pickedImageBytes != null) _buildImagePreviewStrip(),
+            Row(
+          children: [
+            IconButton(
+              icon: const Icon(Icons.image_outlined),
+              tooltip: 'Attach photo',
+              onPressed: (!_loading && !_streaming && !_sending)
+                  ? _pickImage
+                  : null,
+            ),
             Expanded(
               child: TextField(
                 controller: _textController,
@@ -1082,9 +1249,63 @@ class _ChatScreenState extends State<ChatScreen> {
                     ),
             ),
           ],
+            ),
+          ],
         ),
       ),
     );
+  }
+
+  Widget _buildImagePreviewStrip() {
+    return Padding(
+      padding: const EdgeInsets.only(left: 8, right: 8, bottom: 4),
+      child: Row(
+        children: [
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: Image.memory(
+              _pickedImageBytes!,
+              width: 56,
+              height: 56,
+              fit: BoxFit.cover,
+            ),
+          ),
+          const SizedBox(width: 8),
+          const Text('Photo attached', style: TextStyle(fontSize: 12)),
+          const Spacer(),
+          IconButton(
+            icon: const Icon(Icons.close, size: 18),
+            tooltip: 'Remove photo',
+            onPressed: () => setState(() {
+              _pickedImageBytes = null;
+              _pickedImageMimeType = null;
+            }),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _pickImage() async {
+    final file = await _imagePicker.pickImage(
+      source: ImageSource.gallery,
+      maxWidth: 2000,
+      imageQuality: 85,
+    );
+    if (file == null || !mounted) return;
+    final bytes = await file.readAsBytes();
+    if (!mounted) return;
+    final ext = file.name.split('.').last.toLowerCase();
+    final mime = switch (ext) {
+      'png' => 'image/png',
+      'webp' => 'image/webp',
+      'gif' => 'image/gif',
+      _ => 'image/jpeg',
+    };
+    setState(() {
+      _pickedImageBytes = bytes;
+      _pickedImageMimeType = mime;
+    });
   }
 
   Widget _buildBody() {
@@ -1144,8 +1365,8 @@ class _ChatScreenState extends State<ChatScreen> {
         continue;
       }
       if (role != 'user' && role != 'assistant') continue;
-      final content = (msg['content'] as String?) ?? '';
-      if (content.isEmpty) continue;
+      final parsed = parseMessageContent(msg['content']);
+      if (parsed.text.isEmpty && parsed.imageUrls.isEmpty) continue;
 
       if (currentGroup.isNotEmpty) {
         displayMessages.add(currentGroup.toList());
@@ -1170,6 +1391,12 @@ class _ChatScreenState extends State<ChatScreen> {
       displayMessages.add(toolQueue.toList());
     }
 
+    // A generated image that landed mid-stream, before the turn's final
+    // getMessages() refetch — see _pollForLiveMedia.
+    if (_streaming && _liveMediaUrls.isNotEmpty) {
+      displayMessages.add(_liveMediaUrls.toList());
+    }
+
     return ListView.builder(
       controller: _scrollController,
       padding: const EdgeInsets.only(bottom: 4),
@@ -1188,11 +1415,12 @@ class _ChatScreenState extends State<ChatScreen> {
 
         final msg = item as Map<String, dynamic>;
         final role = (msg['role'] as String?) ?? 'assistant';
-        final content = (msg['content'] as String?) ?? '';
+        final parsed = parseMessageContent(msg['content']);
         final isUser = role == 'user';
 
         return _MessageBubble(
-          content: content,
+          content: parsed.text,
+          imageUrls: parsed.imageUrls,
           isUser: isUser,
           verbose: _verboseMode,
           metadata: msg,
@@ -1206,6 +1434,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
 class _MessageBubble extends StatelessWidget {
   final String content;
+  final List<String> imageUrls;
   final bool isUser;
   final bool verbose;
   final Map<String, dynamic> metadata;
@@ -1214,6 +1443,7 @@ class _MessageBubble extends StatelessWidget {
 
   const _MessageBubble({
     required this.content,
+    this.imageUrls = const [],
     required this.isUser,
     this.verbose = false,
     this.metadata = const {},
@@ -1295,9 +1525,21 @@ class _MessageBubble extends StatelessWidget {
               ),
             ),
           ],
+          if (imageUrls.isNotEmpty)
+            Padding(
+              padding: EdgeInsets.only(bottom: content.isEmpty ? 0 : 8),
+              child: Wrap(
+                spacing: 6,
+                runSpacing: 6,
+                children: imageUrls
+                    .map((url) => _AttachedImage(url: url))
+                    .toList(),
+              ),
+            ),
           // Message content
-          MarkdownBody(
-            data: content,
+          if (content.isNotEmpty)
+            MarkdownBody(
+              data: content,
             styleSheet: MarkdownStyleSheet(
               p: (isUser
                   ? theme.textTheme.bodyMedium?.copyWith(color: Colors.white)
@@ -1445,6 +1687,58 @@ class _ToolProgressCard extends StatelessWidget {
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+/// An image attached to a chat message (sent by the user, or echoed back by
+/// the gateway from persisted history). Handles both `data:` URLs (the raw
+/// bytes we just picked and haven't round-tripped through the server yet)
+/// and `http(s)` URLs. Tappable to view full-screen.
+class _AttachedImage extends StatelessWidget {
+  final String url;
+  const _AttachedImage({required this.url});
+
+  Uint8List? get _dataBytes {
+    if (!url.startsWith('data:')) return null;
+    final comma = url.indexOf(',');
+    if (comma < 0) return null;
+    try {
+      return base64Decode(url.substring(comma + 1));
+    } catch (_) {
+      return null;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bytes = _dataBytes;
+    final image = bytes != null
+        ? Image.memory(bytes, fit: BoxFit.cover)
+        : Image.network(url, fit: BoxFit.cover);
+
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: GestureDetector(
+        onTap: () => Navigator.of(context).push(
+          MaterialPageRoute(
+            builder: (_) => Scaffold(
+              backgroundColor: Colors.black,
+              appBar: AppBar(backgroundColor: Colors.black),
+              body: SafeArea(
+                child: Center(
+                  child: InteractiveViewer(
+                    child: bytes != null
+                        ? Image.memory(bytes)
+                        : Image.network(url),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+        child: SizedBox(width: 140, height: 140, child: image),
       ),
     );
   }
