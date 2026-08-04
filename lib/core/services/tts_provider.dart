@@ -16,6 +16,9 @@ abstract class TtsProvider {
   /// Stop any in-progress playback.
   Future<void> stop();
 
+  Future<void> pause();
+  Future<void> resume();
+
   /// True while audio is playing. Used by callers to gate mic input — if the
   /// recognizer captures the TTS output as a "turn" the user gets a garbage
   /// reply. May briefly report true during synthesis before playback starts.
@@ -30,9 +33,14 @@ const String ttsProviderPrefKey = 'tts_provider';
 
 /// Build the TTS backend selected in [prefs]. Defaults to XTTS-v2 so existing
 /// setups are unchanged.
-Future<TtsProvider> ttsProviderForPrefs(SharedPreferences prefs) {
+Future<TtsProvider> ttsProviderForPrefs(
+  SharedPreferences prefs, {
+  String? fallbackHost,
+}) {
   final provider = prefs.getString(ttsProviderPrefKey) ?? 'xtts';
   return Future.value(
-    provider == 'chatterbox' ? ChatterboxService() : XttsService(),
+    provider == 'chatterbox'
+        ? ChatterboxService(fallbackHost: fallbackHost)
+        : XttsService(fallbackHost: fallbackHost),
   );
 }

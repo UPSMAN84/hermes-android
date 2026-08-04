@@ -4,6 +4,7 @@
 // for the call screen to render.
 import 'package:audioplayers/audioplayers.dart';
 import 'package:flutter/foundation.dart';
+import 'dart:async';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
@@ -11,9 +12,15 @@ import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
 import 'call_audio.dart';
+import 'call_route_policy.dart';
 import 'connection_manager.dart';
 import 'tts_provider.dart';
 import 'xtts_service.dart';
+import 'async_generation_gate.dart';
+import 'speech_queue.dart';
+import 'speech_recognition_coordinator.dart';
+import 'speech_retry_backoff.dart';
+import 'speech_segmenter.dart';
 
 /// Entry point for the foreground-service task isolate. The call's actual loop
 /// runs in the main isolate; this handler just lets the service exist
@@ -49,8 +56,19 @@ class CallController extends ChangeNotifier {
 
   CallController({required this.connection, required this.session});
 
-  final SpeechToText _speech = SpeechToText();
-  TtsProvider _xtts = XttsService();
+  final Object _speechOwner = Object();
+  final SpeechRecognitionCoordinator _speechCoordinator =
+      SpeechRecognitionCoordinator.instance;
+  SpeechToText get _speech => _speechCoordinator.speech;
+  late TtsProvider _xtts = XttsService(fallbackHost: connection.host);
+  final AsyncGenerationGate _lifecycle = AsyncGenerationGate();
+  bool _disposed = false;
+  StreamSubscription<int>? _audioFocusSubscription;
+  bool _ttsPausedForFocus = false;
+  final SpeechRetryBackoff _speechRetryBackoff = SpeechRetryBackoff();
+  Timer? _listenRetryTimer;
+  DateTime _listenRetryNotBefore = DateTime.fromMillisecondsSinceEpoch(0);
+  bool _listenStarting = false;
   late final ApiClient _api;
   late final GatewayChatClient _gateway;
 
@@ -70,6 +88,7 @@ class CallController extends ChangeNotifier {
   /// `AudioManager.isSpeakerphoneOn` after `_applyCallAudio` so the UI matches
   /// the actual route on first render; updated by [toggleSpeaker].
   bool _speakerOn = true;
+  bool _bluetoothActive = false;
   bool get speakerOn => _speakerOn;
 
   String? _status;
@@ -82,9 +101,22 @@ class CallController extends ChangeNotifier {
   bool _audioStopped = false;
   String _sttLocaleId = 'en-US';
   final StringBuffer _replyBuffer = StringBuffer();
+  StreamCancelToken? _sendCancelToken;
+
+  // Tail of the streaming reply not yet handed to the speech queue. Chunks are
+  // cut off the front at sentence boundaries as tokens arrive.
+  String _speakTail = '';
+  late final SpeechQueue _speechQueue = SpeechQueue(() => _xtts);
+
+  // Don't speak a first chunk shorter than this — a bare "Hi." would otherwise
+  // be synthesized on its own, wasting a round-trip on one word. Later chunks
+  // have no minimum: by then audio is already playing, so the queue just needs
+  // to stay fed.
+  static const _firstChunkMinChars = 40;
 
   /// Enter the call: build the Gateway client, init the mic, start listening.
   Future<void> start() async {
+    final lifecycle = _lifecycle.begin();
     _api = ApiClient(
       baseUrl: connection.baseUrl,
       apiKey: connection.apiKey,
@@ -92,10 +124,13 @@ class CallController extends ChangeNotifier {
     );
     _gateway = GatewayChatClient(_api);
 
-    _speechAvailable = await _speech.initialize(
+    _speechCoordinator.claim(
+      _speechOwner,
       onStatus: _onSpeechStatus,
       onError: _onSpeechError,
     );
+    _speechAvailable = await _speechCoordinator.initialize();
+    if (!_lifecycle.isCurrent(lifecycle)) return;
     if (!_speechAvailable) {
       _status = 'Speech recognition unavailable on this device';
       _setState(CallState.error);
@@ -105,19 +140,49 @@ class CallController extends ChangeNotifier {
     // Derive the STT locale from the saved XTTS language (same convention as
     // the chat screen's voice input).
     final prefs = await SharedPreferences.getInstance();
+    if (!_lifecycle.isCurrent(lifecycle)) return;
     final lang = prefs.getString(XttsPrefs.language) ?? XttsPrefs.defaultLanguage;
     _sttLocaleId = _localeFor(lang);
 
     // Use the TTS backend selected in Settings (default XTTS).
-    final tts = await ttsProviderForPrefs(prefs);
+    final tts = await ttsProviderForPrefs(prefs, fallbackHost: connection.host);
+    if (!_lifecycle.isCurrent(lifecycle)) {
+      tts.dispose();
+      return;
+    }
     if (tts is! XttsService) {
       _xtts.dispose();
       _xtts = tts;
+    } else {
+      // Already holding an XttsService (the default) — this freshly built
+      // one won't be used, so release its AudioPlayer/http.Client now.
+      tts.dispose();
     }
 
     _active = true;
     await _applyCallAudio();
+    if (!_lifecycle.isCurrent(lifecycle)) {
+      await CallAudio.stopCallAudio();
+      return;
+    }
+    if (callAudioFocusStrategy() == CallAudioFocusStrategy.manualCall) {
+      _audioFocusSubscription ??=
+          CallAudio.audioFocusChanges.listen(_onAudioFocusChange);
+      await CallAudio.requestAudioFocus();
+    }
+    if (!_lifecycle.isCurrent(lifecycle)) {
+      await _audioFocusSubscription?.cancel();
+      _audioFocusSubscription = null;
+      await CallAudio.abandonAudioFocus();
+      await CallAudio.stopCallAudio();
+      return;
+    }
     await _startForegroundService();
+    if (!_lifecycle.isCurrent(lifecycle)) {
+      await FlutterForegroundTask.stopService();
+      await CallAudio.stopCallAudio();
+      return;
+    }
     _listen();
   }
 
@@ -135,9 +200,10 @@ class CallController extends ChangeNotifier {
   /// routing on first render — toggling works the same regardless.
   Future<void> _applyCallAudio() async {
     final scoOn = await CallAudio.startCallAudio();
+    _bluetoothActive = scoOn;
     debugPrint('[Call] SCO ready: $scoOn');
     final speakerState = await CallAudio.setSpeakerphone(enabled: false);
-    _speakerOn = speakerState;
+    if (speakerState != null) _speakerOn = speakerState;
   }
 
   /// Undo [_applyCallAudio]: stop SCO, return to normal mode + media playback.
@@ -145,6 +211,9 @@ class CallController extends ChangeNotifier {
   Future<void> _restoreAudio() async {
     if (_audioStopped) return;
     _audioStopped = true;
+    await _audioFocusSubscription?.cancel();
+    _audioFocusSubscription = null;
+    await CallAudio.abandonAudioFocus();
     await CallAudio.stopCallAudio();
     try {
       await AudioPlayer.global.setAudioContext(
@@ -153,6 +222,50 @@ class CallController extends ChangeNotifier {
         ),
       );
     } catch (_) {}
+  }
+
+  Future<void> _prepareAudioPhase(CallAudioPhase phase) async {
+    final route = callRouteForPhase(
+      phase: phase,
+      bluetoothActive: _bluetoothActive,
+      speakerOn: _speakerOn,
+    );
+    switch (route) {
+      case CallNativeRoute.released:
+        await CallAudio.stopCallAudio();
+        break;
+      case CallNativeRoute.handset:
+        _bluetoothActive = await CallAudio.startCallAudio();
+        if (!_bluetoothActive) {
+          await CallAudio.setSpeakerphone(enabled: false);
+        }
+        break;
+      case CallNativeRoute.speaker:
+        await CallAudio.setSpeakerphone(enabled: true);
+        break;
+      case CallNativeRoute.bluetooth:
+        break;
+    }
+  }
+
+  Future<void> _onAudioFocusChange(int change) async {
+    if (!_active) return;
+    if (change == 1) {
+      if (_ttsPausedForFocus) {
+        _ttsPausedForFocus = false;
+        await _xtts.resume();
+      } else if (!_muted && _state != CallState.thinking) {
+        await _listen();
+      }
+      return;
+    }
+    try {
+      await _speech.cancel();
+    } catch (_) {}
+    if (_xtts.isPlaying) {
+      _ttsPausedForFocus = true;
+      await _xtts.pause();
+    }
   }
 
   /// Start the microphone-type foreground service so the call survives
@@ -171,7 +284,10 @@ class CallController extends ChangeNotifier {
         serviceId: 256,
         notificationTitle: 'Hermes call',
         notificationText: 'Voice call in progress',
-        serviceTypes: const [ForegroundServiceTypes.microphone],
+        serviceTypes: const [
+          ForegroundServiceTypes.microphone,
+          ForegroundServiceTypes.mediaPlayback,
+        ],
         callback: callTaskStartCallback,
       );
     } catch (e) {
@@ -182,28 +298,45 @@ class CallController extends ChangeNotifier {
   /// Start one listening turn. This front guard is the single gate for
   /// re-arming — callers (onComplete, onError, status/error handlers) may call
   /// bare _listen() without repeating the active/muted checks.
-  void _listen() {
-    if (!_active || _muted || !_speechAvailable) return;
+  Future<void> _listen() async {
+    if (!_active || _muted || !_speechAvailable || _listenStarting) return;
     // Don't open the mic while TTS is still playing — we'd capture our own
-    // reply and send it as the next turn. If TTS is busy, schedule a re-arm
-    // for after it finishes (caller's onComplete path will re-call _listen).
-    if (_xtts.isPlaying) {
+    // reply and send it as the next turn. Also covers the gaps between queued
+    // chunks of a streaming reply, where the player is briefly idle but the
+    // reply isn't finished; the queue's onAllSpoken re-calls _listen.
+    if (_xtts.isPlaying || _speechQueue.isSpeaking) {
       debugPrint('[Call] defer listen: TTS still playing');
+      return;
+    }
+    _listenStarting = true;
+    try {
+      await _prepareAudioPhase(CallAudioPhase.listening);
+    } catch (e) {
+      debugPrint('[Call] listening route failed: $e');
+    }
+    if (!_active || _muted) {
+      _listenStarting = false;
       return;
     }
     final epoch = ++_listenEpoch;
     _lastTranscript = '';
     _setState(CallState.listening);
-    _speech.listen(
+    _speechCoordinator.claim(
+      _speechOwner,
+      onStatus: _onSpeechStatus,
+      onError: _onSpeechError,
+    );
+    try {
+      await _speech.listen(
       onResult: (r) => _onResult(r, epoch),
       listenOptions: SpeechListenOptions(
         // 60s hard cap per turn so a stuck-open mic can't hang the call.
         listenFor: const Duration(seconds: 60),
-        // 4s end-of-turn silence. Maps to
+        // 1.5s end-of-turn silence. Maps to
         // EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS — hard session
-        // close after this much silence, not an energy-VAD knob. 4s (up from 3s)
-        // gives room for a mid-sentence pause without cutting the turn short.
-        pauseFor: const Duration(milliseconds: 4000),
+        // close after this much silence, not an energy-VAD knob. This keeps
+        // call-mode replies responsive after the user stops talking.
+        pauseFor: const Duration(milliseconds: 1500),
         localeId: _sttLocaleId,
         listenMode: ListenMode.dictation,
         // Enable partial results so we see the running transcript as Android
@@ -220,7 +353,17 @@ class CallController extends ChangeNotifier {
         // back to the cloud recognizer with a beep if no offline model.
         onDevice: true,
       ),
-    );
+      );
+    } catch (e) {
+      if (!_active || epoch != _listenEpoch) return;
+      _status = 'Microphone failed: $e';
+      notifyListeners();
+      final delay = _speechRetryBackoff.recordFailure();
+      _listenRetryNotBefore = DateTime.now().add(delay);
+      _scheduleListen();
+    } finally {
+      _listenStarting = false;
+    }
   }
 
   // Latest non-empty transcript for the current listen session. Updated on
@@ -230,6 +373,8 @@ class CallController extends ChangeNotifier {
   void _onResult(SpeechRecognitionResult result, int epoch) {
     if (!_active || epoch != _listenEpoch) return;
     final text = result.recognizedWords.trim();
+    _speechRetryBackoff.reset();
+    _listenRetryNotBefore = DateTime.fromMillisecondsSinceEpoch(0);
     if (text.isNotEmpty) _lastTranscript = text;
     // partialResults: true → Android emits partials while speaking AND a final
     // at session close. Send on final; ignore empty finals (some recognizers
@@ -242,46 +387,90 @@ class CallController extends ChangeNotifier {
   }
 
   /// Send a recognized turn to the Gateway and stream the reply.
+  ///
+  /// Speech starts at the first sentence boundary rather than waiting for the
+  /// whole generation: on a slow backend the reply can take a minute or more,
+  /// and holding all audio until the final token made the call feel dead. The
+  /// mic stays closed until every queued chunk has played (see [_speechQueue]),
+  /// so we still never record our own voice.
   Future<void> _send(String text) async {
     _setState(CallState.thinking);
     _replyBuffer.clear();
+    _speakTail = '';
+    var speaking = false;
+    final cancelToken = StreamCancelToken();
+    _sendCancelToken = cancelToken;
+
+    _speechQueue.start(onAllSpoken: () {
+      if (_active && !_muted) _listen();
+    });
+
+    // Cuts every complete sentence off the tail and queues it. Called on each
+    // token, and once more at end-of-stream to flush whatever is left.
+    void pump({required bool flush}) {
+      if (!_active) return;
+      final segmentation = segmentSpeech(
+        _speakTail,
+        minChunkChars: speaking ? 0 : _firstChunkMinChars,
+      );
+      _speakTail = segmentation.remainder;
+      var chunks = segmentation.chunks;
+      if (flush) {
+        final tail = _speakTail.trim();
+        _speakTail = '';
+        if (tail.isNotEmpty) chunks = [...chunks, tail];
+      }
+      if (chunks.isEmpty) return;
+      if (!speaking) {
+        speaking = true;
+        _setState(CallState.speaking);
+        // Route audio for playback before the first chunk is synthesized.
+        unawaited(_prepareAudioPhase(CallAudioPhase.speaking));
+      }
+      for (final chunk in chunks) {
+        _speechQueue.enqueue(chunk);
+      }
+    }
+
     await _gateway.sendMessageStreaming(
       message: text,
       sessionId: session.id,
-      onToken: (token) => _replyBuffer.write(token),
-      onDone: () => _speak(_replyBuffer.toString()),
+      cancelToken: cancelToken,
+      onToken: (token) {
+        _replyBuffer.write(token);
+        if (!_active) return;
+        _speakTail += token;
+        pump(flush: false);
+      },
+      onDone: () {
+        _sendCancelToken = null;
+        if (!_active) return;
+        pump(flush: true);
+        // Nothing was speakable (empty reply, or stripped to nothing) — the
+        // queue never got a chunk, so re-arm the mic directly.
+        if (!speaking) {
+          _speechQueue.markComplete();
+          _listen();
+          return;
+        }
+        _speechQueue.markComplete();
+      },
       onError: (error) {
+        _sendCancelToken = null;
+        if (!_active) return;
         debugPrint('[Call] send error: $error');
         _status = 'Send failed: $error';
         notifyListeners();
-        // Keep the call alive: resume listening after a failed turn.
-        _listen();
+        // Keep the call alive: finish anything already queued, else re-listen.
+        if (speaking) {
+          pump(flush: true);
+          _speechQueue.markComplete();
+        } else {
+          unawaited(_speechQueue.cancel());
+          _listen();
+        }
       },
     );
-  }
-
-  /// Speak the agent reply, then resume listening on completion.
-  Future<void> _speak(String reply) async {
-    final spoken = reply.trim();
-    if (spoken.isEmpty) {
-      _listen();
-      return;
-    }
-    _setState(CallState.speaking);
-    try {
-      await _xtts.speak(
-        spoken,
-        onComplete: () {
-          if (_active && !_muted) _listen();
-        },
-      );
-    } catch (e) {
-      debugPrint('[Call] speak failed: $e');
-      _status = 'Voice offline — replies silent';
-      notifyListeners();
-      // TTS down should not end the call; keep listening.
-      _listen();
-    }
   }
 
   void _onSpeechStatus(String status) {
@@ -291,27 +480,43 @@ class CallController extends ChangeNotifier {
     // Guard with the current epoch so a stale `done` from a listen session
     // that was already superseded doesn't trigger a second listen() racing
     // with the one that's actually live.
+    if (status == 'listening') {
+      _listenRetryTimer?.cancel();
+      _listenRetryTimer = null;
+    }
     if ((status == 'done' || status == 'notListening') &&
         _active &&
         !_muted &&
-        _state == CallState.listening) {
-      _listen();
+        _state == CallState.listening &&
+        shouldRearmAfterSpeechStatus(status)) {
+      _scheduleListen();
     }
+  }
+
+  void _scheduleListen() {
+    if (!_active || _muted || _state != CallState.listening) return;
+    final remaining = _listenRetryNotBefore.difference(DateTime.now());
+    final delay = remaining > const Duration(milliseconds: 150)
+        ? remaining
+        : const Duration(milliseconds: 150);
+    _listenRetryTimer?.cancel();
+    _listenRetryTimer = Timer(delay, () {
+      _listenRetryTimer = null;
+      _listen();
+    });
   }
 
   void _onSpeechError(SpeechRecognitionError error) {
     debugPrint('[Call] speech error: ${error.errorMsg} (epoch $_listenEpoch)');
     if (_active && !_muted) {
-      Future.delayed(const Duration(milliseconds: 500), () {
-        // Only re-arm if we're still in a listening phase. Without this a stale
-        // error scheduled during a prior turn could fire while we're speaking or
-        // thinking — and if TTS is between request and playback (isPlaying still
-        // false), _listen wouldn't defer and would open the mic onto our own
-        // reply. onComplete/onError already own the resume in those phases.
-        if (_state != CallState.speaking && _state != CallState.thinking) {
-          _listen();
-        }
-      });
+      if (speechErrorNeedsBackoff(error.errorMsg)) {
+        final delay = _speechRetryBackoff.recordFailure();
+        _listenRetryNotBefore = DateTime.now().add(delay);
+      } else {
+        _speechRetryBackoff.reset();
+        _listenRetryNotBefore = DateTime.fromMillisecondsSinceEpoch(0);
+      }
+      _scheduleListen();
     }
   }
 
@@ -319,30 +524,38 @@ class CallController extends ChangeNotifier {
     _muted = muted;
     notifyListeners();
     if (muted) {
+      _listenRetryTimer?.cancel();
+      _listenRetryTimer = null;
       _speech.stop();
     } else {
       _listen();
-    }
-  }
+    }  }
 
   Future<void> toggleSpeaker() async {
     // No-op once the call has ended: flipping isSpeakerphoneOn in MODE_NORMAL
     // would fight the restored media route.
     if (!_active) return;
     final next = !_speakerOn;
-    final ok = await CallAudio.setSpeakerphone(enabled: next);
-    if (!ok) {
+    final actual = await CallAudio.setSpeakerphone(enabled: next);
+    if (actual == null) {
       _status = 'Speaker switch failed';
       notifyListeners();
       return;
     }
-    _speakerOn = next;
+    _speakerOn = actual;
     notifyListeners();
   }
 
   /// End the call: stop mic + TTS, release the Gateway client.
   Future<void> hangUp() async {
+    _lifecycle.cancel();
     _active = false;
+    _listenRetryTimer?.cancel();
+    _listenRetryTimer = null;
+    await _speechQueue.cancel();
+    _speechCoordinator.release(_speechOwner);
+    _audioFocusSubscription?.cancel();
+    CallAudio.abandonAudioFocus();
     await _restoreAudio();
     try {
       await FlutterForegroundTask.stopService();
@@ -354,12 +567,16 @@ class CallController extends ChangeNotifier {
       await _xtts.stop();
     } catch (_) {}
     try {
+      _sendCancelToken?.cancel();
+    } catch (_) {}
+    try {
       _gateway.abort();
     } catch (_) {}
     _setState(CallState.connecting);
   }
 
   void _setState(CallState s) {
+    if (_disposed) return;
     _state = s;
     notifyListeners();
   }
@@ -390,7 +607,18 @@ class CallController extends ChangeNotifier {
 
   @override
   void dispose() {
+    _disposed = true;
+    _lifecycle.cancel();
     _active = false;
+    _listenRetryTimer?.cancel();
+    unawaited(_speechQueue.cancel());
+    _speechCoordinator.release(_speechOwner);
+    _audioFocusSubscription?.cancel();
+    _audioFocusSubscription = null;
+    CallAudio.abandonAudioFocus();
+    try {
+      _sendCancelToken?.cancel();
+    } catch (_) {}
     try {
       FlutterForegroundTask.stopService();
     } catch (_) {}

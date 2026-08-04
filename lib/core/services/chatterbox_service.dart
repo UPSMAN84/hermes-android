@@ -13,6 +13,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'tts_provider.dart';
 import 'xtts_service.dart';
+import 'tts_url.dart';
 
 /// Persisted-preference keys for the Chatterbox backend.
 class ChatterboxPrefs {
@@ -55,6 +56,7 @@ class ChatterboxPrefs {
 /// [speak] so Settings changes take effect without recreating the service.
 class ChatterboxService implements TtsProvider {
   final http.Client _http;
+  final String? fallbackHost;
   final AudioPlayer _player = AudioPlayer();
 
   // Completion callback (same contract as XttsService): fires once on natural
@@ -66,7 +68,7 @@ class ChatterboxService implements TtsProvider {
   @override
   bool get isPlaying => _isPlaying;
 
-  ChatterboxService({http.Client? httpClient})
+  ChatterboxService({http.Client? httpClient, this.fallbackHost})
       : _http = httpClient ?? http.Client() {
     _player.onPlayerComplete.listen((_) => _complete());
     _player.onPlayerStateChanged.listen((state) {
@@ -99,8 +101,10 @@ class ChatterboxService implements TtsProvider {
 
   Future<String> _baseUrl(SharedPreferences prefs) {
     return Future.value(
-      normalizeBaseUrl(
-        prefs.getString(ChatterboxPrefs.baseUrl) ?? ChatterboxPrefs.defaultBaseUrl,
+      resolveTtsBaseUrl(
+        configured: prefs.getString(ChatterboxPrefs.baseUrl) ?? ChatterboxPrefs.defaultBaseUrl,
+        fallbackHost: fallbackHost,
+        defaultPort: 8420,
       ),
     );
   }
@@ -136,10 +140,13 @@ class ChatterboxService implements TtsProvider {
       return;
     }
 
+    await stop();
     final epoch = ++_speakEpoch;
     _onComplete = onComplete;
+    _isPlaying = true;
 
     final prefs = await SharedPreferences.getInstance();
+    if (epoch != _speakEpoch) return;
     final base = await _baseUrl(prefs);
     final voice = prefs.getString(ChatterboxPrefs.voice) ?? '';
     final language =
@@ -191,8 +198,14 @@ class ChatterboxService implements TtsProvider {
     if (voice.isNotEmpty) request.fields['voice'] = voice;
 
     try {
-      final streamed = await request.send();
-      final bytes = await streamed.stream.toBytes();
+      final streamed = await request.send().timeout(
+        const Duration(seconds: 45),
+      );
+      if (epoch != _speakEpoch) return;
+      final bytes = await streamed.stream.toBytes().timeout(
+        const Duration(seconds: 45),
+      );
+      if (epoch != _speakEpoch) return;
       debugPrint(
         '[Chatterbox] POST /tts -> HTTP ${streamed.statusCode}, '
         '${bytes.length} bytes',
@@ -204,21 +217,24 @@ class ChatterboxService implements TtsProvider {
       }
 
       await _player.stop();
-      // Bump epoch so any onPlayerComplete from the prior stop() (which races
-      // with our speak()) is treated as stale and ignored.
-      final playEpoch = ++_speakEpoch;
+      if (epoch != _speakEpoch) return;
       try {
         await _player.play(
           BytesSource(Uint8List.fromList(bytes), mimeType: 'audio/wav'),
         );
+        if (epoch != _speakEpoch) {
+          await _player.stop();
+          return;
+        }
         _isPlaying = true;
         debugPrint('[Chatterbox] playback started');
       } catch (e) {
         debugPrint('[Chatterbox] play() failed: $e');
-        _complete(epoch: playEpoch);
+        _complete(epoch: epoch);
         rethrow;
       }
     } catch (e) {
+      if (epoch != _speakEpoch) return;
       debugPrint('[Chatterbox] speak FAILED: $e');
       _complete(epoch: epoch);
       rethrow;
@@ -234,7 +250,16 @@ class ChatterboxService implements TtsProvider {
   }
 
   @override
+  Future<void> pause() => _player.pause();
+
+  @override
+  Future<void> resume() => _player.resume();
+
+  @override
   void dispose() {
+    _speakEpoch++;
+    _onComplete = null;
+    _isPlaying = false;
     _player.dispose();
     _http.close();
   }

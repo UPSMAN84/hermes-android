@@ -9,6 +9,7 @@ import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:flutter/foundation.dart';
 import 'tts_provider.dart';
+import 'tts_url.dart';
 
 /// Persisted-preference keys shared with the settings voice picker.
 class XttsPrefs {
@@ -37,6 +38,7 @@ class XttsPrefs {
 /// [speak] so changes in Settings take effect without recreating the service.
 class XttsService implements TtsProvider {
   final http.Client _http;
+  final String? fallbackHost;
   final AudioPlayer _player = AudioPlayer();
 
   // Notifies the owner (e.g. chat screen) when playback ends, is stopped, or
@@ -48,7 +50,8 @@ class XttsService implements TtsProvider {
   @override
   bool get isPlaying => _isPlaying;
 
-  XttsService({http.Client? httpClient}) : _http = httpClient ?? http.Client() {
+  XttsService({http.Client? httpClient, this.fallbackHost})
+      : _http = httpClient ?? http.Client() {
     _player.onPlayerComplete.listen((_) => _complete());
     _player.onPlayerStateChanged.listen((state) {
       _isPlaying = state == PlayerState.playing;
@@ -95,7 +98,7 @@ class XttsService implements TtsProvider {
 
   // Phrases never spoken by TTS. Matched loosely (punctuation/case-insensitive).
   static final _blocked = <RegExp>[
-    RegExp(r'cold\s+coffee\s*,?\s*warm\s+LO\s*,?\s*I\s+can\s*[''"]?t\s+lose\s+him\s*!?', caseSensitive: false),
+    RegExp("cold\\s+coffee\\s*,?\\s*warm\\s+LO\\s*,?\\s*I\\s+can\\s*['\"]?t\\s+lose\\s+him\\s*!?", caseSensitive: false),
     RegExp(r'cold\s+coffee\s*,?\s*warm\s+LO', caseSensitive: false),
   ];
 
@@ -197,8 +200,10 @@ class XttsService implements TtsProvider {
   }
 
   Future<String> _baseUrl(SharedPreferences prefs) async {
-    return normalizeBaseUrl(
-      prefs.getString(XttsPrefs.baseUrl) ?? XttsPrefs.defaultBaseUrl,
+    return resolveTtsBaseUrl(
+      configured: prefs.getString(XttsPrefs.baseUrl) ?? XttsPrefs.defaultBaseUrl,
+      fallbackHost: fallbackHost,
+      defaultPort: 8020,
     );
   }
 
@@ -264,10 +269,13 @@ class XttsService implements TtsProvider {
       return;
     }
 
+    await stop();
     final epoch = ++_speakEpoch;
     _onComplete = onComplete;
+    _isPlaying = true;
 
     final prefs = await SharedPreferences.getInstance();
+    if (epoch != _speakEpoch) return;
     final base = await _baseUrl(prefs);
     final speaker = prefs.getString(XttsPrefs.speaker) ?? '';
     final language =
@@ -283,19 +291,23 @@ class XttsService implements TtsProvider {
       'text=${spoken.length} chars',
     );
     await _applySettings(base, prefs);
+    if (epoch != _speakEpoch) return;
 
     final sw = Stopwatch()..start();
     try {
-      final res = await _http.post(
-        Uri.parse('$base/tts_to_audio/'),
-        headers: const {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'text': spoken,
-          'speaker_wav': speaker,
-          'language': language,
-        }),
-      );
+      final res = await _http
+          .post(
+            Uri.parse('$base/tts_to_audio/'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'text': spoken,
+              'speaker_wav': speaker,
+              'language': language,
+            }),
+          )
+          .timeout(const Duration(seconds: 45));
       sw.stop();
+      if (epoch != _speakEpoch) return;
       debugPrint(
         '[XTTS] POST /tts_to_audio/ -> HTTP ${res.statusCode}, '
         '${res.bodyBytes.length} bytes in ${sw.elapsedMilliseconds}ms',
@@ -305,19 +317,22 @@ class XttsService implements TtsProvider {
       }
 
       await _player.stop();
-      // Bump epoch again so any onPlayerComplete from the prior stop() (which
-      // races with our speak()) is treated as stale and ignored.
-      final playEpoch = ++_speakEpoch;
+      if (epoch != _speakEpoch) return;
       try {
         await _player.play(BytesSource(res.bodyBytes, mimeType: 'audio/wav'));
+        if (epoch != _speakEpoch) {
+          await _player.stop();
+          return;
+        }
         _isPlaying = true;
         debugPrint('[XTTS] playback started');
       } catch (e) {
         debugPrint('[XTTS] play() failed: $e');
-        _complete(epoch: playEpoch);
+        _complete(epoch: epoch);
         rethrow;
       }
     } catch (e) {
+      if (epoch != _speakEpoch) return;
       // Reset any "speaking" UI before propagating the failure.
       debugPrint('[XTTS] speak FAILED: $e');
       _complete(epoch: epoch);
@@ -335,7 +350,16 @@ class XttsService implements TtsProvider {
   }
 
   @override
+  Future<void> pause() => _player.pause();
+
+  @override
+  Future<void> resume() => _player.resume();
+
+  @override
   void dispose() {
+    _speakEpoch++;
+    _onComplete = null;
+    _isPlaying = false;
     _player.dispose();
     _http.close();
   }

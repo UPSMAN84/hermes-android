@@ -6,17 +6,58 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.media.AudioDeviceInfo
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.os.Build
+import android.os.SystemClock
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
+
+internal fun selectCommunicationDeviceType(
+    availableTypes: List<Int>,
+    speakerEnabled: Boolean,
+): Int? {
+    if (speakerEnabled) {
+        return availableTypes.firstOrNull {
+            it == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+        }
+    }
+
+    return listOf(
+        AudioDeviceInfo.TYPE_BLE_HEADSET,
+        AudioDeviceInfo.TYPE_BLUETOOTH_SCO,
+    ).firstOrNull { it in availableTypes }
+        ?: availableTypes.firstOrNull {
+            it == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+        }
+}
+
+internal fun communicationRouteResult(
+    activeType: Int,
+    requireBluetooth: Boolean,
+    requestedSpeakerState: Boolean?,
+): Boolean {
+    if (requestedSpeakerState != null) return requestedSpeakerState
+    val bluetooth = activeType == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+        activeType == AudioDeviceInfo.TYPE_BLUETOOTH_SCO
+    return !requireBluetooth || bluetooth
+}
 
 class MainActivity : FlutterActivity() {
 
     private val channel = "hermes_audio"
+    private val focusChannel = "hermes_audio_focus"
+    private var focusSink: EventChannel.EventSink? = null
+    private var focusRequest: AudioFocusRequest? = null
+    private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        mainHandler.post { focusSink?.success(change) }
+    }
     private val bluetoothConnectRequestCode = 4242
 
     // Pending SCO waiters — each entry is a continuation that resolves when SCO
@@ -57,23 +98,66 @@ class MainActivity : FlutterActivity() {
                         "startCallAudio" -> startCallAudio(am, result)
                         "stopCallAudio" -> stopCallAudio(am, result)
                         "setSpeakerphone" -> setSpeakerphone(am, call, result)
+                        "requestCallAudioFocus" -> result.success(requestAudioFocus(am))
+                        "abandonCallAudioFocus" -> {
+                            abandonAudioFocus(am)
+                            result.success(true)
+                        }
                         else -> result.notImplemented()
                     }
                 } catch (e: Exception) {
                     result.error("AUDIO_ERROR", e.message, null)
                 }
             }
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, focusChannel)
+            .setStreamHandler(object : EventChannel.StreamHandler {
+                override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                    focusSink = events
+                }
+
+                override fun onCancel(arguments: Any?) {
+                    focusSink = null
+                }
+            })
+    }
+
+    @Suppress("DEPRECATION")
+    private fun requestAudioFocus(am: AudioManager): Boolean {
+        val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .build(),
+                )
+                .setOnAudioFocusChangeListener(focusListener, mainHandler)
+                .build()
+            focusRequest = request
+            am.requestAudioFocus(request)
+        } else {
+            am.requestAudioFocus(
+                focusListener,
+                AudioManager.STREAM_VOICE_CALL,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT,
+            )
+        }
+        return granted == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }
+
+    @Suppress("DEPRECATION")
+    private fun abandonAudioFocus(am: AudioManager) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            focusRequest?.let { am.abandonAudioFocusRequest(it) }
+            focusRequest = null
+        } else {
+            am.abandonAudioFocus(focusListener)
+        }
     }
 
     private fun startCallAudio(am: AudioManager, result: MethodChannel.Result) {
         am.mode = AudioManager.MODE_IN_COMMUNICATION
-        am.isSpeakerphoneOn = false
 
-        // Android 12+ requires a runtime BLUETOOTH_CONNECT grant before we
-        // touch SCO. Without it, isBluetoothScoAvailableOffCall / startBluetoothSco
-        // throw SecurityException. Request it; if denied, skip the BT path
-        // (call proceeds on the handset earpiece) and return false so Dart
-        // knows the earpiece isn't live.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
             ContextCompat.checkSelfPermission(
                 this, Manifest.permission.BLUETOOTH_CONNECT,
@@ -85,12 +169,94 @@ class MainActivity : FlutterActivity() {
                     result.success(false)
                     return@ensureBluetoothConnectPermission
                 }
-                proceedWithBluetoothSco(am, result)
+                setCommunicationRoute(
+                    am = am,
+                    speakerEnabled = false,
+                    requireBluetooth = true,
+                    result = result,
+                )
             }
             return
         }
 
-        proceedWithBluetoothSco(am, result)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            setCommunicationRoute(
+                am = am,
+                speakerEnabled = false,
+                requireBluetooth = true,
+                result = result,
+            )
+        } else {
+            // Android 11 and older only expose the legacy SCO API.
+            am.isSpeakerphoneOn = false
+            proceedWithBluetoothSco(am, result)
+        }
+    }
+
+    private fun setCommunicationRoute(
+        am: AudioManager,
+        speakerEnabled: Boolean,
+        requireBluetooth: Boolean,
+        requestedSpeakerState: Boolean? = null,
+        result: MethodChannel.Result,
+    ) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            result.success(false)
+            return
+        }
+
+        val devices = am.availableCommunicationDevices
+        val selectedType = selectCommunicationDeviceType(
+            availableTypes = devices.map { it.type },
+            speakerEnabled = speakerEnabled,
+        )
+        val selected = devices.firstOrNull { it.type == selectedType }
+        if (selected == null) {
+            result.success(false)
+            return
+        }
+
+        if (!am.setCommunicationDevice(selected)) {
+            result.success(false)
+            return
+        }
+
+        waitForCommunicationRoute(
+            am = am,
+            selected = selected,
+            requireBluetooth = requireBluetooth,
+            requestedSpeakerState = requestedSpeakerState,
+            result = result,
+        )
+    }
+
+    private fun waitForCommunicationRoute(
+        am: AudioManager,
+        selected: AudioDeviceInfo,
+        requireBluetooth: Boolean,
+        requestedSpeakerState: Boolean?,
+        result: MethodChannel.Result,
+    ) {
+        val deadline = SystemClock.uptimeMillis() + 3000L
+        val check = object : Runnable {
+            override fun run() {
+                val active = am.communicationDevice
+                if (active?.id == selected.id) {
+                    result.success(communicationRouteResult(
+                        active.type, requireBluetooth, requestedSpeakerState,
+                    ))
+                    return
+                }
+
+                if (SystemClock.uptimeMillis() >= deadline) {
+                    result.success(false)
+                    return
+                }
+
+                mainHandler.postDelayed(this, 50L)
+            }
+        }
+        check.run()
     }
 
     private fun ensureBluetoothConnectPermission(onResult: (Boolean) -> Unit) {
@@ -149,25 +315,27 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun stopCallAudio(am: AudioManager, result: MethodChannel.Result) {
-        if (scoReceiverRegistered) {
-            try {
-                unregisterReceiver(scoReceiver)
-            } catch (_: IllegalArgumentException) {
-                // Not registered — ignore.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            am.clearCommunicationDevice()
+        } else {
+            if (scoReceiverRegistered) {
+                try {
+                    unregisterReceiver(scoReceiver)
+                } catch (_: IllegalArgumentException) {
+                    // Not registered — ignore.
+                }
+                scoReceiverRegistered = false
             }
-            scoReceiverRegistered = false
-        }
-        drainWaiters(false)
-        if (am.isBluetoothScoOn) {
-            am.stopBluetoothSco()
+            drainWaiters(false)
+            if (am.isBluetoothScoOn) {
+                am.stopBluetoothSco()
+            }
         }
         am.mode = AudioManager.MODE_NORMAL
         result.success(true)
     }
 
-    /// Toggle the loudspeaker while the call is active. Keeps the existing
-    /// MODE_IN_COMMUNICATION; only flips isSpeakerphoneOn. Returns the resulting
-    /// speakerphone state so the Dart side can verify and update its UI.
+    /// Toggle the loudspeaker while the call is active.
     private fun setSpeakerphone(
         am: AudioManager,
         call: io.flutter.plugin.common.MethodCall,
@@ -175,8 +343,19 @@ class MainActivity : FlutterActivity() {
     ) {
         val enabled = call.argument<Boolean>("enabled")
             ?: throw IllegalArgumentException("enabled (bool) is required")
-        am.isSpeakerphoneOn = enabled
-        result.success(am.isSpeakerphoneOn)
+        am.mode = AudioManager.MODE_IN_COMMUNICATION
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            setCommunicationRoute(
+                am = am,
+                speakerEnabled = enabled,
+                requireBluetooth = false,
+                requestedSpeakerState = enabled,
+                result = result,
+            )
+        } else {
+            am.isSpeakerphoneOn = enabled
+            result.success(am.isSpeakerphoneOn)
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -206,6 +385,15 @@ class MainActivity : FlutterActivity() {
             scoReceiverRegistered = false
         }
         drainWaiters(false)
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        abandonAudioFocus(am)
+        focusSink = null
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            am.clearCommunicationDevice()
+        } else if (am.isBluetoothScoOn) {
+            am.stopBluetoothSco()
+        }
+        am.mode = AudioManager.MODE_NORMAL
         super.onDestroy()
     }
 
