@@ -6,6 +6,7 @@ import '../services/chatterbox_service.dart';
 import '../services/comfyui.dart';
 import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
+import '../services/tts_url.dart';
 import '../../main.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
@@ -378,11 +379,11 @@ class _SettingsScreenState extends State<SettingsScreen> {
         ),
         const SizedBox(height: 8),
         _ttsProvider == 'chatterbox'
-            ? _ChatterboxPicker()
+            ? _ChatterboxPicker(fallbackHost: widget.connection.host)
             : Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _VoicePicker(),
+                  _VoicePicker(fallbackHost: widget.connection.host),
                   const SizedBox(height: 8),
                   _TtsParamsCard(),
                 ],
@@ -630,12 +631,15 @@ class _ThemeToggleState extends State<_ThemeToggle> {
 /// language. Speakers and languages are fetched live from the server so the
 /// dropdowns reflect what's actually installed.
 class _VoicePicker extends StatefulWidget {
+  final String fallbackHost;
+  const _VoicePicker({required this.fallbackHost});
+
   @override
   State<_VoicePicker> createState() => _VoicePickerState();
 }
 
 class _VoicePickerState extends State<_VoicePicker> {
-  final XttsService _xtts = XttsService();
+  late final XttsService _xtts;
   final TextEditingController _urlController = TextEditingController();
 
   List<String> _speakers = [];
@@ -649,6 +653,7 @@ class _VoicePickerState extends State<_VoicePicker> {
   @override
   void initState() {
     super.initState();
+    _xtts = XttsService(fallbackHost: widget.fallbackHost);
     _load();
   }
 
@@ -666,8 +671,11 @@ class _VoicePickerState extends State<_VoicePicker> {
     });
 
     final prefs = await SharedPreferences.getInstance();
-    _urlController.text =
-        prefs.getString(XttsPrefs.baseUrl) ?? XttsPrefs.defaultBaseUrl;
+    _urlController.text = resolveTtsBaseUrl(
+      configured: prefs.getString(XttsPrefs.baseUrl) ?? XttsPrefs.defaultBaseUrl,
+      fallbackHost: widget.fallbackHost,
+      defaultPort: 8020,
+    );
     _selectedSpeaker = prefs.getString(XttsPrefs.speaker);
     _selectedLanguage =
         prefs.getString(XttsPrefs.language) ?? XttsPrefs.defaultLanguage;
@@ -919,12 +927,15 @@ class _ComfyUrlFieldState extends State<_ComfyUrlField> {
 /// voices/ folder, fetched via GET /voices), language id, and the two
 /// generation params the /tts endpoint accepts (cfg_weight, exaggeration).
 class _ChatterboxPicker extends StatefulWidget {
+  final String fallbackHost;
+  const _ChatterboxPicker({required this.fallbackHost});
+
   @override
   State<_ChatterboxPicker> createState() => _ChatterboxPickerState();
 }
 
 class _ChatterboxPickerState extends State<_ChatterboxPicker> {
-  final ChatterboxService _chatterbox = ChatterboxService();
+  late final ChatterboxService _chatterbox;
   final TextEditingController _urlController = TextEditingController();
   final TextEditingController _langController = TextEditingController();
   final TextEditingController _cfgController = TextEditingController();
@@ -945,6 +956,7 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
   @override
   void initState() {
     super.initState();
+    _chatterbox = ChatterboxService(fallbackHost: widget.fallbackHost);
     _load();
   }
 
@@ -969,8 +981,12 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
       _error = null;
     });
     final prefs = await SharedPreferences.getInstance();
-    _urlController.text = prefs.getString(ChatterboxPrefs.baseUrl) ??
-        ChatterboxPrefs.defaultBaseUrl;
+    _urlController.text = resolveTtsBaseUrl(
+      configured: prefs.getString(ChatterboxPrefs.baseUrl) ??
+          ChatterboxPrefs.defaultBaseUrl,
+      fallbackHost: widget.fallbackHost,
+      defaultPort: 8420,
+    );
     _model = prefs.getString(ChatterboxPrefs.model) ??
         ChatterboxPrefs.defaultModel;
     _selectedVoice = prefs.getString(ChatterboxPrefs.voice);

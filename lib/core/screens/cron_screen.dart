@@ -91,6 +91,15 @@ class _CronScreenState extends State<CronScreen> {
     return '';
   }
 
+  /// Raw, re-submittable schedule value for the editable Schedule field —
+  /// never [_scheduleDisplay]'s human-readable text, which the backend can't
+  /// parse back as a cron expression.
+  String _editableSchedule(Map<String, dynamic> job) {
+    final schedule = job['schedule'];
+    if (schedule is String) return schedule;
+    return _scheduleDisplay(job);
+  }
+
   String _jobName(Map<String, dynamic> job) {
     return job['name'] as String? ?? job['id'] as String? ?? 'Untitled';
   }
@@ -240,7 +249,7 @@ class _CronScreenState extends State<CronScreen> {
       actionLabel: 'Save',
       initialName: _jobName(job),
       initialPrompt: job['prompt'] as String? ?? '',
-      initialSchedule: _scheduleDisplay(job),
+      initialSchedule: _editableSchedule(job),
       initialNoAgent: job['no_agent'] == true,
     );
     if (result == null || !mounted) return;

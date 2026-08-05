@@ -44,8 +44,14 @@ dependencies:
   # TTS via XTTS-v2 server (returns WAV bytes we play locally)
   audioplayers: ^6.1.0
 
-  # Inline video playback for generated .mp4 clips (ComfyUI /view)
-  video_player: ^2.9.0
+  # Inline video playback for generated clips (ComfyUI /view). media_kit is
+  # libmp/FFmpeg-based: it software-decodes codecs Android's hardware decoders
+  # reject (HEVC/H.265, VP9, AV1, 10-bit yuv420p10le, mkv/webm), which the old
+  # video_player (hardware-first ExoPlayer, no software fallback) failed on —
+  # ComfyUI/WAN outputs regularly hit those formats.
+  media_kit: ^1.1.11
+  media_kit_video: ^1.2.5
+  media_kit_libs_video: ^1.0.5
   flutter_foreground_task: ^10.0.0
 
   # User-side image attach (gallery picker) for multimodal chat messages

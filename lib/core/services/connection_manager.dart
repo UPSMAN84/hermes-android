@@ -531,7 +531,7 @@ class GatewayChatClient {
       // SSE frames are separated by a blank line. RFC 8895 mandates CRLF but
       // servers (and proxies) frequently emit LF or a mix — accept any.
       final frameDelimiter = RegExp(r'\r?\n\r?\n');
-      final flushFrame = () {
+      bool flushFrame() {
         final m = frameDelimiter.firstMatch(buffer);
         if (m == null) return false;
         final frame = buffer.substring(0, m.start);
@@ -539,7 +539,7 @@ class GatewayChatClient {
         final token = parseSseFrame(frame, onToolProgress: onToolProgress);
         if (token != null && token.isNotEmpty) onToken(token);
         return true;
-      };
+      }
 
       final completer = Completer<void>();
       late StreamSubscription<String> sub;

@@ -9,11 +9,14 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:video_player/video_player.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
+import '../models/pending_chat_send.dart';
+import '../services/speech_recognition_coordinator.dart';
 
 import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
@@ -59,8 +62,11 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _pickedImageMimeType;
 
   // Voice input / spoken replies
-  final SpeechToText _speechToText = SpeechToText();
-  TtsProvider _xtts = XttsService();
+  final Object _speechOwner = Object();
+  final SpeechRecognitionCoordinator _speechCoordinator =
+      SpeechRecognitionCoordinator.instance;
+  SpeechToText get _speechToText => _speechCoordinator.speech;
+  late TtsProvider _xtts = XttsService(fallbackHost: widget.connection.host);
   bool _speechAvailable = false;
   bool _listening = false;
   bool _voiceReplyEnabled = true;
@@ -92,10 +98,11 @@ class _ChatScreenState extends State<ChatScreen> {
   Timer? _autoContinueTimer;
   final _autoContinueRandom = Random();
 
-  // Images discovered mid-stream (via a completed image_generate tool call)
-  // that haven't landed in a getMessages() refetch yet — rendered as their
-  // own row right under the in-progress reply so a generated image shows up
-  // as soon as it's ready instead of waiting for the whole turn to finish.
+  // Media discovered mid-stream (via a completed image_generate or
+  // video_generate tool call) that haven't landed in a getMessages() refetch
+  // yet — rendered as their own row right under the in-progress reply so
+  // generated media shows up as soon as it's ready instead of waiting for the
+  // whole turn to finish.
   final List<String> _liveMediaUrls = [];
 
   // Scroll management
@@ -182,11 +189,21 @@ class _ChatScreenState extends State<ChatScreen> {
   /// a mid-init swap is safe.
   Future<void> _initTtsProvider() async {
     final prefs = await SharedPreferences.getInstance();
-    final selected = await ttsProviderForPrefs(prefs);
-    if (!mounted) return;
+    final selected = await ttsProviderForPrefs(
+      prefs,
+      fallbackHost: widget.connection.host,
+    );
+    if (!mounted) {
+      selected.dispose();
+      return;
+    }
     if (selected is! XttsService) {
       _xtts.dispose();
       _xtts = selected;
+    } else {
+      // Already holding an XttsService (the default) — this freshly built
+      // one won't be used, so release its AudioPlayer/http.Client now.
+      selected.dispose();
     }
   }
 
@@ -210,6 +227,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _streamCancelToken?.cancel();
     _autoContinueTimer?.cancel();
     _speechToText.cancel();
+    _speechCoordinator.release(_speechOwner);
     _xtts.dispose();
     _client.close();
     _dashboard?.close();
@@ -230,10 +248,12 @@ class _ChatScreenState extends State<ChatScreen> {
           ? language.replaceAll('-', '_')
           : null;
 
-      final available = await _speechToText.initialize(
+      _speechCoordinator.claim(
+        _speechOwner,
         onStatus: _handleSpeechStatus,
         onError: _handleSpeechError,
       );
+      final available = await _speechCoordinator.initialize();
       if (!mounted) return;
       setState(() {
         _speechAvailable = available;
@@ -306,6 +326,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
     await _xtts.stop();
     if (!mounted) return;
+    _speechCoordinator.claim(
+      _speechOwner,
+      onStatus: _handleSpeechStatus,
+      onError: _handleSpeechError,
+    );
     setState(() => _voiceStatus = 'Listening…');
     await _speechToText.listen(
       listenOptions: SpeechListenOptions(
@@ -543,7 +568,6 @@ class _ChatScreenState extends State<ChatScreen> {
       if (fresh > known) {
         _extractToolMessages(messages);
         setState(() => _messages = messages);
-        known = fresh;
         return;
       }
     }
@@ -797,7 +821,6 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // Keep the user's text in case send fails — the controller is cleared
     // below and without this the typed message is gone for good on error.
-    final pending = text;
     if (textOverride == null) _textController.text = '';
     // Speak the reply whenever spoken replies are toggled on, regardless of
     // whether the message was typed or dictated.
@@ -821,25 +844,13 @@ class _ChatScreenState extends State<ChatScreen> {
       });
     }
 
-    // Attach the pending picked photo (if any) as a data: URL. Only the
-    // current turn carries the image — see buildChatCompletionMessages.
-    List<String>? imageDataUrls;
-    final pickedBytes = _pickedImageBytes;
-    if (pickedBytes != null) {
-      final dataUrl =
-          'data:${_pickedImageMimeType ?? 'image/jpeg'};base64,${base64Encode(pickedBytes)}';
-      imageDataUrls = [dataUrl];
-    }
-    final localContent = imageDataUrls != null
-        ? <Map<String, dynamic>>[
-            if (text.isNotEmpty) {'type': 'text', 'text': text},
-            for (final url in imageDataUrls)
-              {
-                'type': 'image_url',
-                'image_url': {'url': url},
-              },
-          ]
-        : text;
+    // Keep the exact optimistic rows and attachment together so a failed
+    // multimodal send can remove only its own UI rows and restore the draft.
+    final pendingSend = PendingChatSend(
+      text: text,
+      imageBytes: _pickedImageBytes,
+      imageMimeType: _pickedImageMimeType,
+    );
 
     // Invalidate any in-flight late-media poll from the previous turn.
     _mediaPollGen++;
@@ -847,9 +858,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _sending = true;
       _streaming = true;
       _showScrollToBottom = false;
-      _messages.add({'role': 'user', 'content': localContent});
-      // Insert a placeholder streaming message
-      _messages.add({'role': 'assistant', 'content': ''});
+      pendingSend.appendOptimisticRows(_messages);
       _pickedImageBytes = null;
       _pickedImageMimeType = null;
       _liveMediaUrls.clear();
@@ -863,7 +872,7 @@ class _ChatScreenState extends State<ChatScreen> {
       message: text,
       sessionId: widget.session.id,
       history: history,
-      imageDataUrls: imageDataUrls,
+      imageDataUrls: pendingSend.imageDataUrls,
       cancelToken: _streamCancelToken,
       onToken: (token) {
         if (!mounted) return;
@@ -923,6 +932,7 @@ class _ChatScreenState extends State<ChatScreen> {
           }
           WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
         } catch (e) {
+          if (!mounted) return;
           setState(() {
             _streaming = false;
             _sending = false;
@@ -935,13 +945,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _pendingTokens.clear();
         _streamCancelToken = null;
         if (!mounted) return;
-        // Remove the placeholder assistant message
-        setState(() {
-          if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
-            _messages.removeLast();
-          }
-        });
-        _handleSendError(pending, error);
+        _handleSendError(pendingSend, error);
       },
     );
   }
@@ -987,20 +991,20 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  void _handleSendError(String text, Object e) {
+  void _handleSendError(PendingChatSend pending, Object e) {
     setState(() {
       _sending = false;
       _streaming = false;
       _awaitingVoiceReply = false;
-      if (_messages.isNotEmpty &&
-          _messages.last['role'] == 'user' &&
-          _messages.last['content'] == text) {
-        _messages.removeLast();
-      }
+      pending.rollbackOptimisticRows(_messages);
+      _pickedImageBytes = pending.imageBytes;
+      _pickedImageMimeType = pending.imageMimeType;
       // Restore the typed text so the user doesn't lose their message on a
       // transient failure. Put the cursor at the end of the restored text.
-      _textController.text = text;
-      _textController.selection = TextSelection.collapsed(offset: text.length);
+      _textController.text = pending.text;
+      _textController.selection = TextSelection.collapsed(
+        offset: pending.text.length,
+      );
     });
 
     if (mounted) {
@@ -1052,7 +1056,19 @@ class _ChatScreenState extends State<ChatScreen> {
 
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
 
-    if (done && tool == 'image_generate') {
+    if (done &&
+        (tool == 'image_generate' || tool == 'video_generate')) {
+      // Newer servers emit hermes.tool.progress with the rendered filename
+      // directly in the SSE payload — render off that and skip polling.
+      final filename = progress['filename']?.toString();
+      if (filename != null && filename.isNotEmpty) {
+        final url = ComfyUi.viewUrl(_comfyBaseUrl, filename);
+        if (!_liveMediaUrls.contains(url)) {
+          setState(() => _liveMediaUrls.add(url));
+        }
+        return;
+      }
+      // Fallback for older servers that don't include filename: poll briefly.
       _pollForLiveMedia();
     }
   }
@@ -1350,6 +1366,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final displayMessages = <dynamic>[];
     final currentGroup = <Map<String, dynamic>>[];
     final groupImages = <String>{};
+    // Every URL already placed into displayMessages, across every group and
+    // turn in this session — not just the current group. A later tool result
+    // (e.g. a post-render `os.listdir()` verification call, or a duplicate
+    // filename mention) can reference a file whose image already rendered
+    // earlier in the transcript; without this the same picture reappears as
+    // a brand-new row every time its filename resurfaces in tool content.
+    final seenImages = <String>{};
 
     for (final msg in _messages) {
       final role = (msg['role'] as String?) ?? 'assistant';
@@ -1357,7 +1380,8 @@ class _ChatScreenState extends State<ChatScreen> {
         // Harvest generated-image filenames from the raw tool content.
         final raw = (msg['content'] as String?) ?? '';
         for (final name in ComfyUi.extractMediaFilenames(raw)) {
-          groupImages.add(ComfyUi.viewUrl(_comfyBaseUrl, name));
+          final url = ComfyUi.viewUrl(_comfyBaseUrl, name);
+          if (seenImages.add(url)) groupImages.add(url);
         }
         if (toolQueue.isNotEmpty) {
           currentGroup.add(toolQueue.removeAt(0));
@@ -1832,6 +1856,12 @@ class _ImageBubble extends StatelessWidget {
 
 /// One generated video, streamed from ComfyUI's /view endpoint. Tap toggles
 /// play/pause; initialized paused so clips don't all autoplay at once.
+///
+/// Backed by media_kit (libmp/FFmpeg): it software-decodes codecs Android's
+/// hardware MediaCodec path rejects — HEVC/H.265, VP9, AV1, 10-bit
+/// (yuv420p10le), and mkv/webm containers — which the previous ExoPlayer-based
+/// video_player failed to initialize on, showing "video unavailable" for many
+/// ComfyUI/WAN clips.
 class _VideoBubble extends StatefulWidget {
   final String url;
   const _VideoBubble({required this.url});
@@ -1841,8 +1871,14 @@ class _VideoBubble extends StatefulWidget {
 }
 
 class _VideoBubbleState extends State<_VideoBubble> {
-  VideoPlayerController? _controller;
+  late final Player _player = Player();
+  late final VideoController _videoController = VideoController(_player);
+  bool _ready = false;
   bool _failed = false;
+  bool _playing = false;
+  double _aspect = 16 / 9;
+
+  final List<StreamSubscription<dynamic>> _subs = [];
 
   @override
   void initState() {
@@ -1851,22 +1887,46 @@ class _VideoBubbleState extends State<_VideoBubble> {
   }
 
   Future<void> _init() async {
-    final c = VideoPlayerController.networkUrl(Uri.parse(widget.url));
+    // Surface real decode/open failures instead of silently spinning forever.
+    _subs.add(_player.stream.error.listen((e) {
+      debugPrint('[media_kit] video error for ${widget.url}: $e');
+      if (mounted) setState(() => _failed = true);
+    }));
+    _subs.add(_player.stream.playing.listen((p) {
+      if (mounted) setState(() => _playing = p);
+    }));
+    _subs.add(_player.stream.width.listen((_) => _updateAspect()));
+    _subs.add(_player.stream.height.listen((_) => _updateAspect()));
     try {
-      await c.initialize();
-      if (!mounted) {
-        c.dispose();
-        return;
-      }
-      setState(() => _controller = c);
-    } catch (_) {
+      // Open paused so multiple clips in a transcript don't all autoplay.
+      await _player.open(Media(widget.url), play: false);
+      if (!mounted) return;
+      setState(() => _ready = true);
+    } catch (e) {
+      debugPrint('[media_kit] open failed for ${widget.url}: $e');
       if (mounted) setState(() => _failed = true);
     }
   }
 
+  void _updateAspect() {
+    final w = _player.state.width;
+    final h = _player.state.height;
+    if (w != null && h != null && w > 0 && h > 0) {
+      final next = w / h;
+      if (next != _aspect && mounted) setState(() => _aspect = next);
+    }
+  }
+
+  void _togglePlay() {
+    _playing ? _player.pause() : _player.play();
+  }
+
   @override
   void dispose() {
-    _controller?.dispose();
+    for (final s in _subs) {
+      s.cancel();
+    }
+    _player.dispose();
     super.dispose();
   }
 
@@ -1881,23 +1941,25 @@ class _VideoBubbleState extends State<_VideoBubble> {
           child: Text('video unavailable', style: TextStyle(color: Colors.grey)),
         ),
       );
-    } else if (_controller == null) {
+    } else if (!_ready) {
       body = const SizedBox(
         height: 160,
         child: Center(child: CircularProgressIndicator()),
       );
     } else {
-      final c = _controller!;
-      final aspect = c.value.aspectRatio;
       body = GestureDetector(
-        onTap: () => setState(() {
-          c.value.isPlaying ? c.pause() : c.play();
-        }),
+        onTap: _togglePlay,
         child: Stack(
           alignment: Alignment.center,
           children: [
-            AspectRatio(aspectRatio: aspect, child: VideoPlayer(c)),
-            if (!c.value.isPlaying)
+            AspectRatio(
+              aspectRatio: _aspect,
+              child: Video(
+                controller: _videoController,
+                controls: NoVideoControls,
+              ),
+            ),
+            if (!_playing)
               Container(
                 decoration: const BoxDecoration(
                   color: Colors.black54,
@@ -1915,15 +1977,7 @@ class _VideoBubbleState extends State<_VideoBubble> {
               left: 0,
               right: 0,
               bottom: 0,
-              child: VideoProgressIndicator(
-                c,
-                allowScrubbing: true,
-                colors: const VideoProgressColors(
-                  playedColor: Colors.white,
-                  bufferedColor: Colors.white38,
-                  backgroundColor: Colors.white24,
-                ),
-              ),
+              child: _VideoProgressBar(player: _player),
             ),
           ],
         ),
@@ -1939,6 +1993,75 @@ class _VideoBubbleState extends State<_VideoBubble> {
         color: Colors.black,
       ),
       child: body,
+    );
+  }
+}
+
+/// Thin scrubbable progress bar for [_VideoBubble], mirroring the look of the
+/// old VideoProgressIndicator (played/buffered/background tint) since
+/// media_kit_video's default controls are replaced with [NoVideoControls].
+class _VideoProgressBar extends StatelessWidget {
+  final Player player;
+  const _VideoProgressBar({required this.player});
+
+  void _seekToFraction(BuildContext context, double dx, double width) {
+    final duration = player.state.duration;
+    if (duration == Duration.zero) return;
+    final fraction = (dx / width).clamp(0.0, 1.0);
+    player.seek(duration * fraction);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<Duration>(
+      stream: player.stream.position,
+      initialData: player.state.position,
+      builder: (context, positionSnap) {
+        return StreamBuilder<Duration>(
+          stream: player.stream.duration,
+          initialData: player.state.duration,
+          builder: (context, durationSnap) {
+            final position = positionSnap.data ?? Duration.zero;
+            final duration = durationSnap.data ?? Duration.zero;
+            final fraction = duration.inMilliseconds > 0
+                ? (position.inMilliseconds / duration.inMilliseconds).clamp(
+                    0.0,
+                    1.0,
+                  )
+                : 0.0;
+            return LayoutBuilder(
+              builder: (context, constraints) {
+                return GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTapDown: (d) => _seekToFraction(
+                    context,
+                    d.localPosition.dx,
+                    constraints.maxWidth,
+                  ),
+                  onHorizontalDragUpdate: (d) => _seekToFraction(
+                    context,
+                    d.localPosition.dx,
+                    constraints.maxWidth,
+                  ),
+                  child: SizedBox(
+                    height: 6,
+                    width: double.infinity,
+                    child: Stack(
+                      children: [
+                        Container(color: Colors.white24),
+                        FractionallySizedBox(
+                          widthFactor: fraction,
+                          child: Container(color: Colors.white),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            );
+          },
+        );
+      },
     );
   }
 }

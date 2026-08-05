@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'core/services/connection_manager.dart';
 import 'core/screens/session_list_screen.dart';
@@ -8,6 +9,10 @@ import 'core/utils/responsive.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  // Initialize the media_kit native backend (libmp/FFmpeg) used by the inline
+  // video player for ComfyUI-generated clips. Must run before any Player is
+  // created.
+  MediaKit.ensureInitialized();
   // Foreground service used by phone-call-mode to keep the voice loop alive
   // when the app is backgrounded / screen locks.
   FlutterForegroundTask.initCommunicationPort();

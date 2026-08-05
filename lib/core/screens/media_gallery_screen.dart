@@ -19,6 +19,10 @@ class MediaGalleryScreen extends StatelessWidget {
   });
 
   List<String> _collectImageUrls() {
+    // A filename can legitimately resurface in tool content more than once
+    // (e.g. a post-render verification step that lists the output dir) —
+    // dedup by URL so the same picture doesn't get a second gallery tile.
+    final seen = <String>{};
     final urls = <String>[];
     for (final msg in messages) {
       final role = (msg['role'] as String?) ?? '';
@@ -26,11 +30,14 @@ class MediaGalleryScreen extends StatelessWidget {
         final raw = (msg['content'] as String?) ?? '';
         for (final name in ComfyUi.extractMediaFilenames(raw)) {
           if (!ComfyUi.isVideo(name)) {
-            urls.add(ComfyUi.viewUrl(comfyBaseUrl, name));
+            final url = ComfyUi.viewUrl(comfyBaseUrl, name);
+            if (seen.add(url)) urls.add(url);
           }
         }
       } else if (role == 'user') {
-        urls.addAll(parseMessageContent(msg['content']).imageUrls);
+        for (final url in parseMessageContent(msg['content']).imageUrls) {
+          if (seen.add(url)) urls.add(url);
+        }
       }
     }
     return urls;
