@@ -2,6 +2,7 @@
 
 import 'dart:async';
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
@@ -22,10 +23,19 @@ class ConnectionManager {
 
   List<SavedConnection> getConnections() {
     final jsonList = prefs.getStringList(_key) ?? [];
-    return jsonList.map((j) {
-      final map = jsonDecode(j) as Map<String, dynamic>;
-      return SavedConnection.fromMap(map);
-    }).toList();
+    final connections = <SavedConnection>[];
+    for (final j in jsonList) {
+      try {
+        final map = jsonDecode(j) as Map<String, dynamic>;
+        connections.add(SavedConnection.fromMap(map));
+      } catch (e) {
+        // One corrupted/legacy stored entry must not take down the whole
+        // list -- callers (e.g. the home screen's connection picker) have no
+        // try/catch around this call, so skip it rather than throw.
+        debugPrint('[ConnectionManager] skipping malformed saved connection: $e');
+      }
+    }
+    return connections;
   }
 
   void saveConnection(
@@ -185,24 +195,6 @@ class ApiClient {
     }
   }
 
-  // ── Models ───────────────────────────────────────────────────────────
-
-  Future<List<String>> getModels() async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/v1/models'),
-      headers: _headers,
-    );
-    if (res.statusCode != 200) {
-      return ['hermes-agent'];
-    }
-    final data = jsonDecode(res.body) as Map<String, dynamic>;
-    final list = data['data'] as List? ?? [];
-    return list
-        .whereType<Map<String, dynamic>>()
-        .map((m) => (m['id'] as String?) ?? 'hermes-agent')
-        .toList();
-  }
-
   // ── Health check ─────────────────────────────────────────────────────
 
   Future<bool> healthCheck() async {
@@ -224,69 +216,6 @@ class ApiClient {
       return false;
     }
   }
-
-  // ── Generic HTTP helpers (for Dashboard API compatibility) ────────────
-
-  Future<Map<String, dynamic>> apiGet(String endpoint) async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/$endpoint'),
-      headers: _headers,
-    );
-    if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
-    return jsonDecode(res.body) as Map<String, dynamic>;
-  }
-
-  Future<List<dynamic>> apiGetList(String endpoint) async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/$endpoint'),
-      headers: _headers,
-    );
-    if (res.statusCode != 200) throw Exception('HTTP ${res.statusCode}');
-    return jsonDecode(res.body) as List<dynamic>;
-  }
-
-  Future<Map<String, dynamic>> apiPost(
-    String endpoint, {
-    Map<String, dynamic>? body,
-  }) async {
-    final res = await _http.post(
-      Uri.parse('$baseUrl/$endpoint'),
-      headers: _headers,
-      body: body != null ? jsonEncode(body) : null,
-    );
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('HTTP ${res.statusCode}');
-    }
-    return jsonDecode(res.body) as Map<String, dynamic>;
-  }
-
-  Future<void> apiDelete(String endpoint) async {
-    final res = await _http.delete(
-      Uri.parse('$baseUrl/$endpoint'),
-      headers: _headers,
-    );
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('HTTP ${res.statusCode}');
-    }
-  }
-
-  // ── Dashboard-compatible helpers (port 9119 endpoints, may not work on API server) ──
-
-  Future<Map<String, dynamic>> getModelInfo() => apiGet('api/model/info');
-  Future<Map<String, dynamic>> getModelOptions() => apiGet('api/model/options');
-  Future<List<Map<String, dynamic>>> getSkills() async {
-    final data = await apiGetList('api/skills');
-    return data.whereType<Map<String, dynamic>>().toList();
-  }
-
-  Future<Map<String, dynamic>> setModel(
-    String scope,
-    String provider,
-    String model,
-  ) => apiPost(
-    'api/model/set',
-    body: {'scope': scope, 'provider': provider, 'model': model},
-  );
 
   void close() => _http.close();
 }
@@ -489,9 +418,19 @@ class GatewayChatClient {
       const maxConnectAttempts = 4;
       const baseDelay = Duration(seconds: 1);
       const maxDelay = Duration(seconds: 8);
+      // Bounds a silently stalled handshake (weak wifi, VPN hiccup, a
+      // middlebox eating packets without RST) -- that failure mode produces
+      // neither an exception nor a response, so without this the await below
+      // never resolves and neither the retry ladder nor a cancelToken check
+      // ever gets a chance to run.
+      const connectTimeout = Duration(seconds: 15);
 
       http.StreamedResponse? response;
       for (var attempt = 1; attempt <= maxConnectAttempts; attempt++) {
+        if (cancelToken?._cancelled == true) {
+          onDone();
+          return;
+        }
         final request = http.Request(
           'POST',
           Uri.parse('$_baseUrl/v1/chat/completions'),
@@ -500,9 +439,13 @@ class GatewayChatClient {
         request.body = jsonEncode(body);
 
         try {
-          response = await _api._http.send(request);
+          response = await _api._http.send(request).timeout(connectTimeout);
           break;
         } catch (e) {
+          if (cancelToken?._cancelled == true) {
+            onDone();
+            return;
+          }
           if (attempt >= maxConnectAttempts) rethrow;
           final delayMs = (baseDelay.inMilliseconds * (1 << (attempt - 1)))
               .clamp(0, maxDelay.inMilliseconds);
@@ -895,24 +838,8 @@ class DashboardClient {
 
   Future<Map<String, dynamic>> updateJob(
     String jobId,
-    Map<String, dynamic> updates, {
-    bool retried = false,
-  }) async {
-    final headers = await _authHeaders();
-    final res = await _http.put(
-      Uri.parse('$_baseUrl/api/cron/jobs/$jobId'),
-      headers: headers,
-      body: jsonEncode(buildCronUpdateBody(updates)),
-    );
-    if (res.statusCode == 401 && !retried) {
-      _resetAuth();
-      return updateJob(jobId, updates, retried: true);
-    }
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('HTTP ${res.statusCode}');
-    }
-    return jsonDecode(res.body) as Map<String, dynamic>;
-  }
+    Map<String, dynamic> updates,
+  ) => apiPut('cron/jobs/$jobId', body: buildCronUpdateBody(updates));
 
   void close() => _http.close();
 }

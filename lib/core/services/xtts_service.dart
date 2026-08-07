@@ -85,15 +85,6 @@ class XttsService implements TtsProvider {
     'enable_text_splitting': true,
   };
 
-  /// Extracts only the spoken dialog from an assistant reply: text inside
-  /// double quotes (straight " or curly “ ”). Actions, narration, stage
-  /// directions and media/file paths live outside quotes and are skipped.
-  /// Leftover markdown emphasis inside the quotes is stripped, and the ENI
-  /// rebuttal mantra is always removed (it gets quoted often but is never
-  /// meant to be spoken aloud).
-  static final _quoteRe = RegExp(
-    r'"([^"]+)"|“([^”]+)”',
-  );
   static final _mdNoiseRe = RegExp(r'[*_#`>|]');
 
   // Phrases never spoken by TTS. Matched loosely (punctuation/case-insensitive).
@@ -108,21 +99,6 @@ class XttsService implements TtsProvider {
       out = out.replaceAll(re, '');
     }
     return out;
-  }
-
-  static String extractDialog(String text) {
-    final parts = <String>[];
-    for (final m in _quoteRe.allMatches(text)) {
-      var raw = (m.group(1) ?? m.group(2) ?? '').trim();
-      if (raw.isEmpty) continue;
-      raw = _stripBlocked(raw);
-      final cleaned = raw
-          .replaceAll(_mdNoiseRe, '')
-          .replaceAll(RegExp(r'\s+'), ' ')
-          .trim();
-      if (cleaned.isNotEmpty) parts.add(cleaned);
-    }
-    return parts.join(' ');
   }
 
   // Strips markdown emphasis / stage directions / code (file paths, URLs) and
@@ -251,8 +227,8 @@ class XttsService implements TtsProvider {
 
   /// Synthesizes [text] on the server and plays the returned WAV.
   ///
-  /// Only the quoted spoken dialog is narrated (see [extractDialog]); actions,
-  /// narration and media/file paths are skipped. Reads base URL, speaker and
+  /// The whole reply is narrated via [stripForSpeech] (markdown/action/media
+  /// lines stripped), not just quoted dialog. Reads base URL, speaker and
   /// language from SharedPreferences each call. A null/empty speaker means no
   /// voice is configured yet — we skip rather than send an invalid request.
   /// Generation settings are pushed before synthesis if they've changed.

@@ -9,6 +9,27 @@ import 'package:flutter/material.dart';
 
 import '../services/connection_manager.dart';
 
+final RegExp _cronFieldRe = RegExp(
+  r'^(\*|[\d*,\-/]+|(mon|tue|wed|thu|fri|sat|sun|jan|feb|mar|apr|may|jun|jul|'
+  r'aug|sep|oct|nov|dec)([,-](mon|tue|wed|thu|fri|sat|sun|jan|feb|mar|apr|'
+  r'may|jun|jul|aug|sep|oct|nov|dec))*)$',
+  caseSensitive: false,
+);
+final RegExp _durationScheduleRe =
+    RegExp(r'^every\s+\d+\s*[smhd]$', caseSensitive: false);
+
+/// Basic format check only -- not a full cron/duration parser. Catches
+/// obviously-wrong input (prose, missing fields, typos) before it round-trips
+/// to the server; doesn't validate field ranges (e.g. minute 0-59).
+bool looksLikeValidSchedule(String schedule) {
+  final s = schedule.trim();
+  if (s.isEmpty) return false;
+  if (_durationScheduleRe.hasMatch(s)) return true;
+  final fields = s.split(RegExp(r'\s+'));
+  if (fields.length != 5) return false;
+  return fields.every((f) => _cronFieldRe.hasMatch(f));
+}
+
 class CronScreen extends StatefulWidget {
   final SavedConnection connection;
   const CronScreen({required this.connection, super.key});
@@ -213,24 +234,19 @@ class _CronScreenState extends State<CronScreen> {
     );
     if (result == null || !mounted) return;
 
+    // createJob has no no_agent parameter, so a "script only" job is created
+    // in two round trips: create, then a follow-up flag update. If the first
+    // succeeds and the second fails (or never runs because the id came back
+    // empty), the job already exists server-side -- that must not be reported
+    // as "failed to add" (which reads as nothing happened) or left off the
+    // refreshed list.
+    Map<String, dynamic>? created;
     try {
-      final created = await _client.createJob(
+      created = await _client.createJob(
         name: result['name']?.toString() ?? '',
         prompt: result['prompt']?.toString() ?? '',
         schedule: result['schedule']?.toString() ?? '',
       );
-      if (result['no_agent'] == true) {
-        final jobId =
-            created['id']?.toString() ?? created['job_id']?.toString() ?? '';
-        if (jobId.isNotEmpty) {
-          await _client.updateJob(jobId, {'no_agent': true});
-        }
-      }
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('Cron job added')));
-      await _loadJobs();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -240,7 +256,37 @@ class _CronScreenState extends State<CronScreen> {
           ),
         );
       }
+      return;
     }
+
+    String? flagError;
+    if (result['no_agent'] == true) {
+      final jobId =
+          created['id']?.toString() ?? created['job_id']?.toString() ?? '';
+      if (jobId.isNotEmpty) {
+        try {
+          await _client.updateJob(jobId, {'no_agent': true});
+        } catch (e) {
+          flagError = '$e';
+        }
+      } else {
+        flagError = 'server did not return a job id';
+      }
+    }
+
+    if (!mounted) return;
+    await _loadJobs();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      flagError == null
+          ? const SnackBar(content: Text('Cron job added'))
+          : SnackBar(
+              content: Text(
+                'Job added, but "script only" flag failed to save: $flagError',
+              ),
+              backgroundColor: Colors.orange,
+            ),
+    );
   }
 
   Future<void> _showEditJobDialog(Map<String, dynamic> job) async {
@@ -353,6 +399,20 @@ class _CronScreenState extends State<CronScreen> {
                         content: Text(
                           'Name, prompt, and schedule are required',
                         ),
+                      ),
+                    );
+                    return;
+                  }
+
+                  if (!looksLikeValidSchedule(schedule)) {
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      const SnackBar(
+                        content: Text(
+                          'Schedule doesn\'t look valid — use a 5-field cron '
+                          'expression (e.g. "0 9 * * *") or "every <n><unit>" '
+                          '(e.g. "every 2h")',
+                        ),
+                        backgroundColor: Colors.orange,
                       ),
                     );
                     return;

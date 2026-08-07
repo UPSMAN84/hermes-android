@@ -72,6 +72,13 @@ class SpeechQueue {
     } catch (_) {}
   }
 
+  // Upper bound on how long one chunk is allowed to sit "playing": synthesis
+  // itself already has its own HTTP timeout, but if the platform player wedges
+  // *after* a successful handoff (no error, no completion event -- rare, but
+  // seen on some devices/players), nothing else would ever complete `done`,
+  // parking the whole call at CallState.speaking indefinitely.
+  static const _playbackWatchdog = Duration(seconds: 60);
+
   Future<void> _drain() async {
     if (_draining || _cancelled) return;
     _draining = true;
@@ -84,7 +91,15 @@ class SpeechQueue {
         });
         // speak() returns once playback has been handed to the player; the
         // completion callback is what tells us the audio actually ended.
-        await done.future;
+        await done.future.timeout(_playbackWatchdog);
+      } on TimeoutException {
+        debugPrint(
+          '[SpeechQueue] chunk playback wedged past '
+          '${_playbackWatchdog.inSeconds}s -- forcing stop and moving on',
+        );
+        try {
+          await _resolveTts().stop();
+        } catch (_) {}
       } catch (e) {
         debugPrint('[SpeechQueue] chunk failed: $e');
         // Skip the failed chunk and keep the reply going.

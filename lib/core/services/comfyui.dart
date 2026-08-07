@@ -60,8 +60,10 @@ class ComfyUi {
   /// True if the filename has a video extension.
   static bool isVideo(String filename) => _videoExtRe.hasMatch(filename);
 
-  /// Builds the ComfyUI /view URL for a given output filename.
-  static String viewUrl(String baseUrl, String filename) {
-    return '${normalizeBaseUrl(baseUrl)}/view?filename=${Uri.encodeComponent(filename)}&type=output';
+  /// Builds the ComfyUI /view URL for a given filename. [type] is ComfyUI's
+  /// own file-source classifier (`output` for generated results, `input` for
+  /// uploaded/source images, `temp` for intermediate previews).
+  static String viewUrl(String baseUrl, String filename, {String type = 'output'}) {
+    return '${normalizeBaseUrl(baseUrl)}/view?filename=${Uri.encodeComponent(filename)}&type=${Uri.encodeComponent(type)}';
   }
 }

@@ -6,6 +6,8 @@ class SpeechEventRouter {
   void Function(String)? _status;
   void Function(SpeechRecognitionError)? _error;
 
+  Object? get owner => _owner;
+
   void claim(
     Object owner, {
     void Function(String)? onStatus,
@@ -39,7 +41,21 @@ class SpeechRecognitionCoordinator {
     Object owner, {
     void Function(String)? onStatus,
     void Function(SpeechRecognitionError)? onError,
-  }) => _router.claim(owner, onStatus: onStatus, onError: onError);
+  }) {
+    // claim() only used to swap which owner's callbacks the router forwards
+    // to -- it never touched the actual mic. Two owners (e.g. chat's inline
+    // voice input and call mode) could each call speech.listen() on this one
+    // shared SpeechToText instance, since the plugin has no re-entrancy guard
+    // of its own. Stopping the outgoing owner's session here, before its
+    // callbacks are detached, makes it the outgoing owner's own onStatus that
+    // observes the resulting done/notListening (not silently dropped), so
+    // its "am I still listening" state resolves correctly instead of getting
+    // stuck on whatever it was at hand-off.
+    if (!identical(owner, _router.owner) && speech.isListening) {
+      speech.stop();
+    }
+    _router.claim(owner, onStatus: onStatus, onError: onError);
+  }
 
   void release(Object owner) => _router.release(owner);
 

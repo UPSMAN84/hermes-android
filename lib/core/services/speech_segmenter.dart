@@ -27,6 +27,8 @@ bool _isWhitespace(int c) => c == 0x20 || c == 0x09 || c == 0x0A || c == 0x0D;
 bool _isLetter(int c) =>
     (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A);
 
+bool _isDigit(int c) => c >= 0x30 && c <= 0x39;
+
 /// True when the period at [index] closes an abbreviation rather than a
 /// sentence — checked against [_abbreviations] plus bare initials.
 bool _isAbbreviation(String s, int index) {
@@ -38,6 +40,25 @@ bool _isAbbreviation(String s, int index) {
   if (word.isEmpty) return false;
   if (word.length == 1) return true; // initial: "J. R. R. Tolkien"
   return _abbreviations.contains(word);
+}
+
+/// True when the period at [index] closes a list marker ("1.", "12.") rather
+/// than a sentence — a digit run at the start of a line, optionally indented.
+/// Doesn't fire mid-sentence ("Version 2.") since that digit run isn't at a
+/// line start.
+bool _isListMarker(String s, int index) {
+  var start = index;
+  while (start > 0 && _isDigit(s.codeUnitAt(start - 1))) {
+    start--;
+  }
+  if (start == index) return false; // no digits before the period
+  var lineStart = start;
+  while (lineStart > 0 &&
+      (s.codeUnitAt(lineStart - 1) == 0x20 ||
+          s.codeUnitAt(lineStart - 1) == 0x09)) {
+    lineStart--;
+  }
+  return lineStart == 0 || s.codeUnitAt(lineStart - 1) == 0x0A;
 }
 
 /// Offsets just past each sentence-ending punctuation run (including any
@@ -63,7 +84,11 @@ List<int> _sentenceBoundaries(String s) {
     // Must be followed by whitespace or end-of-buffer. This also rejects
     // decimals ("3.14") and dotted identifiers ("file.png") for free.
     if (end < s.length && !_isWhitespace(s.codeUnitAt(end))) continue;
-    if (c == 0x2E && end == i + 1 && _isAbbreviation(s, i)) continue;
+    if (c == 0x2E &&
+        end == i + 1 &&
+        (_isAbbreviation(s, i) || _isListMarker(s, i))) {
+      continue;
+    }
 
     boundaries.add(end);
     i = end - 1;

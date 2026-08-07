@@ -355,7 +355,7 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     });
     if (result.finalResult) {
-      _sendMessage(speakResponse: true);
+      _sendMessage();
     }
   }
 
@@ -387,7 +387,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _replayMessage(Map<String, dynamic> msg) async {
     final wasSpeaking = identical(msg, _speakingMessage);
     debugPrint(
-      '[Replay] tapped: ${((msg['content'] as String?) ?? '').length} chars, '
+      '[Replay] tapped: ${parseMessageContent(msg['content']).text.length} chars, '
       'wasSpeaking=$wasSpeaking',
     );
 
@@ -405,7 +405,7 @@ class _ChatScreenState extends State<ChatScreen> {
     await _xtts.stop();
     if (!mounted) return;
 
-    final content = (msg['content'] as String?) ?? '';
+    final content = parseMessageContent(msg['content']).text;
 
     // Nothing speakable in this message -> silent no-op (don't set state).
     final speakable = XttsService.stripForSpeech(content);
@@ -438,6 +438,21 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
       );
     }
+  }
+
+  // Object identity alone isn't enough: _messages (and therefore every Map
+  // instance in it) gets wholesale-replaced on every refetch (onDone,
+  // _fetchMessages, _pollForLateMedia), so a replay started before a refetch
+  // would otherwise desync from the bubble that's actually still playing.
+  // Falls back to role+text equality, which survives the refetch since the
+  // same historical turn's content doesn't change.
+  bool _isSpeakingMessage(Map<String, dynamic> msg) {
+    final speaking = _speakingMessage;
+    if (speaking == null) return false;
+    if (identical(msg, speaking)) return true;
+    return (msg['role'] as String?) == (speaking['role'] as String?) &&
+        parseMessageContent(msg['content']).text ==
+            parseMessageContent(speaking['content']).text;
   }
 
   void _onScroll() {
@@ -583,17 +598,27 @@ class _ChatScreenState extends State<ChatScreen> {
     final known = _mediaUrlsIn(_messages)..addAll(_liveMediaUrls);
     for (var attempt = 0; attempt < 5; attempt++) {
       await Future.delayed(const Duration(milliseconds: 800));
-      if (!mounted || gen != _mediaPollGen) return;
+      // Abort if a new turn started, a manual refetch ran, or the turn ended
+      // -- matches _pollForLateMedia's abort conditions so a straggling poll
+      // can't re-add a URL to _liveMediaUrls after onDone already cleared it.
+      if (!mounted || gen != _mediaPollGen || !_streaming) return;
       List<Map<String, dynamic>> messages;
       try {
         messages = await _client.getMessages(widget.session.id);
       } catch (_) {
         continue;
       }
-      if (!mounted || gen != _mediaPollGen) return;
+      if (!mounted || gen != _mediaPollGen || !_streaming) return;
       final fresh = _mediaUrlsIn(messages).difference(known);
       if (fresh.isNotEmpty) {
-        setState(() => _liveMediaUrls.addAll(fresh));
+        setState(() {
+          // Guarded like the fast path's equivalent add (below): two polls
+          // completing close together on a legacy (no-filename) server must
+          // not add the same URL twice.
+          for (final url in fresh) {
+            if (!_liveMediaUrls.contains(url)) _liveMediaUrls.add(url);
+          }
+        });
         WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
         return;
       }
@@ -808,7 +833,7 @@ class _ChatScreenState extends State<ChatScreen> {
     ];
   }
 
-  Future<void> _sendMessage({bool speakResponse = false, String? textOverride}) async {
+  Future<void> _sendMessage({String? textOverride}) async {
     final text = (textOverride ?? _textController.text).trim();
     if (text.isEmpty) return;
     if (_sending || _streaming) return;
@@ -1311,13 +1336,17 @@ class _ChatScreenState extends State<ChatScreen> {
     if (file == null || !mounted) return;
     final bytes = await file.readAsBytes();
     if (!mounted) return;
-    final ext = file.name.split('.').last.toLowerCase();
-    final mime = switch (ext) {
-      'png' => 'image/png',
-      'webp' => 'image/webp',
-      'gif' => 'image/gif',
-      _ => 'image/jpeg',
-    };
+    // The platform picker usually already knows the real MIME type; only
+    // guess from the extension when it doesn't say.
+    final platformMime = file.mimeType;
+    final mime = (platformMime != null && platformMime.isNotEmpty)
+        ? platformMime
+        : switch (file.name.split('.').last.toLowerCase()) {
+            'png' => 'image/png',
+            'webp' => 'image/webp',
+            'gif' => 'image/gif',
+            _ => 'image/jpeg',
+          };
     setState(() {
       _pickedImageBytes = bytes;
       _pickedImageMimeType = mime;
@@ -1448,7 +1477,7 @@ class _ChatScreenState extends State<ChatScreen> {
           isUser: isUser,
           verbose: _verboseMode,
           metadata: msg,
-          isSpeaking: identical(msg, _speakingMessage),
+          isSpeaking: _isSpeakingMessage(msg),
           onReplay: isUser ? null : () => _replayMessage(msg),
         );
       },

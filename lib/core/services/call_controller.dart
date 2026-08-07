@@ -100,7 +100,6 @@ class CallController extends ChangeNotifier {
   // restore audio, and a normal exit runs both. Set on first teardown.
   bool _audioStopped = false;
   String _sttLocaleId = 'en-US';
-  final StringBuffer _replyBuffer = StringBuffer();
   StreamCancelToken? _sendCancelToken;
 
   // Tail of the streaming reply not yet handed to the speech queue. Chunks are
@@ -127,7 +126,7 @@ class CallController extends ChangeNotifier {
     _speechCoordinator.claim(
       _speechOwner,
       onStatus: _onSpeechStatus,
-      onError: _onSpeechError,
+      onError: (e) => _onSpeechError(e, _listenEpoch),
     );
     _speechAvailable = await _speechCoordinator.initialize();
     if (!_lifecycle.isCurrent(lifecycle)) return;
@@ -324,7 +323,7 @@ class CallController extends ChangeNotifier {
     _speechCoordinator.claim(
       _speechOwner,
       onStatus: _onSpeechStatus,
-      onError: _onSpeechError,
+      onError: (e) => _onSpeechError(e, epoch),
     );
     try {
       await _speech.listen(
@@ -395,7 +394,6 @@ class CallController extends ChangeNotifier {
   /// so we still never record our own voice.
   Future<void> _send(String text) async {
     _setState(CallState.thinking);
-    _replyBuffer.clear();
     _speakTail = '';
     var speaking = false;
     final cancelToken = StreamCancelToken();
@@ -437,7 +435,6 @@ class CallController extends ChangeNotifier {
       sessionId: session.id,
       cancelToken: cancelToken,
       onToken: (token) {
-        _replyBuffer.write(token);
         if (!_active) return;
         _speakTail += token;
         pump(flush: false);
@@ -473,6 +470,12 @@ class CallController extends ChangeNotifier {
     );
   }
 
+  // Grace period after a terminal status (done/notListening) with no result
+  // or error yet, before the watchdog below force-rearms. Real
+  // results/errors normally follow a terminal status within tens of
+  // milliseconds; this is generous headroom, not a tuned deadline.
+  static const _statusWatchdogGrace = Duration(milliseconds: 1200);
+
   void _onSpeechStatus(String status) {
     debugPrint('[Call] speech status: $status (epoch $_listenEpoch)');
     // Mic stopped. If we were mid-listen with no turn in flight (e.g. the 60s
@@ -487,9 +490,26 @@ class CallController extends ChangeNotifier {
     if ((status == 'done' || status == 'notListening') &&
         _active &&
         !_muted &&
-        _state == CallState.listening &&
-        shouldRearmAfterSpeechStatus(status)) {
-      _scheduleListen();
+        _state == CallState.listening) {
+      // shouldRearmAfterSpeechStatus is permanently false: rearming
+      // immediately off this status raced _onResult/_onSpeechError, which
+      // fire for the same session. But if a session ends with truly empty
+      // audio, on-device recognizers can emit this terminal status with
+      // neither a final result nor an error ever following -- nothing else
+      // would ever rearm, and the call would sit at CallState.listening
+      // forever. This watchdog is the deferred, epoch-scoped fallback: it
+      // only acts if nothing resolved this exact session within the grace
+      // window, so it can't race a genuine result/error the way an
+      // immediate rearm would.
+      final epoch = _listenEpoch;
+      Timer(_statusWatchdogGrace, () {
+        if (_active &&
+            !_muted &&
+            _state == CallState.listening &&
+            epoch == _listenEpoch) {
+          _scheduleListen();
+        }
+      });
     }
   }
 
@@ -506,8 +526,15 @@ class CallController extends ChangeNotifier {
     });
   }
 
-  void _onSpeechError(SpeechRecognitionError error) {
-    debugPrint('[Call] speech error: ${error.errorMsg} (epoch $_listenEpoch)');
+  void _onSpeechError(SpeechRecognitionError error, int epoch) {
+    debugPrint(
+      '[Call] speech error: ${error.errorMsg} (epoch $epoch, current $_listenEpoch)',
+    );
+    // Mirrors _onResult's epoch check: an error from a listen session already
+    // superseded by a newer one (e.g. this callback still in flight from an
+    // old _listen() call when a fresh one started) must not schedule a
+    // rearm on top of the session that's actually live.
+    if (epoch != _listenEpoch) return;
     if (_active && !_muted) {
       if (speechErrorNeedsBackoff(error.errorMsg)) {
         final delay = _speechRetryBackoff.recordFailure();

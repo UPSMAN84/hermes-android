@@ -16,6 +16,27 @@ String? _header(http.BaseRequest request, String name) {
   return null;
 }
 
+/// Fake client for exercising [GatewayChatClient.sendMessageStreaming]'s
+/// connect retry ladder: throws on the first [failCount] calls to `send`,
+/// then returns an empty-but-successful streamed response.
+class _CountingFailThenSucceedClient extends http.BaseClient {
+  _CountingFailThenSucceedClient(this.failCount);
+  final int failCount;
+  int sendCount = 0;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) async {
+    sendCount++;
+    if (sendCount <= failCount) {
+      throw Exception('connection reset');
+    }
+    return http.StreamedResponse(const Stream<List<int>>.empty(), 200);
+  }
+
+  @override
+  void close() {}
+}
+
 void main() {
   group('SavedConnection', () {
     test('normalizes bare HTTP gateway hosts with fallback port', () {
@@ -358,6 +379,59 @@ void main() {
       expect(progress!['toolCallId'], 'call_1');
       expect(progress!['status'], 'running');
     });
+
+    test(
+      'sendMessageStreaming retries a failed connect with backoff and '
+      'eventually succeeds',
+      () async {
+        final client = _CountingFailThenSucceedClient(2);
+        final api = ApiClient(
+          baseUrl: 'http://example.test',
+          apiKey: 'k',
+          httpClient: client,
+        );
+        var doneCalled = false;
+        String? errorMsg;
+        await GatewayChatClient(api).sendMessageStreaming(
+          message: 'hi',
+          sessionId: 'sess1',
+          onToken: (_) {},
+          onDone: () => doneCalled = true,
+          onError: (e) => errorMsg = e,
+        );
+
+        expect(client.sendCount, 3);
+        expect(doneCalled, isTrue);
+        expect(errorMsg, isNull);
+      },
+    );
+
+    test(
+      'sendMessageStreaming bails out immediately if already cancelled, '
+      'without sending a request',
+      () async {
+        final client = _CountingFailThenSucceedClient(0);
+        final api = ApiClient(
+          baseUrl: 'http://example.test',
+          apiKey: 'k',
+          httpClient: client,
+        );
+        final cancelToken = StreamCancelToken()..cancel();
+        var doneCalled = false;
+
+        await GatewayChatClient(api).sendMessageStreaming(
+          message: 'hi',
+          sessionId: 'sess1',
+          cancelToken: cancelToken,
+          onToken: (_) {},
+          onDone: () => doneCalled = true,
+          onError: (_) => fail('onError should not fire on a pre-cancelled send'),
+        );
+
+        expect(client.sendCount, 0);
+        expect(doneCalled, isTrue);
+      },
+    );
   });
 
   group('DashboardClient', () {
@@ -520,6 +594,33 @@ void main() {
       expect(conn.dashboardUsername, 'misha');
       expect(conn.dashboardPassword, 'secret');
     });
+
+    test(
+      'getConnections skips a malformed stored entry instead of throwing',
+      () async {
+        final good = SavedConnection(
+          id: 'good-id',
+          label: 'Home',
+          host: '192.168.1.50',
+          port: 8642,
+          apiKey: 'key',
+        );
+        SharedPreferences.setMockInitialValues({
+          'saved_connections': [
+            jsonEncode(good.toMap()),
+            '{"id": "corrupt-id", "label": "Corrupt"}', // missing host
+            'not even json',
+          ],
+        });
+        final prefs = await SharedPreferences.getInstance();
+        final mgr = ConnectionManager(prefs);
+
+        final conns = mgr.getConnections();
+
+        expect(conns, hasLength(1));
+        expect(conns.single.id, 'good-id');
+      },
+    );
 
     test('updateDashboardAuth sets then clears fields', () async {
       final prefs = await SharedPreferences.getInstance();

@@ -150,7 +150,8 @@ class _SessionListScreenState extends State<SessionListScreen> {
     if (dt.year == now.year && dt.month == now.month && dt.day == now.day) {
       return '${dt.hour.toString().padLeft(2, '0')}:${dt.minute.toString().padLeft(2, '0')}';
     }
-    return '${dt.day}/${dt.month}';
+    if (dt.year == now.year) return '${dt.day}/${dt.month}';
+    return '${dt.day}/${dt.month}/${dt.year}';
   }
 
   void _openScreen(Widget screen) {

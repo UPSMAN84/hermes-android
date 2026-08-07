@@ -52,20 +52,21 @@ class _MemoryScreenState extends State<MemoryScreen> {
     });
 
     try {
-      // Try dedicated /api/memory endpoint first
+      // Try dedicated /api/memory endpoint first. A successful call (even
+      // with zero entries) is authoritative -- only an actual failure (the
+      // endpoint doesn't exist on this server) should fall through to the
+      // /api/config heuristic below.
       try {
         final memData = await _client.apiGet('memory');
         if (!mounted) return;
         final items =
             memData['entries'] as List? ?? memData['memory'] as List? ?? [];
-        if (items.isNotEmpty) {
-          setState(() {
-            _entries = items.cast<Map<String, dynamic>>();
-            _source = 'api';
-            _loading = false;
-          });
-          return;
-        }
+        setState(() {
+          _entries = items.whereType<Map<String, dynamic>>().toList();
+          _source = 'api';
+          _loading = false;
+        });
+        return;
       } catch (_) {
         // Endpoint not available — fall through to config
       }
@@ -78,7 +79,7 @@ class _MemoryScreenState extends State<MemoryScreen> {
       if (mem is List) {
         // Memory is a list of {target, content}
         setState(() {
-          _entries = mem.cast<Map<String, dynamic>>();
+          _entries = mem.whereType<Map<String, dynamic>>().toList();
           _source = 'config';
           _loading = false;
         });

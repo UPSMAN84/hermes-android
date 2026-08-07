@@ -92,6 +92,24 @@ void main() {
       expect(r.chunks, ['A list item']);
       expect(r.remainder, 'next line');
     });
+
+    test('does not split numbered list markers mid-item', () {
+      final r = segmentSpeech('1. First item\n2. Second item\n3. Third item');
+      expect(r.chunks, ['1. First item', '2. Second item']);
+      expect(r.remainder, '3. Third item');
+    });
+
+    test('indented numbered list markers are not split either', () {
+      final r = segmentSpeech('Here is a list:\n  1. First item\n  2. Second');
+      expect(r.chunks, ['Here is a list:', '1. First item']);
+      expect(r.remainder, '  2. Second');
+    });
+
+    test('a number ending a real sentence still splits normally', () {
+      final r = segmentSpeech('Version 2. Released last year');
+      expect(r.chunks, ['Version 2.']);
+      expect(r.remainder, ' Released last year');
+    });
   });
 
   group('SpeechQueue', () {

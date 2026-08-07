@@ -23,7 +23,6 @@ dependencies:
 
   # Network
   http: ^1.2.0
-  web_socket_channel: ^3.0.0
 
   # Local storage
   shared_preferences: ^2.3.0

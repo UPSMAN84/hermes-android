@@ -8,7 +8,6 @@ class Session {
   final bool isActive;
   final String preview;
   final double startedAt;
-  final double? endedAt;
 
   const Session({
     required this.id,
@@ -19,21 +18,18 @@ class Session {
     required this.isActive,
     required this.preview,
     required this.startedAt,
-    this.endedAt,
   });
 
   factory Session.fromJson(Map<String, dynamic> json) {
-    final endedAt = json['ended_at'];
     return Session(
       id: json['id'] ?? '',
       title: json['title'] ?? 'Untitled',
       model: json['model'] ?? 'Default',
       source: json['source'] ?? '',
       messageCount: json['message_count'] ?? 0,
-      isActive: endedAt == null,
+      isActive: json['ended_at'] == null,
       preview: json['preview'] ?? '',
       startedAt: (json['started_at'] ?? 0).toDouble(),
-      endedAt: endedAt?.toDouble(),
     );
   }
 }

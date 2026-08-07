@@ -148,10 +148,12 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
     try {
       await _client.setModel('main', _selectedProvider, _selectedModel);
+      if (!mounted) return;
       setState(() {
         _successMsg = 'Model set to $_selectedModel — applies to new sessions';
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _error = e.toString();
       });
@@ -363,7 +365,13 @@ class _SettingsScreenState extends State<SettingsScreen> {
                 const Text('TTS engine'),
                 const Spacer(),
                 DropdownButton<String>(
-                  value: _ttsProvider,
+                  // Guard like the Provider/Model pickers above: asserts if
+                  // `value` doesn't exactly match one entry in `items`. A
+                  // stale pref value (future engine rename/removal) must fall
+                  // back to null rather than crash the whole screen.
+                  value: const ['xtts', 'chatterbox'].contains(_ttsProvider)
+                      ? _ttsProvider
+                      : null,
                   items: const [
                     DropdownMenuItem(value: 'xtts', child: Text('XTTS-v2')),
                     DropdownMenuItem(
@@ -952,6 +960,8 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
   String _model = ChatterboxPrefs.defaultModel;
   bool _loading = true;
   String? _error;
+  bool _paramsSaved = false;
+  String? _paramsError;
 
   @override
   void initState() {
@@ -1055,31 +1065,67 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
   }
 
   Future<void> _saveParams() async {
-    final prefs = await SharedPreferences.getInstance();
     final lang = _langController.text.trim();
+    final cfgText = _cfgController.text.trim();
+    final exagText = _exagController.text.trim();
+    final repetitionPenaltyText = _repetitionPenaltyController.text.trim();
+    final minPText = _minPController.text.trim();
+    final topPText = _topPController.text.trim();
+    final temperatureText = _temperatureController.text.trim();
+    final topKText = _topKController.text.trim();
+
+    final cfg = double.tryParse(cfgText);
+    final exag = double.tryParse(exagText);
+    final repetitionPenalty = double.tryParse(repetitionPenaltyText);
+    final minP = double.tryParse(minPText);
+    final topP = double.tryParse(topPText);
+    final temperature = double.tryParse(temperatureText);
+    final topK = int.tryParse(topKText);
+
+    // Validate: non-empty but unparseable is an error, surfaced instead of
+    // silently dropping the field (empty fields are simply left unsaved).
+    final bad = [
+      if (cfgText.isNotEmpty && cfg == null) 'cfg_weight',
+      if (exagText.isNotEmpty && exag == null) 'exaggeration',
+      if (repetitionPenaltyText.isNotEmpty && repetitionPenalty == null)
+        'repetition_penalty',
+      if (minPText.isNotEmpty && minP == null) 'min_p',
+      if (topPText.isNotEmpty && topP == null) 'top_p',
+      if (temperatureText.isNotEmpty && temperature == null) 'temperature',
+      if (topKText.isNotEmpty && topK == null) 'top_k',
+    ];
+
+    if (bad.isNotEmpty) {
+      if (!mounted) return;
+      setState(() => _paramsError = 'Invalid number: ${bad.join(', ')}');
+      return;
+    }
+
+    final prefs = await SharedPreferences.getInstance();
     if (lang.isNotEmpty) await prefs.setString(ChatterboxPrefs.languageId, lang);
-    final cfg = double.tryParse(_cfgController.text.trim());
     if (cfg != null) await prefs.setDouble(ChatterboxPrefs.cfgWeight, cfg);
-    final exag = double.tryParse(_exagController.text.trim());
     if (exag != null) await prefs.setDouble(ChatterboxPrefs.exaggeration, exag);
-    final repetitionPenalty =
-        double.tryParse(_repetitionPenaltyController.text.trim());
     if (repetitionPenalty != null) {
       await prefs.setDouble(
         ChatterboxPrefs.repetitionPenalty,
         repetitionPenalty,
       );
     }
-    final minP = double.tryParse(_minPController.text.trim());
     if (minP != null) await prefs.setDouble(ChatterboxPrefs.minP, minP);
-    final topP = double.tryParse(_topPController.text.trim());
     if (topP != null) await prefs.setDouble(ChatterboxPrefs.topP, topP);
-    final temperature = double.tryParse(_temperatureController.text.trim());
     if (temperature != null) {
       await prefs.setDouble(ChatterboxPrefs.temperature, temperature);
     }
-    final topK = int.tryParse(_topKController.text.trim());
     if (topK != null) await prefs.setInt(ChatterboxPrefs.topK, topK);
+
+    if (!mounted) return;
+    setState(() {
+      _paramsError = null;
+      _paramsSaved = true;
+    });
+    Future.delayed(const Duration(seconds: 2), () {
+      if (mounted) setState(() => _paramsSaved = false);
+    });
   }
 
   @override
@@ -1115,7 +1161,12 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
             ),
             const SizedBox(height: 12),
             DropdownButtonFormField<String>(
-              initialValue: _model,
+              // Guard like the Provider/Model pickers above: a stale pref
+              // value (future model rename/removal) must fall back to null
+              // rather than crash the whole screen.
+              initialValue: const ['v3', 'turbo'].contains(_model)
+                  ? _model
+                  : null,
               isExpanded: true,
               decoration: const InputDecoration(
                 labelText: 'Model',
@@ -1302,6 +1353,26 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                   ],
                 ),
               ],
+              const SizedBox(height: 12),
+              Row(
+                children: [
+                  FilledButton.icon(
+                    onPressed: _saveParams,
+                    icon: Icon(_paramsSaved ? Icons.check : Icons.save),
+                    label: Text(_paramsSaved ? 'Saved' : 'Save'),
+                  ),
+                  if (_paramsError != null) ...[
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _paramsError!,
+                        style:
+                            const TextStyle(color: Colors.orange, fontSize: 12),
+                      ),
+                    ),
+                  ],
+                ],
+              ),
             ],
           ],
         ),
