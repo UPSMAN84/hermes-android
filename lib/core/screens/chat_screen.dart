@@ -193,17 +193,22 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _characterImagePath;
   String? _characterName;
 
-  static String _characterPrefKey(String sessionId) =>
+  // Stored as two keys rather than one delimited string: character names
+  // and image filenames both contain spaces, punctuation and unicode
+  // ("Bianca Laurent", "Julia Villasenor"), so any in-band separator is a
+  // bug waiting to happen.
+  static String _characterImageKey(String sessionId) =>
       'character_image_$sessionId';
+  static String _characterNameKey(String sessionId) =>
+      'character_name_$sessionId';
 
   Future<void> _restoreOrApplyCharacter() async {
     final prefs = await SharedPreferences.getInstance();
+    final sessionId = widget.session.id;
     final picked = widget.character;
     if (picked != null) {
-      await prefs.setString(
-        _characterPrefKey(widget.session.id),
-        '${picked.name} ${picked.primaryImage}',
-      );
+      await prefs.setString(_characterNameKey(sessionId), picked.name);
+      await prefs.setString(_characterImageKey(sessionId), picked.primaryImage);
       if (!mounted) return;
       setState(() {
         _characterName = picked.name;
@@ -212,13 +217,11 @@ class _ChatScreenState extends State<ChatScreen> {
       await _sendCharacterSetup();
       return;
     }
-    final stored = prefs.getString(_characterPrefKey(widget.session.id));
-    if (stored == null || !mounted) return;
-    final parts = stored.split(' ');
-    if (parts.length != 2) return;
+    final storedImage = prefs.getString(_characterImageKey(sessionId));
+    if (storedImage == null || !mounted) return;
     setState(() {
-      _characterName = parts[0];
-      _characterImagePath = parts[1];
+      _characterName = prefs.getString(_characterNameKey(sessionId));
+      _characterImagePath = storedImage;
     });
   }
 
@@ -1888,16 +1891,11 @@ class _MessageBubble extends StatelessWidget {
   /// Bright yellow — spoken dialogue.
   static const Color _rpDialogue = Color(0xFFFFEB3B);
 
-  /// Bold black — narration and actions, i.e. *asterisk* spans, which the
-  /// markdown renderer surfaces as emphasis.
-  static const Color _rpNarration = Color(0xFF000000);
-
-  /// Black-on-artwork needs a lift or it disappears into dark areas of the
-  /// card; a tight bright halo keeps it readable without changing the ink.
-  static const List<Shadow> _rpNarrationHalo = [
-    Shadow(color: Color(0xCCFFFFFF), blurRadius: 3),
-    Shadow(color: Color(0x99FFFFFF), blurRadius: 6),
-  ];
+  /// Bold white — narration and actions, i.e. *asterisk* spans, which the
+  /// markdown renderer surfaces as emphasis. White rather than black: the
+  /// bubble has to stay dark for the yellow dialogue to read, and black ink
+  /// on a dark bubble is invisible.
+  static const Color _rpNarration = Color(0xFFFFFFFF);
 
   /// Same idea for the yellow: a dark rim so it holds up over light art.
   static const List<Shadow> _rpDialogueHalo = [
@@ -1910,12 +1908,13 @@ class _MessageBubble extends StatelessWidget {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
 
-    // Bubble colors. A character reply drops its fill entirely so the card
-    // art behind the conversation stays visible.
+    // Bubble colors. A character reply keeps a bubble — going fully
+    // transparent over the card art made replies unreadable — but uses a
+    // translucent dark scrim so the picture still reads behind the text.
     final rp = roleplay && !isUser;
     final userBubbleColor = const Color(0xFFD4AF37);
     final assistantBubbleColor = rp
-        ? Colors.transparent
+        ? const Color(0xFF141414).withValues(alpha: 0.82)
         : (isDark ? const Color(0xFF2A2A2A) : const Color(0xFFEAEAEA));
     final assistantTextColor =
         rp ? _rpDialogue : (isDark ? Colors.white : Colors.black87);
@@ -2057,7 +2056,6 @@ class _MessageBubble extends StatelessWidget {
                       fontStyle: rp ? FontStyle.normal : FontStyle.italic,
                       fontWeight: rp ? FontWeight.bold : null,
                       color: rp ? _rpNarration : null,
-                      shadows: rp ? _rpNarrationHalo : null,
                     ),
               strong: isUser
                   ? theme.textTheme.bodyMedium?.copyWith(
@@ -2067,7 +2065,6 @@ class _MessageBubble extends StatelessWidget {
                   : theme.textTheme.bodyMedium?.copyWith(
                       fontWeight: FontWeight.bold,
                       color: rp ? _rpNarration : null,
-                      shadows: rp ? _rpNarrationHalo : null,
                     ),
             ),
           ),
