@@ -6,10 +6,12 @@ import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
+import '../models/character.dart';
 import '../models/connection.dart';
 import '../models/session.dart';
 
 // Re-export for convenience
+export '../models/character.dart';
 export '../models/connection.dart';
 export '../models/session.dart';
 
@@ -194,6 +196,50 @@ class ApiClient {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
     }
   }
+
+  // ── Character cards ──────────────────────────────────────────────────
+  //
+  // Served from HERMES_CHARACTERS_DIR on the gateway. Names come from the
+  // SillyTavern card metadata embedded in each PNG, not the filename (many
+  // exported cards are named by UUID).
+
+  Future<List<CharacterSummary>> getCharacters() async {
+    final res = await _http.get(
+      Uri.parse('$baseUrl/api/characters'),
+      headers: _headers,
+    );
+    if (res.statusCode != 200) {
+      throw Exception('HTTP ${res.statusCode}: ${res.body}');
+    }
+    final data = jsonDecode(res.body) as Map<String, dynamic>;
+    final list = data['data'] as List? ?? [];
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map(CharacterSummary.fromJson)
+        .where((c) => c.images.isNotEmpty)
+        .toList();
+  }
+
+  /// Full persona for one card. Fetched on demand — a card is ~10KB of
+  /// prose, so the listing deliberately omits it.
+  Future<CharacterCard> getCharacterCard(String imagePath) async {
+    final res = await _http.get(
+      Uri.parse('$baseUrl/api/characters/card?path=${Uri.encodeQueryComponent(imagePath)}'),
+      headers: _headers,
+    );
+    if (res.statusCode != 200) {
+      throw Exception('HTTP ${res.statusCode}: ${res.body}');
+    }
+    return CharacterCard.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
+  }
+
+  /// URL for a character image. Authenticated like every other route, so it
+  /// can't be handed to a bare Image.network — callers fetch it through
+  /// MediaCacheService with [authHeaders].
+  String characterImageUrl(String imagePath) =>
+      '$baseUrl/api/characters/image?path=${Uri.encodeQueryComponent(imagePath)}';
+
+  Map<String, String> get authHeaders => _headers;
 
   // ── Health check ─────────────────────────────────────────────────────
 

@@ -69,7 +69,12 @@ class MediaCacheService {
   /// Returns a local [File] holding [url]'s bytes — served from disk if
   /// already downloaded, fetched and saved otherwise. Throws on a network
   /// failure with nothing cached yet (callers show their own error state).
-  static Future<File> fileFor(String url) async {
+  ///
+  /// [headers] carries auth for sources that need it (gateway character
+  /// images are behind the same Bearer token as every other API route;
+  /// ComfyUI's /view is not). Headers are NOT part of the cache key — the
+  /// same URL is the same bytes regardless of who asked.
+  static Future<File> fileFor(String url, {Map<String, String>? headers}) async {
     final dir = await _cacheDir();
     final file = File('${dir.path}/${_keyFor(url)}');
     if (await file.exists() && await file.length() > 0) {
@@ -80,7 +85,7 @@ class MediaCacheService {
       if (age < _maxAge) return file;
     }
 
-    final res = await _http.get(Uri.parse(url));
+    final res = await _http.get(Uri.parse(url), headers: headers);
     if (res.statusCode < 200 || res.statusCode >= 300) {
       // A stale-but-present copy beats showing a broken image when the
       // server is unreachable or the file is gone upstream.

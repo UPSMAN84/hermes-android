@@ -26,6 +26,7 @@ import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
 import '../widgets/cached_media_thumbnail.dart';
 import 'call_screen.dart';
+import 'character_picker_screen.dart';
 import 'media_gallery_screen.dart';
 import 'session_list_screen.dart';
 import 'skills_screen.dart';
@@ -34,9 +35,18 @@ class ChatScreen extends StatefulWidget {
   final SavedConnection connection;
   final Session session;
 
+  /// Character whose card was just picked. When set, the screen sends the
+  /// persona as its opening turn (see _loadPickedCharacter) and uses the
+  /// card art as the chat background. Null for an ordinary chat — a
+  /// previously-picked character is restored from prefs instead.
+  final CharacterSummary? character;
+  final CharacterCard? characterCard;
+
   const ChatScreen({
     required this.connection,
     required this.session,
+    this.character,
+    this.characterCard,
     super.key,
   });
 
@@ -170,8 +180,109 @@ class _ChatScreenState extends State<ChatScreen> {
     _loadComfyUrl();
     _initTtsProvider();
     _rememberAsLastSession();
+    _restoreOrApplyCharacter();
     _scrollController.addListener(_onScroll);
     _textController.addListener(_onTextChanged);
+  }
+
+  // ── Character background ────────────────────────────────────────────
+  //
+  // The picked character's image path (relative to the gateway's characters
+  // dir), used as the chat background. Persisted per session so reopening a
+  // chat restores its character art.
+  String? _characterImagePath;
+  String? _characterName;
+
+  static String _characterPrefKey(String sessionId) =>
+      'character_image_$sessionId';
+
+  Future<void> _restoreOrApplyCharacter() async {
+    final prefs = await SharedPreferences.getInstance();
+    final picked = widget.character;
+    if (picked != null) {
+      await prefs.setString(
+        _characterPrefKey(widget.session.id),
+        '${picked.name} ${picked.primaryImage}',
+      );
+      if (!mounted) return;
+      setState(() {
+        _characterName = picked.name;
+        _characterImagePath = picked.primaryImage;
+      });
+      await _sendCharacterSetup();
+      return;
+    }
+    final stored = prefs.getString(_characterPrefKey(widget.session.id));
+    if (stored == null || !mounted) return;
+    final parts = stored.split(' ');
+    if (parts.length != 2) return;
+    setState(() {
+      _characterName = parts[0];
+      _characterImagePath = parts[1];
+    });
+  }
+
+  /// Sends the picked card's persona as the opening turn. It goes as an
+  /// ordinary user message because the gateway rebuilds history from its own
+  /// DB and ignores any client-supplied history — a persona only persists if
+  /// it is a real message. It's tagged with CharacterCard.setupMarker so the
+  /// transcript can hide the prose while the model still receives it.
+  Future<void> _sendCharacterSetup() async {
+    final card = widget.characterCard;
+    if (card == null) return;
+    await _sendMessage(textOverride: card.buildSetupMessage());
+  }
+
+  Future<void> _pickCharacter() async {
+    final picked = await Navigator.push<CharacterSummary>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CharacterPickerScreen(connection: widget.connection),
+      ),
+    );
+    if (picked == null || !mounted) return;
+
+    CharacterCard card;
+    try {
+      card = await _client.getCharacterCard(picked.primaryImage);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Could not load ${picked.name}: $e',
+            style: const TextStyle(color: Colors.black87),
+          ),
+          backgroundColor: Colors.orange,
+        ),
+      );
+      return;
+    }
+    if (!mounted) return;
+
+    // Each character gets its own conversation — injecting a second persona
+    // into an existing thread leaves the model with conflicting characters.
+    final session = Session(
+      id: GatewayChatClient.generateSessionId(),
+      title: picked.name,
+      model: 'hermes-agent',
+      source: 'mobile',
+      messageCount: 0,
+      isActive: true,
+      preview: '',
+      startedAt: DateTime.now().millisecondsSinceEpoch.toDouble() / 1000,
+    );
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ChatScreen(
+          connection: widget.connection,
+          session: session,
+          character: picked,
+          characterCard: card,
+        ),
+      ),
+    );
   }
 
   /// Remembers this as the last-opened session for this connection, so the
@@ -1278,7 +1389,7 @@ class _ChatScreenState extends State<ChatScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(
-          widget.session.title,
+          _characterName ?? widget.session.title,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
         ),
@@ -1287,6 +1398,11 @@ class _ChatScreenState extends State<ChatScreen> {
             icon: const Icon(Icons.history),
             tooltip: 'All chats',
             onPressed: _openSessionList,
+          ),
+          IconButton(
+            icon: const Icon(Icons.face_retouching_natural),
+            tooltip: 'Characters',
+            onPressed: _streaming ? null : _pickCharacter,
           ),
           IconButton(
             icon: const Icon(Icons.add_comment_outlined),
@@ -1379,7 +1495,42 @@ class _ChatScreenState extends State<ChatScreen> {
             ),
         ],
       ),
-      body: Center(
+      body: Stack(
+        children: [
+          if (_characterImagePath != null) _buildCharacterBackdrop(),
+          _buildChatColumn(),
+        ],
+      ),
+    );
+  }
+
+  /// The picked character's card art, behind the conversation. Dimmed hard
+  /// so message text keeps its contrast — the cards are busy, full-bleed
+  /// artwork, and at full strength they make the transcript unreadable.
+  Widget _buildCharacterBackdrop() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    return Positioned.fill(
+      child: IgnorePointer(
+        child: ColorFiltered(
+          colorFilter: ColorFilter.mode(
+            (isDark ? Colors.black : Colors.white).withValues(alpha: 0.78),
+            BlendMode.srcOver,
+          ),
+          child: CachedMediaThumbnail(
+            url: _client.characterImageUrl(_characterImagePath!),
+            headers: _client.authHeaders,
+            fit: BoxFit.cover,
+            // Decode near screen width, not the card's native resolution —
+            // these run to 6MB / ~25MB decoded.
+            decodeWidth: MediaQuery.of(context).size.width.round(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildChatColumn() {
+    return Center(
         child: ConstrainedBox(
           constraints: BoxConstraints(
             maxWidth: Responsive.isTablet(context) ? 800 : double.infinity,
@@ -1392,7 +1543,6 @@ class _ChatScreenState extends State<ChatScreen> {
             ],
           ),
         ),
-      ),
     );
   }
 
@@ -1636,6 +1786,11 @@ class _ChatScreenState extends State<ChatScreen> {
       if (role != 'user' && role != 'assistant') continue;
       final parsed = parseMessageContent(msg['content']);
       if (parsed.text.isEmpty && parsed.imageUrls.isEmpty) continue;
+      // Hide the character-persona turn: the model needs those ~10k chars,
+      // the reader doesn't want a wall of card prose as the first bubble.
+      if (role == 'user' && parsed.text.startsWith(CharacterCard.setupMarker)) {
+        continue;
+      }
 
       if (currentGroup.isNotEmpty) {
         displayMessages.add(currentGroup.toList());

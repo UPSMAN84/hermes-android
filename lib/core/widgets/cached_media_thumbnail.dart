@@ -21,10 +21,21 @@ class CachedMediaThumbnail extends StatefulWidget {
   final BoxFit fit;
   final double borderRadius;
 
+  /// Auth for sources that need it (gateway character images sit behind the
+  /// same Bearer token as the rest of the API; ComfyUI's /view does not).
+  final Map<String, String>? headers;
+
+  /// Decode width in pixels. Character cards are full-resolution PNGs — up
+  /// to 6MB, which decodes to ~25MB of bitmap — so a grid of them at full
+  /// size will OOM the app. Set this to roughly the on-screen width.
+  final int? decodeWidth;
+
   const CachedMediaThumbnail({
     required this.url,
     this.fit = BoxFit.cover,
     this.borderRadius = 0,
+    this.headers,
+    this.decodeWidth,
     super.key,
   });
 
@@ -56,7 +67,7 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
   void _resolve() {
     _fileFuture = widget.url.startsWith('data:')
         ? null
-        : MediaCacheService.fileFor(widget.url);
+        : MediaCacheService.fileFor(widget.url, headers: widget.headers);
   }
 
   static Uint8List? _decodeDataUri(String url) {
@@ -133,7 +144,11 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
           }
           return GestureDetector(
             onTap: () => _openFullscreen(context, Image.file(file)),
-            child: Image.file(file, fit: widget.fit),
+            child: Image.file(
+              file,
+              fit: widget.fit,
+              cacheWidth: widget.decodeWidth,
+            ),
           );
         },
       ),
