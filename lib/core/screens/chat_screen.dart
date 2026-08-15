@@ -554,6 +554,19 @@ class _ChatScreenState extends State<ChatScreen> {
         _error = errStr;
         _loading = false;
       });
+      // A refresh failure with an already-loaded conversation shouldn't hide
+      // that conversation behind a full-screen error (see _buildBody, which
+      // only shows the full-screen state when _messages is empty) — surface
+      // it as a SnackBar instead so the chat stays visible underneath.
+      if (_messages.isNotEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Refresh failed: $errStr'),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 6),
+          ),
+        );
+      }
     }
   }
 
@@ -1451,7 +1464,11 @@ class _ChatScreenState extends State<ChatScreen> {
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (_error != null) {
+    // Only the "nothing to show" case gets the full-screen error+Retry —
+    // a refresh failure with an already-loaded conversation surfaces via
+    // SnackBar instead (see _fetchMessages) so the conversation stays
+    // visible underneath rather than being replaced by an error screen.
+    if (_error != null && _messages.isEmpty) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(32),
