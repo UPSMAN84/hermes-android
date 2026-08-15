@@ -121,7 +121,10 @@ class _MemoryScreenState extends State<MemoryScreen> {
             if (_source != null)
               Text(
                 'Source: $_source',
-                style: const TextStyle(fontSize: 11, color: Colors.grey),
+                style: TextStyle(
+                  fontSize: 11,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant,
+                ),
               ),
           ],
         ),
@@ -187,9 +190,9 @@ class _MemoryScreenState extends State<MemoryScreen> {
               'Memory entries are cross-session facts the agent remembers.\n'
               'They are configured in ~/.hermes/config.yaml',
               textAlign: TextAlign.center,
-              style: Theme.of(
-                context,
-              ).textTheme.bodyMedium?.copyWith(color: Colors.grey),
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),
@@ -218,7 +221,12 @@ class _MemoryScreenState extends State<MemoryScreen> {
                       Chip(
                         label: Text(
                           target,
-                          style: const TextStyle(fontSize: 11),
+                          // Explicit white: the chip's backgroundColor below is
+                          // always a dark shade800, but the label's default
+                          // color follows the ambient theme (near-black in
+                          // light mode) rather than auto-contrasting against a
+                          // manually-set background — dark-on-dark otherwise.
+                          style: const TextStyle(fontSize: 11, color: Colors.white),
                         ),
                         padding: EdgeInsets.zero,
                         visualDensity: VisualDensity.compact,

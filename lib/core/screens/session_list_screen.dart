@@ -379,9 +379,9 @@ class _SessionListScreenState extends State<SessionListScreen> {
                       session.preview,
                       maxLines: 2,
                       overflow: TextOverflow.ellipsis,
-                      style: Theme.of(
-                        context,
-                      ).textTheme.bodySmall?.copyWith(color: Colors.grey[500]),
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
                     ),
                 ],
               ),

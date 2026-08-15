@@ -156,7 +156,10 @@ class _CronScreenState extends State<CronScreen> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed: $e'), backgroundColor: Colors.orange),
+          SnackBar(
+            content: Text('Failed: $e', style: const TextStyle(color: Colors.black87)),
+            backgroundColor: Colors.orange,
+          ),
         );
       }
     }
@@ -200,7 +203,7 @@ class _CronScreenState extends State<CronScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Delete failed: $e'),
+            content: Text('Delete failed: $e', style: const TextStyle(color: Colors.black87)),
             backgroundColor: Colors.orange,
           ),
         );
@@ -221,7 +224,10 @@ class _CronScreenState extends State<CronScreen> {
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed: $e'), backgroundColor: Colors.orange),
+          SnackBar(
+            content: Text('Failed: $e', style: const TextStyle(color: Colors.black87)),
+            backgroundColor: Colors.orange,
+          ),
         );
       }
     }
@@ -251,7 +257,7 @@ class _CronScreenState extends State<CronScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Failed to add job: $e'),
+            content: Text('Failed to add job: $e', style: const TextStyle(color: Colors.black87)),
             backgroundColor: Colors.orange,
           ),
         );
@@ -283,6 +289,7 @@ class _CronScreenState extends State<CronScreen> {
           : SnackBar(
               content: Text(
                 'Job added, but "script only" flag failed to save: $flagError',
+                style: const TextStyle(color: Colors.black87),
               ),
               backgroundColor: Colors.orange,
             ),
@@ -314,7 +321,7 @@ class _CronScreenState extends State<CronScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Failed to update job: $e'),
+            content: Text('Failed to update job: $e', style: const TextStyle(color: Colors.black87)),
             backgroundColor: Colors.orange,
           ),
         );
@@ -411,6 +418,7 @@ class _CronScreenState extends State<CronScreen> {
                           'Schedule doesn\'t look valid — use a 5-field cron '
                           'expression (e.g. "0 9 * * *") or "every <n><unit>" '
                           '(e.g. "every 2h")',
+                          style: TextStyle(color: Colors.black87),
                         ),
                         backgroundColor: Colors.orange,
                       ),

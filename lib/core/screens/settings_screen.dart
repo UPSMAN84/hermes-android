@@ -245,9 +245,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                       padding: const EdgeInsets.only(top: 4),
                       child: Text(
                         'Context: ${_modelInfo!['effective_context_length']} tokens',
-                        style: Theme.of(
-                          context,
-                        ).textTheme.bodySmall?.copyWith(color: Colors.grey),
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                          color: Theme.of(context).colorScheme.onSurfaceVariant,
+                        ),
                       ),
                     ),
                 ],
@@ -450,9 +450,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
           width: 80,
           child: Text(
             label,
-            style: const TextStyle(
+            style: TextStyle(
               fontWeight: FontWeight.w500,
-              color: Colors.grey,
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
             ),
           ),
         ),
@@ -524,10 +524,10 @@ class _AboutCardState extends State<_AboutCard> {
             const SizedBox(height: 4),
             Text('Version ${_version.isNotEmpty ? _version : '…'}'),
             const SizedBox(height: 8),
-            const Text(
+            Text(
               'Browse and manage your Hermes Agent sessions from your phone. '
               'Connects to a Hermes dashboard running on your local network.',
-              style: TextStyle(color: Colors.grey),
+              style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
             ),
           ],
         ),
@@ -791,7 +791,7 @@ class _VoicePickerState extends State<_VoicePicker> {
             else if (_error != null)
               Text(
                 'Could not reach XTTS server:\n$_error',
-                style: const TextStyle(color: Colors.orange),
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
               )
             else ...[
               // Speaker picker
@@ -1193,7 +1193,7 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
             else if (_error != null)
               Text(
                 'Could not reach Chatterbox server:\n$_error',
-                style: const TextStyle(color: Colors.orange),
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
               )
             else ...[
               DropdownButtonFormField<String?>(
@@ -1366,8 +1366,10 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                     Expanded(
                       child: Text(
                         _paramsError!,
-                        style:
-                            const TextStyle(color: Colors.orange, fontSize: 12),
+                        style: TextStyle(
+                          color: Theme.of(context).colorScheme.error,
+                          fontSize: 12,
+                        ),
                       ),
                     ),
                   ],
@@ -1509,9 +1511,12 @@ class _TtsParamsCardState extends State<_TtsParamsCard> {
               style: TextStyle(fontWeight: FontWeight.w500),
             ),
             const SizedBox(height: 4),
-            const Text(
+            Text(
               'Empty = server default. Applied before each reply.',
-              style: TextStyle(color: Colors.grey, fontSize: 12),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+                fontSize: 12,
+              ),
             ),
             const SizedBox(height: 12),
             Row(
@@ -1550,7 +1555,10 @@ class _TtsParamsCardState extends State<_TtsParamsCard> {
                   Expanded(
                     child: Text(
                       _error!,
-                      style: const TextStyle(color: Colors.orange, fontSize: 12),
+                      style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                        fontSize: 12,
+                      ),
                     ),
                   ),
                 ],

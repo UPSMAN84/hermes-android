@@ -384,7 +384,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('TTS failed: $e'),
+          content: Text('TTS failed: $e', style: const TextStyle(color: Colors.black87)),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 4),
         ),
@@ -444,7 +444,7 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _speakingMessage = null);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Voice playback failed: $e'),
+          content: Text('Voice playback failed: $e', style: const TextStyle(color: Colors.black87)),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 3),
         ),
@@ -561,7 +561,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_messages.isNotEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Refresh failed: $errStr'),
+            content: Text('Refresh failed: $errStr', style: const TextStyle(color: Colors.black87)),
             backgroundColor: Colors.orange,
             duration: const Duration(seconds: 6),
           ),
@@ -1105,12 +1105,15 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: const Text('Connection dropped — reply was interrupted, but your message went through.'),
+            content: const Text(
+              'Connection dropped — reply was interrupted, but your message went through.',
+              style: TextStyle(color: Colors.black87),
+            ),
             backgroundColor: Colors.orange,
             duration: const Duration(seconds: 8),
             action: SnackBarAction(
               label: 'Continue',
-              textColor: Colors.white,
+              textColor: Colors.black87,
               onPressed: () {
                 if (!_sending && !_streaming) {
                   _sendMessage(textOverride: 'Continue.');
@@ -1141,7 +1144,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Send failed: $e'),
+          content: Text('Send failed: $e', style: const TextStyle(color: Colors.black87)),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 6),
         ),
