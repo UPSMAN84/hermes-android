@@ -11,7 +11,15 @@ import 'xtts_service.dart';
 abstract class TtsProvider {
   /// Synthesize [text] and play it. [onComplete] fires when playback ends, is
   /// stopped, or fails (best-effort, once).
-  Future<void> speak(String text, {void Function()? onComplete});
+  ///
+  /// [keepActions] speaks `*narration*` instead of stripping it — set in
+  /// character chats, where actions are half the reply rather than a stray
+  /// stage direction. See XttsService.stripForSpeech.
+  Future<void> speak(
+    String text, {
+    void Function()? onComplete,
+    bool keepActions = false,
+  });
 
   /// Stop any in-progress playback.
   Future<void> stop();

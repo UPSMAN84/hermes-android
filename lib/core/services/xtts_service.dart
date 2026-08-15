@@ -111,9 +111,20 @@ class XttsService implements TtsProvider {
     caseSensitive: false,
   );
 
-  static String stripForSpeech(String text) {
+  /// [keepActions] retains `*asterisk*` spans instead of dropping them.
+  /// Ordinary chats strip them — a stray stage direction shouldn't be read
+  /// aloud. Character chats are the opposite: narration and action are half
+  /// the reply and are rendered as first-class text, so silently deleting
+  /// them means most of the message never gets spoken.
+  static String stripForSpeech(String text, {bool keepActions = false}) {
     var s = text;
-    s = s.replaceAll(_actionRe, ' '); // *stage directions*
+    if (keepActions) {
+      // Keep the words, drop only the asterisks themselves so the narration
+      // is spoken as prose rather than read out with punctuation.
+      s = s.replaceAllMapped(_actionRe, (m) => m[0]!.replaceAll('*', ''));
+    } else {
+      s = s.replaceAll(_actionRe, ' '); // *stage directions*
+    }
     s = s.replaceAll(_inlineCodeRe, ' '); // `C:\...\file.png`, URLs
     s = s.replaceAll(_mdNoiseRe, ' '); // leftover markdown chars
     // Drop lines that are clearly file paths / media output / links.
@@ -233,10 +244,14 @@ class XttsService implements TtsProvider {
   /// voice is configured yet — we skip rather than send an invalid request.
   /// Generation settings are pushed before synthesis if they've changed.
   @override
-  Future<void> speak(String text, {void Function()? onComplete}) async {
+  Future<void> speak(
+    String text, {
+    void Function()? onComplete,
+    bool keepActions = false,
+  }) async {
     // Speak the whole cleaned reply (markdown/action-stripped), not just
     // quoted dialog — the full chat text is already sanitized upstream.
-    final spoken = stripForSpeech(text);
+    final spoken = stripForSpeech(text, keepActions: keepActions);
     if (spoken.isEmpty) {
       // Nothing to narrate (stage directions only, media-only reply, blocked
       // phrase, etc.). Still signal completion so callers like the call-mode

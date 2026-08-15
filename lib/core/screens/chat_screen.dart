@@ -538,7 +538,11 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
     try {
-      await _xtts.speak(spokenText, onComplete: onComplete);
+      await _xtts.speak(
+        spokenText,
+        onComplete: onComplete,
+        keepActions: _characterImagePath != null,
+      );
     } catch (e) {
       onComplete?.call();
       if (!mounted) return;
@@ -580,7 +584,12 @@ class _ChatScreenState extends State<ChatScreen> {
     final content = parseMessageContent(msg['content']).text;
 
     // Nothing speakable in this message -> silent no-op (don't set state).
-    final speakable = XttsService.stripForSpeech(content);
+    // Must use the same keepActions as the speak() below, or a pure-narration
+    // reply in a character chat looks empty here and never plays.
+    final speakable = XttsService.stripForSpeech(
+      content,
+      keepActions: _characterImagePath != null,
+    );
     if (speakable.isEmpty) {
       debugPrint('[Replay] no speakable text -> no-op');
       return;
@@ -593,6 +602,7 @@ class _ChatScreenState extends State<ChatScreen> {
     try {
       await _xtts.speak(
         content,
+        keepActions: _characterImagePath != null,
         onComplete: () {
           debugPrint('[Replay] playback complete');
           if (mounted) setState(() => _speakingMessage = null);
