@@ -195,41 +195,6 @@ class ApiClient {
     }
   }
 
-  // ── Push device registration ────────────────────────────────────────
-  //
-  // `chatId` is the gateway's push routing key (e.g. "telegram:123456"),
-  // NOT the FCM token — it identifies which chat's replies should wake this
-  // device. See gateway/platforms/push.py for the server-side contract.
-  // Returns false (rather than throwing) on a 503, which means the gateway
-  // has no `platforms.push` block configured — a normal, non-error state for
-  // any gateway that hasn't set up FCM, not a bug in this call.
-
-  Future<bool> registerDevice(String chatId, String fcmToken) async {
-    final res = await _http.post(
-      Uri.parse('$baseUrl/api/devices/register'),
-      headers: _headers,
-      body: jsonEncode({'chat_id': chatId, 'token': fcmToken}),
-    );
-    if (res.statusCode == 503) return false;
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('HTTP ${res.statusCode}: ${res.body}');
-    }
-    return true;
-  }
-
-  Future<bool> unregisterDevice(String chatId, String fcmToken) async {
-    final res = await _http.post(
-      Uri.parse('$baseUrl/api/devices/unregister'),
-      headers: _headers,
-      body: jsonEncode({'chat_id': chatId, 'token': fcmToken}),
-    );
-    if (res.statusCode == 503) return false;
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('HTTP ${res.statusCode}: ${res.body}');
-    }
-    return true;
-  }
-
   // ── Health check ─────────────────────────────────────────────────────
 
   Future<bool> healthCheck() async {

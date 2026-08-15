@@ -4,7 +4,6 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../services/connection_manager.dart';
 import '../services/chatterbox_service.dart';
 import '../services/comfyui.dart';
-import '../services/push_service.dart';
 import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../services/tts_url.dart';
@@ -402,11 +401,6 @@ class _SettingsScreenState extends State<SettingsScreen> {
         // ---- Section: Media ----
         _buildSectionHeader('Media'),
         _ComfyUrlField(),
-        const SizedBox(height: 16),
-
-        // ---- Section: Notifications ----
-        _buildSectionHeader('Notifications'),
-        _PushRoutingKeyField(connection: widget.connection),
         const SizedBox(height: 16),
 
         // ---- Section: Connection ----
@@ -930,147 +924,6 @@ class _ComfyUrlFieldState extends State<_ComfyUrlField> {
               icon: Icon(_saved ? Icons.check : Icons.save),
               label: Text(_saved ? 'Saved' : 'Save'),
             ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// Push notification routing key for this connection: which gateway chat_id
-/// (e.g. "telegram:123456" — see gateway/platforms/push.py) should wake this
-/// device. There's no way to auto-discover this from the app side, since the
-/// gateway's push adapter routes by chat_id, not by account — see
-/// PushService's doc comment for the full explanation.
-class _PushRoutingKeyField extends StatefulWidget {
-  final SavedConnection connection;
-  const _PushRoutingKeyField({required this.connection});
-
-  @override
-  State<_PushRoutingKeyField> createState() => _PushRoutingKeyFieldState();
-}
-
-class _PushRoutingKeyFieldState extends State<_PushRoutingKeyField> {
-  final TextEditingController _chatIdController = TextEditingController();
-  ApiClient? _apiClient;
-  PushService? _push;
-  bool _saving = false;
-  bool _saved = false;
-  String? _error;
-
-  @override
-  void initState() {
-    super.initState();
-    _load();
-  }
-
-  @override
-  void dispose() {
-    _chatIdController.dispose();
-    _apiClient?.close();
-    super.dispose();
-  }
-
-  Future<void> _load() async {
-    final prefs = await SharedPreferences.getInstance();
-    final client = ApiClient(
-      baseUrl: widget.connection.baseUrl,
-      apiKey: widget.connection.apiKey,
-      pathPrefix: widget.connection.gatewayPrefix ?? '',
-    );
-    final push = PushService(client, prefs);
-    if (!mounted) {
-      client.close();
-      return;
-    }
-    setState(() {
-      _apiClient = client;
-      _push = push;
-      _chatIdController.text = push.chatIdFor(widget.connection.id);
-    });
-  }
-
-  Future<void> _save() async {
-    final push = _push;
-    if (push == null) return;
-    setState(() {
-      _saving = true;
-      _error = null;
-    });
-    try {
-      // Re-syncs registration with the gateway (unregisters the old key if
-      // it changed, registers the new one) — fails quiet if Firebase/the
-      // gateway's push adapter isn't configured, since push is opportunistic.
-      await push.setChatIdFor(widget.connection.id, _chatIdController.text);
-      if (!mounted) return;
-      setState(() {
-        _saving = false;
-        _saved = true;
-      });
-      Future.delayed(const Duration(seconds: 2), () {
-        if (mounted) setState(() => _saved = false);
-      });
-    } catch (e) {
-      if (!mounted) return;
-      setState(() {
-        _saving = false;
-        _error = e.toString();
-      });
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'Which gateway chat should wake this device when the app is '
-              'closed — e.g. "telegram:123456" for a Telegram chat sharing '
-              'this session. Leave blank to disable. Requires the gateway\'s '
-              'platforms.push to be configured.',
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextField(
-                    controller: _chatIdController,
-                    decoration: const InputDecoration(
-                      labelText: 'Push routing key',
-                      hintText: 'telegram:123456',
-                      border: OutlineInputBorder(),
-                      contentPadding: EdgeInsets.symmetric(
-                        horizontal: 12,
-                        vertical: 10,
-                      ),
-                      isDense: true,
-                    ),
-                    autocorrect: false,
-                    onSubmitted: (_) => _save(),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                FilledButton.icon(
-                  onPressed: _saving ? null : _save,
-                  icon: Icon(_saved ? Icons.check : Icons.save),
-                  label: Text(_saving ? 'Saving...' : (_saved ? 'Saved' : 'Save')),
-                ),
-              ],
-            ),
-            if (_error != null) ...[
-              const SizedBox(height: 8),
-              Text(
-                _error!,
-                style: TextStyle(color: Theme.of(context).colorScheme.error),
-              ),
-            ],
           ],
         ),
       ),

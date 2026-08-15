@@ -20,7 +20,6 @@ import '../services/speech_recognition_coordinator.dart';
 
 import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
-import '../services/push_service.dart';
 import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
@@ -49,7 +48,6 @@ class _ChatScreenState extends State<ChatScreen> {
   String? _error;
   late final ApiClient _client;
   late final GatewayChatClient _gateway;
-  PushService? _pushService;
 
   // Chat sending state
   final _textController = TextEditingController();
@@ -161,24 +159,8 @@ class _ChatScreenState extends State<ChatScreen> {
     _initVoice();
     _loadComfyUrl();
     _initTtsProvider();
-    _initPush();
     _scrollController.addListener(_onScroll);
     _textController.addListener(_onTextChanged);
-  }
-
-  /// Best-effort: initializes Firebase and registers this device for push if
-  /// a routing key was already configured for this connection (Settings has
-  /// no UI for that yet — see PushService's doc comment). Silently does
-  /// nothing on a gateway/app that hasn't set up FCM.
-  Future<void> _initPush() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final push = PushService(_client, prefs);
-      _pushService = push;
-      await push.start(widget.connection.id);
-    } catch (e) {
-      debugPrint('[Push] init failed: $e');
-    }
   }
 
   /// Rebuilds only when the slash-command suggestion row should appear or
@@ -247,7 +229,6 @@ class _ChatScreenState extends State<ChatScreen> {
     _speechToText.cancel();
     _speechCoordinator.release(_speechOwner);
     _xtts.dispose();
-    _pushService?.dispose();
     _client.close();
     _dashboard?.close();
     _textController.removeListener(_onTextChanged);
