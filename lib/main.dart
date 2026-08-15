@@ -13,14 +13,18 @@ void main() async {
   // video player for ComfyUI-generated clips. Must run before any Player is
   // created.
   MediaKit.ensureInitialized();
-  // Foreground service used by phone-call-mode to keep the voice loop alive
-  // when the app is backgrounded / screen locks.
+  // Foreground service used by phone-call-mode (to keep the voice loop alive
+  // when backgrounded / screen locks) and by chat sends (to keep the SSE
+  // stream alive while waiting on a reply, without needing the app in the
+  // foreground). notificationTitle/notificationText are set per-use at
+  // startService() time; this channel config is shared by both.
   FlutterForegroundTask.initCommunicationPort();
   FlutterForegroundTask.init(
     androidNotificationOptions: AndroidNotificationOptions(
-      channelId: 'hermes_call',
-      channelName: 'Hermes Call',
-      channelDescription: 'Shown during an active Hermes voice call.',
+      channelId: 'hermes_background',
+      channelName: 'Hermes Background Activity',
+      channelDescription:
+          'Shown while Hermes is on a call or waiting for a reply in the background.',
       onlyAlertOnce: true,
     ),
     iosNotificationOptions: const IOSNotificationOptions(),

@@ -18,6 +18,7 @@ import 'package:speech_to_text/speech_to_text.dart';
 import '../models/pending_chat_send.dart';
 import '../services/speech_recognition_coordinator.dart';
 
+import '../services/background_activity_service.dart';
 import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
 import '../services/tts_provider.dart';
@@ -41,7 +42,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   List<Map<String, dynamic>> _messages = [];
   final List<Map<String, dynamic>> _toolMessages = [];
   bool _loading = true;
@@ -54,6 +55,11 @@ class _ChatScreenState extends State<ChatScreen> {
   bool _sending = false;
   bool _streaming = false;
   StreamCancelToken? _streamCancelToken;
+  // True while the background-keepalive foreground service is running.
+  // Only started when the app is backgrounded mid-generation (see
+  // didChangeAppLifecycleState) — not on every send — so a normal
+  // foreground send never shows the notification.
+  bool _backgroundServiceActive = false;
 
   // Image attach (gallery picker) — one pending image per send, mirroring
   // Telegram's attach-then-caption flow.
@@ -148,6 +154,7 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _client = ApiClient(
       baseUrl: widget.connection.baseUrl,
       apiKey: widget.connection.apiKey,
@@ -161,6 +168,22 @@ class _ChatScreenState extends State<ChatScreen> {
     _initTtsProvider();
     _scrollController.addListener(_onScroll);
     _textController.addListener(_onTextChanged);
+  }
+
+  /// Starts the background-keepalive foreground service only when the app is
+  /// actually backgrounded (not merely inactive, e.g. a transient system
+  /// dialog) while a generation is in flight — a normal foreground send never
+  /// triggers it. Stops it again on resume; the send's own try/finally is the
+  /// other stop path, covering a reply that finishes while still backgrounded.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused && _streaming && !_backgroundServiceActive) {
+      _backgroundServiceActive = true;
+      startBackgroundSendService();
+    } else if (state == AppLifecycleState.resumed && _backgroundServiceActive) {
+      _backgroundServiceActive = false;
+      stopBackgroundSendService();
+    }
   }
 
   /// Rebuilds only when the slash-command suggestion row should appear or
@@ -220,6 +243,11 @@ class _ChatScreenState extends State<ChatScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    if (_backgroundServiceActive) {
+      _backgroundServiceActive = false;
+      stopBackgroundSendService();
+    }
     // Stop any in-flight late-media poll from touching state after teardown.
     _mediaPollGen++;
     _savedPositions[widget.session.id] = _lastPixels;
@@ -893,7 +921,8 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // Accumulate tokens into the streaming placeholder
     _streamCancelToken = StreamCancelToken();
-    await _gateway.sendMessageStreaming(
+    try {
+      await _gateway.sendMessageStreaming(
       message: text,
       sessionId: widget.session.id,
       history: history,
@@ -972,7 +1001,16 @@ class _ChatScreenState extends State<ChatScreen> {
         if (!mounted) return;
         _handleSendError(pendingSend, error);
       },
-    );
+      );
+    } finally {
+      // Covers the reply-finishes-while-backgrounded path; the resumed
+      // branch of didChangeAppLifecycleState covers the other (app comes
+      // back to the foreground before the reply is done).
+      if (_backgroundServiceActive) {
+        _backgroundServiceActive = false;
+        stopBackgroundSendService();
+      }
+    }
   }
 
   // Aborts the in-flight SSE connection. The gateway treats a dropped
