@@ -42,7 +42,7 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
+class _ChatScreenState extends State<ChatScreen> {
   List<Map<String, dynamic>> _messages = [];
   final List<Map<String, dynamic>> _toolMessages = [];
   bool _loading = true;
@@ -56,9 +56,11 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   bool _streaming = false;
   StreamCancelToken? _streamCancelToken;
   // True while the background-keepalive foreground service is running.
-  // Only started when the app is backgrounded mid-generation (see
-  // didChangeAppLifecycleState) — not on every send — so a normal
-  // foreground send never shows the notification.
+  // Started the moment a send begins (see _sendMessage) — not reactively on
+  // backgrounding — so there's no async gap between "app backgrounds" and
+  // "OS actually protects the process" for the OS to suspend the socket in.
+  // Costs a brief notification on every send, including ones that never
+  // leave the foreground.
   bool _backgroundServiceActive = false;
 
   // Image attach (gallery picker) — one pending image per send, mirroring
@@ -154,7 +156,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _client = ApiClient(
       baseUrl: widget.connection.baseUrl,
       apiKey: widget.connection.apiKey,
@@ -168,22 +169,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     _initTtsProvider();
     _scrollController.addListener(_onScroll);
     _textController.addListener(_onTextChanged);
-  }
-
-  /// Starts the background-keepalive foreground service only when the app is
-  /// actually backgrounded (not merely inactive, e.g. a transient system
-  /// dialog) while a generation is in flight — a normal foreground send never
-  /// triggers it. Stops it again on resume; the send's own try/finally is the
-  /// other stop path, covering a reply that finishes while still backgrounded.
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.paused && _streaming && !_backgroundServiceActive) {
-      _backgroundServiceActive = true;
-      startBackgroundSendService();
-    } else if (state == AppLifecycleState.resumed && _backgroundServiceActive) {
-      _backgroundServiceActive = false;
-      stopBackgroundSendService();
-    }
   }
 
   /// Rebuilds only when the slash-command suggestion row should appear or
@@ -243,7 +228,6 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
 
   @override
   void dispose() {
-    WidgetsBinding.instance.removeObserver(this);
     if (_backgroundServiceActive) {
       _backgroundServiceActive = false;
       stopBackgroundSendService();
@@ -905,6 +889,12 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
       imageMimeType: _pickedImageMimeType,
     );
 
+    // Snapshot before the optimistic rows go in, so onError can tell a
+    // genuinely-nothing-sent failure apart from a connection drop that the
+    // gateway had already persisted a turn for (it interrupts-and-persists
+    // rather than discarding — see _handleSendError).
+    final baselineMessageCount = _messages.length;
+
     // Invalidate any in-flight late-media poll from the previous turn.
     _mediaPollGen++;
     setState(() {
@@ -918,6 +908,13 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
 
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+
+    // Started here (not reactively on backgrounding) so there's no gap
+    // between the app going to the background and the OS actually
+    // protecting the process — see _backgroundServiceActive's doc comment.
+    // Stopped in the finally below, whichever state the app is in by then.
+    _backgroundServiceActive = true;
+    startBackgroundSendService();
 
     // Accumulate tokens into the streaming placeholder
     _streamCancelToken = StreamCancelToken();
@@ -993,19 +990,18 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
           });
         }
       },
-      onError: (error) {
+      onError: (error) async {
         _tokenFlushTimer?.cancel();
         _tokenFlushTimer = null;
         _pendingTokens.clear();
         _streamCancelToken = null;
         if (!mounted) return;
-        _handleSendError(pendingSend, error);
+        await _handleSendError(pendingSend, error, baselineMessageCount);
       },
       );
     } finally {
-      // Covers the reply-finishes-while-backgrounded path; the resumed
-      // branch of didChangeAppLifecycleState covers the other (app comes
-      // back to the foreground before the reply is done).
+      // Always stop once the send completes — success, error, or cancel —
+      // regardless of whether the app is foreground or background by then.
       if (_backgroundServiceActive) {
         _backgroundServiceActive = false;
         stopBackgroundSendService();
@@ -1054,7 +1050,66 @@ class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
     });
   }
 
-  void _handleSendError(PendingChatSend pending, Object e) {
+  /// Handles a failed/interrupted send. The gateway treats a dropped SSE
+  /// connection (e.g. the OS suspending the socket when the app backgrounds)
+  /// the same as any other client disconnect: it interrupts the agent but
+  /// PERSISTS whatever was generated so far, rather than discarding it — see
+  /// the comment on _stopStreaming. So a network-level onError does not mean
+  /// nothing happened server-side; check before rolling back the optimistic
+  /// rows, or a message that actually landed (fully or partially) would
+  /// visually vanish and the user would re-type + re-send a duplicate.
+  Future<void> _handleSendError(
+    PendingChatSend pending,
+    Object e,
+    int baselineMessageCount,
+  ) async {
+    List<Map<String, dynamic>>? serverMessages;
+    try {
+      final fetched = await _client.getMessages(widget.session.id);
+      if (fetched.length > baselineMessageCount) {
+        serverMessages = fetched;
+      }
+    } catch (_) {
+      // Refetch itself failed (e.g. still offline) — fall through to the
+      // optimistic-rollback path below, same as before this fix existed.
+    }
+
+    if (!mounted) return;
+
+    if (serverMessages != null) {
+      // The gateway actually has a turn recorded for this send (complete or
+      // interrupted-partial) — show it instead of pretending nothing was
+      // sent. Mirrors onDone's success-path refetch, minus auto-continue/
+      // voice-reply (an interrupted turn isn't a "reply finished" event).
+      _extractToolMessages(serverMessages);
+      setState(() {
+        _messages = serverMessages!;
+        _sending = false;
+        _streaming = false;
+        _awaitingVoiceReply = false;
+        _liveMediaUrls.clear();
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text('Connection dropped — reply was interrupted, but your message went through.'),
+            backgroundColor: Colors.orange,
+            duration: const Duration(seconds: 8),
+            action: SnackBarAction(
+              label: 'Continue',
+              textColor: Colors.white,
+              onPressed: () {
+                if (!_sending && !_streaming) {
+                  _sendMessage(textOverride: 'Continue.');
+                }
+              },
+            ),
+          ),
+        );
+      }
+      return;
+    }
+
     setState(() {
       _sending = false;
       _streaming = false;
