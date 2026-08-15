@@ -4,6 +4,7 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'core/services/connection_manager.dart';
+import 'core/screens/chat_screen.dart';
 import 'core/screens/session_list_screen.dart';
 import 'core/utils/responsive.dart';
 
@@ -217,8 +218,50 @@ class _HomeScreenState extends State<HomeScreen> {
     final conn = _connections.where((c) => c.id == lastId).firstOrNull;
     if (conn == null) return;
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted) _navigateToSessions(conn);
+      if (mounted) _resumeLastSessionOrShowList(conn);
     });
+  }
+
+  static String _lastSessionPrefKey(String connectionId) =>
+      'last_session_id_$connectionId';
+
+  /// Opens straight into the last-used chat session for [conn] (set by
+  /// ChatScreen on every open — see its initState), so the app doesn't force
+  /// a trip through the session list on every launch. Falls back to the
+  /// session list itself when there's no remembered session, the API call
+  /// fails (offline), or the remembered session no longer exists (deleted).
+  Future<void> _resumeLastSessionOrShowList(SavedConnection conn) async {
+    widget.connManager.prefs.setString(_lastConnectionKey, conn.id);
+    final lastSessionId = widget.connManager.prefs.getString(
+      _lastSessionPrefKey(conn.id),
+    );
+    if (lastSessionId != null) {
+      final client = ApiClient(
+        baseUrl: conn.baseUrl,
+        apiKey: conn.apiKey,
+        pathPrefix: conn.gatewayPrefix ?? '',
+      );
+      try {
+        final sessions = await client.getSessions();
+        final session = sessions.where((s) => s.id == lastSessionId).firstOrNull;
+        if (session != null) {
+          if (!mounted) return;
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => ChatScreen(connection: conn, session: session),
+            ),
+          );
+          return;
+        }
+      } catch (_) {
+        // Offline, gateway unreachable, etc. — fall through to the list.
+      } finally {
+        client.close();
+      }
+    }
+    if (!mounted) return;
+    _navigateToSessions(conn);
   }
 
   void _navigateToSessions(SavedConnection conn) {

@@ -26,6 +26,7 @@ import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
 import 'call_screen.dart';
 import 'media_gallery_screen.dart';
+import 'session_list_screen.dart';
 import 'skills_screen.dart';
 
 class ChatScreen extends StatefulWidget {
@@ -167,8 +168,52 @@ class _ChatScreenState extends State<ChatScreen> {
     _initVoice();
     _loadComfyUrl();
     _initTtsProvider();
+    _rememberAsLastSession();
     _scrollController.addListener(_onScroll);
     _textController.addListener(_onTextChanged);
+  }
+
+  /// Remembers this as the last-opened session for this connection, so the
+  /// app can resume straight into it on next launch instead of always
+  /// showing the session list first — see HomeScreen._resumeLastSessionOrShowList.
+  Future<void> _rememberAsLastSession() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(
+      'last_session_id_${widget.connection.id}',
+      widget.session.id,
+    );
+  }
+
+  void _openSessionList() {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => SessionListScreen(connection: widget.connection),
+      ),
+    );
+  }
+
+  /// Starts a fresh session, replacing this screen (not pushing on top of
+  /// it) so the back button doesn't stack chats — same generateSessionId +
+  /// placeholder-Session shape SessionListScreen._createNewSession uses.
+  void _startNewChat() {
+    final session = Session(
+      id: GatewayChatClient.generateSessionId(),
+      title: 'New Chat',
+      model: 'hermes-agent',
+      source: 'mobile',
+      messageCount: 0,
+      isActive: true,
+      preview: '',
+      startedAt: DateTime.now().millisecondsSinceEpoch.toDouble() / 1000,
+    );
+    Navigator.pushReplacement(
+      context,
+      MaterialPageRoute(
+        builder: (_) =>
+            ChatScreen(connection: widget.connection, session: session),
+      ),
+    );
   }
 
   /// Rebuilds only when the slash-command suggestion row should appear or
@@ -1218,42 +1263,79 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         actions: [
           IconButton(
-            icon: Icon(
-              _autoContinueEnabled ? Icons.repeat_on : Icons.repeat,
-            ),
-            color: _autoContinueEnabled
-                ? Theme.of(context).colorScheme.primary
-                : null,
-            tooltip: _autoContinueEnabled
-                ? 'Auto-continue on — tap to stop'
-                : 'Auto-continue: send another turn automatically after each reply',
-            onPressed: _toggleAutoContinue,
+            icon: const Icon(Icons.history),
+            tooltip: 'All chats',
+            onPressed: _openSessionList,
           ),
           IconButton(
-            icon: const Icon(Icons.photo_library_outlined),
-            tooltip: 'Image gallery',
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => MediaGalleryScreen(
-                  messages: _messages,
-                  comfyBaseUrl: _comfyBaseUrl,
-                ),
-              ),
-            ),
+            icon: const Icon(Icons.add_comment_outlined),
+            tooltip: 'New chat',
+            onPressed: _streaming ? null : _startNewChat,
           ),
-          IconButton(
-            icon: const Icon(Icons.call),
-            tooltip: 'Phone call mode',
-            onPressed: () => Navigator.push(
-              context,
-              MaterialPageRoute(
-                builder: (_) => CallScreen(
-                  connection: widget.connection,
-                  session: widget.session,
+          PopupMenuButton<String>(
+            tooltip: 'More',
+            onSelected: (value) {
+              switch (value) {
+                case 'auto_continue':
+                  _toggleAutoContinue();
+                  break;
+                case 'gallery':
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => MediaGalleryScreen(
+                        messages: _messages,
+                        comfyBaseUrl: _comfyBaseUrl,
+                      ),
+                    ),
+                  );
+                  break;
+                case 'call':
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => CallScreen(
+                        connection: widget.connection,
+                        session: widget.session,
+                      ),
+                    ),
+                  );
+                  break;
+              }
+            },
+            itemBuilder: (context) => [
+              PopupMenuItem(
+                value: 'auto_continue',
+                child: ListTile(
+                  leading: Icon(
+                    _autoContinueEnabled ? Icons.repeat_on : Icons.repeat,
+                    color: _autoContinueEnabled
+                        ? Theme.of(context).colorScheme.primary
+                        : null,
+                  ),
+                  title: Text(
+                    _autoContinueEnabled ? 'Auto-continue on' : 'Auto-continue',
+                  ),
+                  contentPadding: EdgeInsets.zero,
                 ),
               ),
-            ),
+              const PopupMenuItem(
+                value: 'gallery',
+                child: ListTile(
+                  leading: Icon(Icons.photo_library_outlined),
+                  title: Text('Image gallery'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+              const PopupMenuItem(
+                value: 'call',
+                child: ListTile(
+                  leading: Icon(Icons.call),
+                  title: Text('Phone call mode'),
+                  contentPadding: EdgeInsets.zero,
+                ),
+              ),
+            ],
           ),
           if (_streaming)
             Padding(
