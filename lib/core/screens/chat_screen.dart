@@ -1625,6 +1625,10 @@ class _MessageBubble extends StatelessWidget {
         ? const Color(0xFF2A2A2A)
         : const Color(0xFFEAEAEA);
     final assistantTextColor = isDark ? Colors.white : Colors.black87;
+    // White text on this gold measures ~2.1:1 contrast — well under WCAG AA's
+    // 4.5:1 minimum for normal text. Dark text on the same gold comfortably
+    // clears it, so every isUser text color below uses this instead of white.
+    final userTextColor = Colors.black87;
 
     // Collect extra metadata for verbose mode
     final List<String> metaLines = [];
@@ -1679,7 +1683,7 @@ class _MessageBubble extends StatelessWidget {
                           fontSize: 11,
                           fontFamily: 'monospace',
                           color: isUser
-                              ? Colors.white.withValues(alpha: 0.8)
+                              ? userTextColor.withValues(alpha: 0.8)
                               : (isDark ? Colors.grey[400] : Colors.grey[600]),
                         ),
                       ),
@@ -1705,36 +1709,37 @@ class _MessageBubble extends StatelessWidget {
               data: content,
             styleSheet: MarkdownStyleSheet(
               p: (isUser
-                  ? theme.textTheme.bodyMedium?.copyWith(color: Colors.white)
+                  ? theme.textTheme.bodyMedium?.copyWith(color: userTextColor)
                   : theme.textTheme.bodyMedium?.copyWith(
                       color: assistantTextColor,
                     )),
               code: TextStyle(
-                backgroundColor: (isUser ? Colors.white : Colors.black)
-                    .withValues(alpha: 0.12),
+                backgroundColor: Colors.black.withValues(alpha: 0.12),
                 fontFamily: 'monospace',
-                color: isUser ? Colors.white : null,
+                color: isUser ? userTextColor : null,
               ),
               a: TextStyle(
-                color: isUser ? Colors.white70 : theme.colorScheme.primary,
+                color: isUser ? Colors.blue[900] : theme.colorScheme.primary,
               ),
               h1: isUser
-                  ? theme.textTheme.headlineSmall?.copyWith(color: Colors.white)
+                  ? theme.textTheme.headlineSmall?.copyWith(color: userTextColor)
                   : theme.textTheme.headlineSmall,
               h2: isUser
-                  ? theme.textTheme.titleLarge?.copyWith(color: Colors.white)
+                  ? theme.textTheme.titleLarge?.copyWith(color: userTextColor)
                   : theme.textTheme.titleLarge,
               h3: isUser
-                  ? theme.textTheme.titleMedium?.copyWith(color: Colors.white)
+                  ? theme.textTheme.titleMedium?.copyWith(color: userTextColor)
                   : theme.textTheme.titleMedium,
               blockquote: TextStyle(
-                color: isUser ? Colors.white60 : Colors.grey,
+                color: isUser ? userTextColor.withValues(alpha: 0.7) : Colors.grey,
                 fontStyle: FontStyle.italic,
               ),
               blockquoteDecoration: BoxDecoration(
                 border: Border(
                   left: BorderSide(
-                    color: isUser ? Colors.white38 : theme.colorScheme.primary,
+                    color: isUser
+                        ? userTextColor.withValues(alpha: 0.4)
+                        : theme.colorScheme.primary,
                     width: 3,
                   ),
                 ),
@@ -1742,7 +1747,7 @@ class _MessageBubble extends StatelessWidget {
               em: isUser
                   ? theme.textTheme.bodyMedium?.copyWith(
                       fontStyle: FontStyle.italic,
-                      color: Colors.white,
+                      color: userTextColor,
                     )
                   : theme.textTheme.bodyMedium?.copyWith(
                       fontStyle: FontStyle.italic,
@@ -1750,7 +1755,7 @@ class _MessageBubble extends StatelessWidget {
               strong: isUser
                   ? theme.textTheme.bodyMedium?.copyWith(
                       fontWeight: FontWeight.bold,
-                      color: Colors.white,
+                      color: userTextColor,
                     )
                   : theme.textTheme.bodyMedium?.copyWith(
                       fontWeight: FontWeight.bold,
