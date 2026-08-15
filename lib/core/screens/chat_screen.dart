@@ -1504,16 +1504,17 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
-  /// The picked character's card art, behind the conversation. Dimmed hard
-  /// so message text keeps its contrast — the cards are busy, full-bleed
-  /// artwork, and at full strength they make the transcript unreadable.
+  /// The picked character's card art, behind the conversation. Only lightly
+  /// veiled: the reply bubbles go transparent in a character chat, so the
+  /// art is meant to be seen. Legibility comes from the text halos in
+  /// _MessageBubble rather than from hiding the picture.
   Widget _buildCharacterBackdrop() {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     return Positioned.fill(
       child: IgnorePointer(
         child: ColorFiltered(
           colorFilter: ColorFilter.mode(
-            (isDark ? Colors.black : Colors.white).withValues(alpha: 0.78),
+            (isDark ? Colors.black : Colors.white).withValues(alpha: 0.25),
             BlendMode.srcOver,
           ),
           child: CachedMediaThumbnail(
@@ -1850,6 +1851,9 @@ class _ChatScreenState extends State<ChatScreen> {
           metadata: msg,
           isSpeaking: _isSpeakingMessage(msg),
           onReplay: isUser ? null : () => _replayMessage(msg),
+          // In a character chat the reply sits directly on the card art:
+          // no bubble fill, dialogue in yellow, *narration* in bold black.
+          roleplay: _characterImagePath != null,
         );
       },
     );
@@ -1865,6 +1869,11 @@ class _MessageBubble extends StatelessWidget {
   final bool isSpeaking;
   final VoidCallback? onReplay;
 
+  /// Character-chat styling: the assistant's reply drops its bubble fill so
+  /// the card art shows through, with dialogue in yellow and *narration* in
+  /// bold black. User messages keep their normal bubble either way.
+  final bool roleplay;
+
   const _MessageBubble({
     required this.content,
     this.imageUrls = const [],
@@ -1873,19 +1882,43 @@ class _MessageBubble extends StatelessWidget {
     this.metadata = const {},
     this.isSpeaking = false,
     this.onReplay,
+    this.roleplay = false,
   });
+
+  /// Bright yellow — spoken dialogue.
+  static const Color _rpDialogue = Color(0xFFFFEB3B);
+
+  /// Bold black — narration and actions, i.e. *asterisk* spans, which the
+  /// markdown renderer surfaces as emphasis.
+  static const Color _rpNarration = Color(0xFF000000);
+
+  /// Black-on-artwork needs a lift or it disappears into dark areas of the
+  /// card; a tight bright halo keeps it readable without changing the ink.
+  static const List<Shadow> _rpNarrationHalo = [
+    Shadow(color: Color(0xCCFFFFFF), blurRadius: 3),
+    Shadow(color: Color(0x99FFFFFF), blurRadius: 6),
+  ];
+
+  /// Same idea for the yellow: a dark rim so it holds up over light art.
+  static const List<Shadow> _rpDialogueHalo = [
+    Shadow(color: Color(0xCC000000), blurRadius: 3),
+    Shadow(color: Color(0x99000000), blurRadius: 6),
+  ];
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isDark = theme.brightness == Brightness.dark;
 
-    // Bubble colors
+    // Bubble colors. A character reply drops its fill entirely so the card
+    // art behind the conversation stays visible.
+    final rp = roleplay && !isUser;
     final userBubbleColor = const Color(0xFFD4AF37);
-    final assistantBubbleColor = isDark
-        ? const Color(0xFF2A2A2A)
-        : const Color(0xFFEAEAEA);
-    final assistantTextColor = isDark ? Colors.white : Colors.black87;
+    final assistantBubbleColor = rp
+        ? Colors.transparent
+        : (isDark ? const Color(0xFF2A2A2A) : const Color(0xFFEAEAEA));
+    final assistantTextColor =
+        rp ? _rpDialogue : (isDark ? Colors.white : Colors.black87);
     // White text on this gold measures ~2.1:1 contrast — well under WCAG AA's
     // 4.5:1 minimum for normal text. Dark text on the same gold comfortably
     // clears it, so every isUser text color below uses this instead of white.
@@ -1979,6 +2012,7 @@ class _MessageBubble extends StatelessWidget {
                   ? theme.textTheme.bodyMedium?.copyWith(color: userTextColor)
                   : theme.textTheme.bodyMedium?.copyWith(
                       color: assistantTextColor,
+                      shadows: rp ? _rpDialogueHalo : null,
                     )),
               code: TextStyle(
                 backgroundColor: Colors.black.withValues(alpha: 0.12),
@@ -2011,13 +2045,19 @@ class _MessageBubble extends StatelessWidget {
                   ),
                 ),
               ),
+              // *asterisks* — narration and actions. The markdown renderer
+              // surfaces them as emphasis, which is what makes roleplay
+              // styling possible without a custom parser.
               em: isUser
                   ? theme.textTheme.bodyMedium?.copyWith(
                       fontStyle: FontStyle.italic,
                       color: userTextColor,
                     )
                   : theme.textTheme.bodyMedium?.copyWith(
-                      fontStyle: FontStyle.italic,
+                      fontStyle: rp ? FontStyle.normal : FontStyle.italic,
+                      fontWeight: rp ? FontWeight.bold : null,
+                      color: rp ? _rpNarration : null,
+                      shadows: rp ? _rpNarrationHalo : null,
                     ),
               strong: isUser
                   ? theme.textTheme.bodyMedium?.copyWith(
@@ -2026,6 +2066,8 @@ class _MessageBubble extends StatelessWidget {
                     )
                   : theme.textTheme.bodyMedium?.copyWith(
                       fontWeight: FontWeight.bold,
+                      color: rp ? _rpNarration : null,
+                      shadows: rp ? _rpNarrationHalo : null,
                     ),
             ),
           ),
