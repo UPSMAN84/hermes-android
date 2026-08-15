@@ -16,7 +16,7 @@ import 'package:flutter/material.dart';
 
 import '../services/media_cache_service.dart';
 
-class CachedMediaThumbnail extends StatelessWidget {
+class CachedMediaThumbnail extends StatefulWidget {
   final String url;
   final BoxFit fit;
   final double borderRadius;
@@ -27,6 +27,37 @@ class CachedMediaThumbnail extends StatelessWidget {
     this.borderRadius = 0,
     super.key,
   });
+
+  @override
+  State<CachedMediaThumbnail> createState() => _CachedMediaThumbnailState();
+}
+
+class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
+  // Held in State, NOT created inside build(): a Future built in build() is a
+  // new instance on every rebuild, which makes FutureBuilder resubscribe and
+  // reset its snapshot to `waiting` — i.e. every visible image drops to a
+  // spinner on each rebuild. The chat screen rebuilds every 120ms while a
+  // reply streams (see _flushPendingTokens), so that flickered ~8x/second.
+  Future<File>? _fileFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _resolve();
+  }
+
+  @override
+  void didUpdateWidget(CachedMediaThumbnail oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // Only re-resolve when the actual source changes.
+    if (oldWidget.url != widget.url) _resolve();
+  }
+
+  void _resolve() {
+    _fileFuture = widget.url.startsWith('data:')
+        ? null
+        : MediaCacheService.fileFor(widget.url);
+  }
 
   static Uint8List? _decodeDataUri(String url) {
     if (!url.startsWith('data:')) return null;
@@ -60,9 +91,8 @@ class CachedMediaThumbnail extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final dataBytes = _decodeDataUri(url);
-
-    if (url.startsWith('data:')) {
+    if (widget.url.startsWith('data:')) {
+      final dataBytes = _decodeDataUri(widget.url);
       // A data: URI that failed to decode has no network fallback worth
       // attempting — data URIs aren't fetchable URLs — so show the broken
       // state directly instead of the old behavior of falling through to
@@ -70,23 +100,23 @@ class CachedMediaThumbnail extends StatelessWidget {
       // to fail with no visible error.
       if (dataBytes == null) {
         return ClipRRect(
-          borderRadius: BorderRadius.circular(borderRadius),
+          borderRadius: BorderRadius.circular(widget.borderRadius),
           child: _broken(context),
         );
       }
       return ClipRRect(
-        borderRadius: BorderRadius.circular(borderRadius),
+        borderRadius: BorderRadius.circular(widget.borderRadius),
         child: GestureDetector(
           onTap: () => _openFullscreen(context, Image.memory(dataBytes)),
-          child: Image.memory(dataBytes, fit: fit),
+          child: Image.memory(dataBytes, fit: widget.fit),
         ),
       );
     }
 
     return ClipRRect(
-      borderRadius: BorderRadius.circular(borderRadius),
+      borderRadius: BorderRadius.circular(widget.borderRadius),
       child: FutureBuilder<File>(
-        future: MediaCacheService.fileFor(url),
+        future: _fileFuture,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
             return const Center(
@@ -103,7 +133,7 @@ class CachedMediaThumbnail extends StatelessWidget {
           }
           return GestureDetector(
             onTap: () => _openFullscreen(context, Image.file(file)),
-            child: Image.file(file, fit: fit),
+            child: Image.file(file, fit: widget.fit),
           );
         },
       ),

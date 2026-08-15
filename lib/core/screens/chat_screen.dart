@@ -616,14 +616,34 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  // extractMediaFilenames runs a regex over a tool message's FULL content,
+  // and tool outputs can be tens of KB. _buildBody re-derives the display
+  // list on every rebuild — ~8x/second while a reply streams (see
+  // _flushPendingTokens) — so without memoization that regex re-scans the
+  // entire transcript every frame; measured at ~15ms/frame with 50 tool
+  // messages on desktop, which alone blows the 16.7ms/60fps budget on a
+  // phone. A tool message's content never changes once set, and a refetch
+  // builds new map objects, so caching per map object is both safe and
+  // self-invalidating.
+  final Expando<List<String>> _mediaNamesCache = Expando<List<String>>();
+
+  List<String> _mediaNamesIn(Map<String, dynamic> msg) {
+    final cached = _mediaNamesCache[msg];
+    if (cached != null) return cached;
+    final names = ComfyUi.extractMediaFilenames(
+      (msg['content'] as String?) ?? '',
+    );
+    _mediaNamesCache[msg] = names;
+    return names;
+  }
+
   /// All generated-media URLs currently derivable from a message list — the
   /// same harvest the build() path uses (tool messages → filenames → view URL).
   Set<String> _mediaUrlsIn(List<Map<String, dynamic>> messages) {
     final urls = <String>{};
     for (final msg in messages) {
       if ((msg['role'] as String?) != 'tool') continue;
-      final raw = (msg['content'] as String?) ?? '';
-      for (final name in ComfyUi.extractMediaFilenames(raw)) {
+      for (final name in _mediaNamesIn(msg)) {
         urls.add(ComfyUi.viewUrl(_comfyBaseUrl, name));
       }
     }
@@ -1602,9 +1622,9 @@ class _ChatScreenState extends State<ChatScreen> {
     for (final msg in _messages) {
       final role = (msg['role'] as String?) ?? 'assistant';
       if (role == 'tool') {
-        // Harvest generated-image filenames from the raw tool content.
-        final raw = (msg['content'] as String?) ?? '';
-        for (final name in ComfyUi.extractMediaFilenames(raw)) {
+        // Harvest generated-image filenames from the raw tool content
+        // (memoized per message — see _mediaNamesIn).
+        for (final name in _mediaNamesIn(msg)) {
           final url = ComfyUi.viewUrl(_comfyBaseUrl, name);
           if (seenImages.add(url)) groupImages.add(url);
         }
