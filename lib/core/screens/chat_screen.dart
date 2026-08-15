@@ -2,7 +2,6 @@
 // Uses REST endpoints: POST /api/sessions/{id}/chat and
 // GET /api/sessions/{id}/messages.
 import 'dart:async';
-import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -21,9 +20,11 @@ import '../services/speech_recognition_coordinator.dart';
 import '../services/background_activity_service.dart';
 import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
+import '../services/media_cache_service.dart';
 import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
+import '../widgets/cached_media_thumbnail.dart';
 import 'call_screen.dart';
 import 'media_gallery_screen.dart';
 import 'session_list_screen.dart';
@@ -1784,7 +1785,13 @@ class _MessageBubble extends StatelessWidget {
                 spacing: 6,
                 runSpacing: 6,
                 children: imageUrls
-                    .map((url) => _AttachedImage(url: url))
+                    .map(
+                      (url) => SizedBox(
+                        width: 140,
+                        height: 140,
+                        child: CachedMediaThumbnail(url: url, borderRadius: 12),
+                      ),
+                    )
                     .toList(),
               ),
             ),
@@ -1945,57 +1952,9 @@ class _ToolProgressCard extends StatelessWidget {
   }
 }
 
-/// An image attached to a chat message (sent by the user, or echoed back by
-/// the gateway from persisted history). Handles both `data:` URLs (the raw
-/// bytes we just picked and haven't round-tripped through the server yet)
-/// and `http(s)` URLs. Tappable to view full-screen.
-class _AttachedImage extends StatelessWidget {
-  final String url;
-  const _AttachedImage({required this.url});
-
-  Uint8List? get _dataBytes {
-    if (!url.startsWith('data:')) return null;
-    final comma = url.indexOf(',');
-    if (comma < 0) return null;
-    try {
-      return base64Decode(url.substring(comma + 1));
-    } catch (_) {
-      return null;
-    }
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final bytes = _dataBytes;
-    final image = bytes != null
-        ? Image.memory(bytes, fit: BoxFit.cover)
-        : Image.network(url, fit: BoxFit.cover);
-
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
-      child: GestureDetector(
-        onTap: () => Navigator.of(context).push(
-          MaterialPageRoute(
-            builder: (_) => Scaffold(
-              backgroundColor: Colors.black,
-              appBar: AppBar(backgroundColor: Colors.black),
-              body: SafeArea(
-                child: Center(
-                  child: InteractiveViewer(
-                    child: bytes != null
-                        ? Image.memory(bytes)
-                        : Image.network(url),
-                  ),
-                ),
-              ),
-            ),
-          ),
-        ),
-        child: SizedBox(width: 140, height: 140, child: image),
-      ),
-    );
-  }
-}
+// Attached-image rendering moved to the shared CachedMediaThumbnail widget
+// (see ../widgets/cached_media_thumbnail.dart) — this used to be its own
+// near-identical copy of the gallery's tile widget.
 
 /// A column of generated media (images and/or videos) from tool results.
 class _MediaRow extends StatelessWidget {
@@ -2127,8 +2086,19 @@ class _VideoBubbleState extends State<_VideoBubble> {
     _subs.add(_player.stream.width.listen((_) => _updateAspect()));
     _subs.add(_player.stream.height.listen((_) => _updateAspect()));
     try {
+      // Resolve through the disk cache first so a re-opened chat plays from
+      // a local file instead of re-fetching the same clip from the LAN
+      // gateway every time. A cache-fetch failure (offline, file gone)
+      // falls back to the direct URL — media_kit can still stream it live.
+      String source = widget.url;
+      try {
+        final file = await MediaCacheService.fileFor(widget.url);
+        source = file.path;
+      } catch (e) {
+        debugPrint('[media_kit] cache fetch failed for ${widget.url}: $e');
+      }
       // Open paused so multiple clips in a transcript don't all autoplay.
-      await _player.open(Media(widget.url), play: false);
+      await _player.open(Media(source), play: false);
       if (!mounted) return;
       setState(() => _ready = true);
     } catch (e) {
