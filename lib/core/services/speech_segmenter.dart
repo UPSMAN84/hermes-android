@@ -63,9 +63,21 @@ bool _isListMarker(String s, int index) {
 
 /// Offsets just past each sentence-ending punctuation run (including any
 /// closing quote/bracket that trails it).
-List<int> _sentenceBoundaries(String s) {
+/// [scanFrom] skips a prefix already known to contain no boundary. The
+/// lookback helpers still read the full string, so abbreviation and
+/// list-marker detection are unaffected by where the scan starts.
+/// [allowEndOfBuffer] accepts a terminator sitting at the very end of [s].
+/// True for a complete string, but FALSE while the reply is still streaming:
+/// mid-stream the next character has not arrived yet, and it is the character
+/// that decides. "Open file." looks like a finished sentence right up until
+/// the "png" lands.
+List<int> _sentenceBoundaries(
+  String s, {
+  int scanFrom = 0,
+  bool allowEndOfBuffer = true,
+}) {
   final boundaries = <int>[];
-  for (var i = 0; i < s.length; i++) {
+  for (var i = scanFrom < 0 ? 0 : scanFrom; i < s.length; i++) {
     final c = s.codeUnitAt(i);
     if (c == 0x0A) {
       boundaries.add(i + 1);
@@ -82,8 +94,14 @@ List<int> _sentenceBoundaries(String s) {
     }
 
     // Must be followed by whitespace or end-of-buffer. This also rejects
-    // decimals ("3.14") and dotted identifiers ("file.png") for free.
-    if (end < s.length && !_isWhitespace(s.codeUnitAt(end))) continue;
+    // decimals ("3.14") and dotted identifiers ("file.png") for free -- but
+    // only once the deciding character has actually arrived, hence
+    // allowEndOfBuffer.
+    if (end >= s.length) {
+      if (!allowEndOfBuffer) continue;
+    } else if (!_isWhitespace(s.codeUnitAt(end))) {
+      continue;
+    }
     if (c == 0x2E &&
         end == i + 1 &&
         (_isAbbreviation(s, i) || _isListMarker(s, i))) {
@@ -102,10 +120,33 @@ List<int> _sentenceBoundaries(String s) {
 /// [minChunkChars] long; shorter candidates are skipped so a reply doesn't get
 /// narrated one or two words at a time. Text after the last used boundary is
 /// returned as [SpeechSegmentation.remainder].
-SpeechSegmentation segmentSpeech(String buffer, {int minChunkChars = 0}) {
+/// [alreadyScanned] is the length of a prefix of [buffer] that a previous call
+/// already examined and found no boundary in. Call mode runs this on EVERY
+/// token, so rescanning the whole accumulated tail each time made the work
+/// quadratic in the length of an unpunctuated passage. A small overlap is
+/// re-examined because a boundary can be completed by newly arrived
+/// characters -- "Hello." only counts once the following space arrives.
+/// [isFinal] says whether [buffer] is the complete text. Pass false while
+/// tokens are still arriving so a terminator at the end of the buffer is held
+/// back until the next character confirms it really ends a sentence.
+SpeechSegmentation segmentSpeech(
+  String buffer, {
+  int minChunkChars = 0,
+  int alreadyScanned = 0,
+  bool isFinal = true,
+}) {
+  const overlap = 8;
+  final scanFrom = alreadyScanned <= overlap ? 0 : alreadyScanned - overlap;
   final chunks = <String>[];
   var start = 0;
-  for (final boundary in _sentenceBoundaries(buffer)) {
+  for (final boundary in _sentenceBoundaries(
+    buffer,
+    scanFrom: scanFrom,
+    allowEndOfBuffer: isFinal,
+  )) {
+    // A boundary inside the re-scanned overlap may already have been consumed
+    // by an earlier pass; `start` only ever moves forward, so skip it.
+    if (boundary <= start) continue;
     if (boundary - start < minChunkChars) continue;
     final piece = buffer.substring(start, boundary).trim();
     if (piece.isNotEmpty) chunks.add(piece);

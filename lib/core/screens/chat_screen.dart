@@ -145,14 +145,6 @@ class _ChatScreenState extends State<ChatScreen> {
   static String _mediaFilenameCapKey(String connectionId) =>
       'server_sends_media_filename_$connectionId';
 
-  Future<void> _loadMediaFilenameCapability() async {
-    final prefs = await SharedPreferences.getInstance();
-    final known =
-        prefs.getBool(_mediaFilenameCapKey(widget.connection.id)) ?? false;
-    if (!known || !mounted) return;
-    _serverSendsMediaFilename = true;
-  }
-
   Future<void> _rememberMediaFilenameCapability() async {
     if (_serverSendsMediaFilename) return;
     _serverSendsMediaFilename = true;
@@ -164,7 +156,21 @@ class _ChatScreenState extends State<ChatScreen> {
   final _scrollController = ScrollController();
   bool _showScrollToBottom = false;
   double _lastPixels = 0;
+  // Restored scroll offset per session. Static so it survives the screen
+  // being popped and reopened, which means nothing ever disposes it — so it
+  // is bounded rather than left to grow one entry per session for the life of
+  // the process. Dart Maps keep insertion order, so the oldest entry is
+  // simply the first key.
+  static const int _maxSavedPositions = 50;
   static final Map<String, double> _savedPositions = {};
+
+  static void _rememberScrollPosition(String sessionId, double pixels) {
+    _savedPositions.remove(sessionId);
+    _savedPositions[sessionId] = pixels;
+    while (_savedPositions.length > _maxSavedPositions) {
+      _savedPositions.remove(_savedPositions.keys.first);
+    }
+  }
 
   // Streaming-token batching: coalesce onToken callbacks into periodic
   // setState flushes instead of rebuilding on every token. Mirrors the
@@ -238,15 +244,62 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     _gateway = GatewayChatClient(_client);
     _fetchMessages();
-    _loadMediaFilenameCapability();
-    _loadVerboseMode();
+    _loadStartupPrefs();
+    // Kept separate from the batch: this one is permission-gated and can sit
+    // behind a system dialog, so folding it in would hold every other setting
+    // hostage to the microphone prompt.
     _initVoice();
-    _loadComfyUrl();
     _initTtsProvider();
-    _rememberAsLastSession();
-    _restoreOrApplyCharacter();
     _scrollController.addListener(_onScroll);
     _textController.addListener(_onTextChanged);
+  }
+
+  /// Reads every SharedPreferences-derived setting the screen opens with and
+  /// applies them in ONE setState.
+  ///
+  /// These used to be five independent initializers, each awaiting prefs and
+  /// then calling its own setState — up to five extra full rebuilds of the
+  /// screen during the exact moment the user is waiting for the chat to
+  /// appear. SharedPreferences caches its instance after the first call, so
+  /// the reads themselves are cheap; the rebuilds were the cost.
+  Future<void> _loadStartupPrefs() async {
+    final prefs = await SharedPreferences.getInstance();
+    final sessionId = widget.session.id;
+
+    // Remembering the session is a pure write, nothing renders from it.
+    await prefs.setString('last_session_id_${widget.connection.id}', sessionId);
+
+    final verbose = prefs.getBool('verbose_mode') ?? false;
+    final comfyUrl = ComfyUi.normalizeBaseUrl(
+      prefs.getString(ComfyUiPrefs.baseUrl) ?? ComfyUiPrefs.defaultBaseUrl,
+    );
+    _serverSendsMediaFilename =
+        prefs.getBool(_mediaFilenameCapKey(widget.connection.id)) ?? false;
+
+    // Character: an explicitly picked one is persisted now, otherwise restore
+    // whatever this session was last opened with.
+    final picked = widget.character;
+    if (picked != null) {
+      await prefs.setString(_characterNameKey(sessionId), picked.name);
+      await prefs.setString(_characterImageKey(sessionId), picked.primaryImage);
+    }
+    final characterImage =
+        picked?.primaryImage ?? prefs.getString(_characterImageKey(sessionId));
+    final characterName =
+        picked?.name ?? prefs.getString(_characterNameKey(sessionId));
+
+    if (!mounted) return;
+    _invalidateDisplayList();
+    setState(() {
+      _verboseMode = verbose;
+      _comfyBaseUrl = comfyUrl;
+      _characterImagePath = characterImage;
+      _characterName = characterName;
+    });
+
+    // The persona turn has to go after the state is applied, because it sends
+    // a message and the send path reads _characterImagePath.
+    if (picked != null) await _sendCharacterSetup();
   }
 
   // ── Character background ────────────────────────────────────────────
@@ -265,29 +318,6 @@ class _ChatScreenState extends State<ChatScreen> {
       'character_image_$sessionId';
   static String _characterNameKey(String sessionId) =>
       'character_name_$sessionId';
-
-  Future<void> _restoreOrApplyCharacter() async {
-    final prefs = await SharedPreferences.getInstance();
-    final sessionId = widget.session.id;
-    final picked = widget.character;
-    if (picked != null) {
-      await prefs.setString(_characterNameKey(sessionId), picked.name);
-      await prefs.setString(_characterImageKey(sessionId), picked.primaryImage);
-      if (!mounted) return;
-      setState(() {
-        _characterName = picked.name;
-        _characterImagePath = picked.primaryImage;
-      });
-      await _sendCharacterSetup();
-      return;
-    }
-    final storedImage = prefs.getString(_characterImageKey(sessionId));
-    if (storedImage == null || !mounted) return;
-    setState(() {
-      _characterName = prefs.getString(_characterNameKey(sessionId));
-      _characterImagePath = storedImage;
-    });
-  }
 
   /// Sends the picked card's persona as the opening turn. It goes as an
   /// ordinary user message because the gateway rebuilds history from its own
@@ -349,17 +379,6 @@ class _ChatScreenState extends State<ChatScreen> {
           characterCard: card,
         ),
       ),
-    );
-  }
-
-  /// Remembers this as the last-opened session for this connection, so the
-  /// app can resume straight into it on next launch instead of always
-  /// showing the session list first — see HomeScreen._resumeLastSessionOrShowList.
-  Future<void> _rememberAsLastSession() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(
-      'last_session_id_${widget.connection.id}',
-      widget.session.id,
     );
   }
 
@@ -439,18 +458,6 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _loadComfyUrl() async {
-    final url = await ComfyUi.loadBaseUrl();
-    if (!mounted) return;
-    _invalidateDisplayList();
-    setState(() => _comfyBaseUrl = url);
-  }
-
-  Future<void> _loadVerboseMode() async {
-    final prefs = await SharedPreferences.getInstance();
-    setState(() => _verboseMode = prefs.getBool('verbose_mode') ?? false);
-  }
-
   @override
   void dispose() {
     if (_backgroundServiceActive) {
@@ -459,7 +466,7 @@ class _ChatScreenState extends State<ChatScreen> {
     }
     // Stop any in-flight late-media poll from touching state after teardown.
     _mediaPollGen++;
-    _savedPositions[widget.session.id] = _lastPixels;
+    _rememberScrollPosition(widget.session.id, _lastPixels);
     _tokenFlushTimer?.cancel();
     _streamCancelToken?.cancel();
     _autoContinueTimer?.cancel();
@@ -596,20 +603,51 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  Future<void> _speakAssistantText(String text, {void Function()? onComplete}) async {
+  /// Speaks a reply that arrived on its own (the automatic voice reply), as
+  /// opposed to [_replayMessage]'s manual tap.
+  ///
+  /// [message] is the transcript row the text came from. Passing it makes the
+  /// automatic path drive the same `_speakingMessage` state the manual one
+  /// does, so the per-bubble stop/replay icon and the "jump to it" bar reflect
+  /// an auto-spoken reply too. Previously only manual replay set it, which
+  /// meant the more common path showed no speaking state at all.
+  Future<void> _speakAssistantText(
+    String text, {
+    void Function()? onComplete,
+    Map<String, dynamic>? message,
+  }) async {
     final spokenText = text.trim();
     if (spokenText.isEmpty || !_voiceReplyEnabled) {
       onComplete?.call();
       return;
     }
+    // Only claim the speaking slot if there is actually something to say,
+    // matching _replayMessage's silent no-op on an unspeakable reply.
+    final speakable = XttsService.stripForSpeech(
+      spokenText,
+      keepActions: _characterImagePath != null,
+    );
+    if (speakable.isEmpty) {
+      onComplete?.call();
+      return;
+    }
+    if (message != null && mounted) {
+      setState(() => _speakingMessage = message);
+    }
+    void finish() {
+      if (message != null && mounted && identical(_speakingMessage, message)) {
+        setState(() => _speakingMessage = null);
+      }
+      onComplete?.call();
+    }
     try {
       await _xtts.speak(
         spokenText,
-        onComplete: onComplete,
+        onComplete: finish,
         keepActions: _characterImagePath != null,
       );
     } catch (e) {
-      onComplete?.call();
+      finish();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
@@ -725,11 +763,23 @@ class _ChatScreenState extends State<ChatScreen> {
     final chunk = _pendingTokens.toString();
     _pendingTokens.clear();
     if (!mounted) return;
+    // Stay pinned to the newest text as it arrives, but only if the view was
+    // already at the bottom -- scrolling up to re-read something must not be
+    // yanked back. _showScrollToBottom is exactly that "user has scrolled
+    // away" signal. jumpTo rather than animateTo: an animation restarted
+    // every flush fights itself and never settles.
+    final follow = !_showScrollToBottom;
     setState(() {
       if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
         _messages.last['content'] = (_messages.last['content'] as String) + chunk;
       }
     });
+    if (follow) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scrollController.hasClients) return;
+        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
+      });
+    }
   }
 
   Future<void> _scrollToBottom() =>
@@ -1244,6 +1294,7 @@ class _ChatScreenState extends State<ChatScreen> {
             if (assistantText != null) {
               await _speakAssistantText(
                 assistantText,
+                message: assistant.isEmpty ? null : assistant,
                 onComplete: _autoContinueEnabled ? _scheduleAutoContinue : null,
               );
             } else if (_autoContinueEnabled) {

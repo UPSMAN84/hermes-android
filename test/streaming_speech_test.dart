@@ -145,6 +145,87 @@ void main() {
     });
   });
 
+  group('segmentSpeech incremental scanning', () {
+    /// Feeds [text] through the segmenter the way call mode does — a token at
+    /// a time, carrying the scan cursor forward — and returns everything it
+    /// chose to speak.
+    List<String> streamed(String text, {int chunkSize = 3, int minChunk = 0}) {
+      final spoken = <String>[];
+      var tail = '';
+      var scanned = 0;
+      var speaking = false;
+      for (var i = 0; i < text.length; i += chunkSize) {
+        tail += text.substring(i, (i + chunkSize).clamp(0, text.length));
+        final r = segmentSpeech(
+          tail,
+          minChunkChars: speaking ? 0 : minChunk,
+          alreadyScanned: scanned,
+          isFinal: false,
+        );
+        tail = r.remainder;
+        scanned = tail.length;
+        if (r.chunks.isNotEmpty) speaking = true;
+        spoken.addAll(r.chunks);
+      }
+      final rest = tail.trim();
+      if (rest.isNotEmpty) spoken.add(rest);
+      return spoken;
+    }
+
+    /// The same text segmented in one pass, with no cursor.
+    List<String> wholesale(String text, {int minChunk = 0}) {
+      final r = segmentSpeech(text, minChunkChars: minChunk);
+      final out = [...r.chunks];
+      final rest = r.remainder.trim();
+      if (rest.isNotEmpty) out.add(rest);
+      return out;
+    }
+
+    const samples = <String>[
+      'Hello there. How are you doing today? I am fine!',
+      'A boundary can be completed by the very next character. Like that.',
+      'Ask Dr. Smith about it. He costs 3.14 dollars. Open file.png now.',
+      '1. First item\n2. Second item\n3. Third item',
+      'No terminator at all so this is one long unpunctuated run of words',
+      'Really? Yes! "Quoted." Next',
+      'By J. R. R. Tolkien here. Then more text follows.',
+    ];
+
+    for (final sample in samples) {
+      final label = sample.length > 40 ? '${sample.substring(0, 40)}…' : sample;
+      test('matches a single full scan: "${label.replaceAll('\n', ' ')}"', () {
+        expect(streamed(sample), wholesale(sample));
+      });
+    }
+
+    test('matches across every chunk size, so no boundary straddles a seam',
+        () {
+      // A boundary landing exactly on a token seam is the case the overlap
+      // exists for; sweeping the chunk size walks every seam position.
+      for (final sample in samples) {
+        for (var size = 1; size <= 9; size++) {
+          expect(
+            streamed(sample, chunkSize: size),
+            wholesale(sample),
+            reason: 'chunkSize $size on "$sample"',
+          );
+        }
+      }
+    });
+
+    test('honours the first-chunk minimum the same way either route', () {
+      const text = 'Hi. Here is the actual substantive answer you asked for. '
+          'And a bit more after it.';
+      for (var size = 1; size <= 9; size++) {
+        expect(
+          streamed(text, chunkSize: size, minChunk: 40),
+          wholesale(text, minChunk: 40),
+          reason: 'chunkSize $size',
+        );
+      }
+    });
+  });
+
   group('SpeechQueue', () {
     test('is not speaking before the first reply, so listen is not blocked', () {
       final tts = FakeTts();

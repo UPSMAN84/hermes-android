@@ -98,8 +98,26 @@ class MediaCacheService {
     final tmp = File('${file.path}.tmp');
     await tmp.writeAsBytes(res.bodyBytes, flush: true);
     await tmp.rename(file.path);
-    unawaited(_evictIfNeeded());
+    unawaited(_noteWrite(res.bodyBytes.length));
     return file;
+  }
+
+  /// Running total of the cache directory, so the common case costs nothing.
+  ///
+  /// Eviction used to stat EVERY file in a directory allowed to reach 512MB
+  /// after every single download, just to discover it was under budget. Now
+  /// the total is tracked in memory and the directory is only walked when we
+  /// believe we are actually over. Null means "not yet established", which is
+  /// true once per process.
+  static int? _totalBytes;
+
+  static Future<void> _noteWrite(int bytes) async {
+    final known = _totalBytes;
+    if (known != null) {
+      _totalBytes = known + bytes;
+      if (_totalBytes! <= _maxBytes) return;
+    }
+    await _evictIfNeeded();
   }
 
   /// Trims the cache to [_maxBytes], oldest-first. Runs opportunistically
@@ -128,7 +146,12 @@ class MediaCacheService {
           // Raced with another delete — skip it.
         }
       }
-      if (total <= _maxBytes) return;
+      if (total <= _maxBytes) {
+        // Walking the directory is the only way to learn the real total, so
+        // record it while we have it.
+        _totalBytes = total;
+        return;
+      }
       entries.sort((a, b) => a.modified.compareTo(b.modified));
       for (final entry in entries) {
         if (total <= _maxBytes) break;
@@ -139,6 +162,7 @@ class MediaCacheService {
           // Best-effort: a file in use just stays until the next pass.
         }
       }
+      _totalBytes = total;
     } catch (_) {
       // Eviction is housekeeping — never surface it to the caller.
     } finally {

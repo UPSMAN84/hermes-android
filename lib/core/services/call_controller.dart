@@ -105,6 +105,11 @@ class CallController extends ChangeNotifier {
   // Tail of the streaming reply not yet handed to the speech queue. Chunks are
   // cut off the front at sentence boundaries as tokens arrive.
   String _speakTail = '';
+
+  // How much of [_speakTail] segmentSpeech has already examined without
+  // finding a boundary, so each token's pump only scans the newly arrived
+  // characters instead of the whole accumulated tail.
+  int _speakTailScanned = 0;
   late final SpeechQueue _speechQueue = SpeechQueue(() => _xtts);
 
   // Don't speak a first chunk shorter than this — a bare "Hi." would otherwise
@@ -395,6 +400,7 @@ class CallController extends ChangeNotifier {
   Future<void> _send(String text) async {
     _setState(CallState.thinking);
     _speakTail = '';
+    _speakTailScanned = 0;
     var speaking = false;
     final cancelToken = StreamCancelToken();
     _sendCancelToken = cancelToken;
@@ -410,12 +416,17 @@ class CallController extends ChangeNotifier {
       final segmentation = segmentSpeech(
         _speakTail,
         minChunkChars: speaking ? 0 : _firstChunkMinChars,
+        alreadyScanned: _speakTailScanned,
+        isFinal: flush,
       );
       _speakTail = segmentation.remainder;
+      // Everything left over has now been scanned and yielded no boundary.
+      _speakTailScanned = _speakTail.length;
       var chunks = segmentation.chunks;
       if (flush) {
         final tail = _speakTail.trim();
         _speakTail = '';
+        _speakTailScanned = 0;
         if (tail.isNotEmpty) chunks = [...chunks, tail];
       }
       if (chunks.isEmpty) return;
