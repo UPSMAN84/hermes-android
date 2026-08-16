@@ -7,6 +7,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 
 import 'tts_provider.dart';
+export 'tts_provider.dart' show PreparedSpeech;
 
 /// Plays queued utterances through a [TtsProvider], one after another.
 ///
@@ -16,11 +17,23 @@ import 'tts_provider.dart';
 ///
 /// The provider is resolved per chunk rather than captured, because the owning
 /// controller may swap backends (XTTS ↔ Chatterbox) after this queue is built.
+/// One queued utterance plus its synthesis, once started.
+class _QueuedChunk {
+  _QueuedChunk(this.text);
+
+  final String text;
+
+  /// Non-null once synthesis has been kicked off for this chunk — possibly
+  /// while an earlier chunk is still playing. Never completes with an error:
+  /// see [SpeechQueue._safePrepare].
+  Future<PreparedSpeech?>? prepared;
+}
+
 class SpeechQueue {
   SpeechQueue(this._resolveTts);
 
   final TtsProvider Function() _resolveTts;
-  final List<String> _pending = [];
+  final List<_QueuedChunk> _pending = [];
 
   bool _draining = false;
   bool _inputClosed = false;
@@ -49,7 +62,10 @@ class SpeechQueue {
     if (_cancelled || _inputClosed) return;
     final text = chunk.trim();
     if (text.isEmpty) return;
-    _pending.add(text);
+    _pending.add(_QueuedChunk(text));
+    // Start synthesizing it now if nothing else is queued ahead of it, even
+    // when the player is busy with the previous chunk.
+    _startLookahead();
     unawaited(_drain());
   }
 
@@ -79,18 +95,53 @@ class SpeechQueue {
   // parking the whole call at CallState.speaking indefinitely.
   static const _playbackWatchdog = Duration(seconds: 60);
 
+  /// Begin synthesizing the chunk at the head of the queue, if it hasn't
+  /// started already. This is the whole point of the split provider API: a
+  /// sentence boundary used to cost a full synthesis round trip of silence,
+  /// because the next chunk's HTTP request only started after the previous
+  /// chunk had finished *playing*. One chunk of lookahead is enough to keep
+  /// the player fed as long as synthesis is no slower than playback.
+  void _startLookahead() {
+    if (_cancelled || _pending.isEmpty) return;
+    final next = _pending.first;
+    next.prepared ??= _safePrepare(next.text);
+  }
+
+  /// Synthesis that never completes with an error, so a lookahead future that
+  /// nobody ends up awaiting (cancelled reply) can't surface as an unhandled
+  /// async error. A failed chunk resolves to null and gets skipped.
+  Future<PreparedSpeech?> _safePrepare(String text) async {
+    try {
+      return await _resolveTts().prepare(text);
+    } catch (e) {
+      debugPrint('[SpeechQueue] synthesis failed: $e');
+      return null;
+    }
+  }
+
   Future<void> _drain() async {
     if (_draining || _cancelled) return;
     _draining = true;
     while (_pending.isNotEmpty && !_cancelled) {
       final chunk = _pending.removeAt(0);
+      final synthesis = chunk.prepared ??= _safePrepare(chunk.text);
+      // Get the following chunk's synthesis moving now, so it overlaps this
+      // one's fetch and playback rather than starting after them.
+      _startLookahead();
+
+      final prepared = await synthesis;
+      if (_cancelled) break;
+      // Nothing speakable, or synthesis failed — skip it and keep the reply
+      // going rather than stalling the call.
+      if (prepared == null) continue;
+
       final done = Completer<void>();
       try {
-        await _resolveTts().speak(chunk, onComplete: () {
+        await _resolveTts().speakPrepared(prepared, onComplete: () {
           if (!done.isCompleted) done.complete();
         });
-        // speak() returns once playback has been handed to the player; the
-        // completion callback is what tells us the audio actually ended.
+        // speakPrepared() returns once playback has been handed to the player;
+        // the completion callback is what tells us the audio actually ended.
         await done.future.timeout(_playbackWatchdog);
       } on TimeoutException {
         debugPrint(

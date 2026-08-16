@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/services/speech_queue.dart';
 import 'package:hermes_android/core/services/speech_segmenter.dart';
@@ -5,8 +8,12 @@ import 'package:hermes_android/core/services/tts_provider.dart';
 
 /// Records what it was asked to speak and lets each utterance be completed
 /// on demand, so ordering and the "still speaking" gate can be asserted.
+///
+/// [spoken] records PLAYBACK, not synthesis: the queue prepares the next chunk
+/// while the current one plays, so `prepared` is the one that runs ahead.
 class FakeTts implements TtsProvider {
   final List<String> spoken = [];
+  final List<String> prepared = [];
   final List<void Function()> _pending = [];
   int stopCalls = 0;
   bool _playing = false;
@@ -15,10 +22,36 @@ class FakeTts implements TtsProvider {
   bool get isPlaying => _playing;
 
   @override
-  Future<void> speak(String text, {void Function()? onComplete}) async {
-    spoken.add(text);
+  Future<PreparedSpeech?> prepare(
+    String text, {
+    bool keepActions = false,
+  }) async {
+    prepared.add(text);
+    return PreparedSpeech(Uint8List.fromList(utf8.encode(text)));
+  }
+
+  @override
+  Future<void> speakPrepared(
+    PreparedSpeech prepared, {
+    void Function()? onComplete,
+  }) async {
+    spoken.add(utf8.decode(prepared.bytes));
     _playing = true;
     if (onComplete != null) _pending.add(onComplete);
+  }
+
+  @override
+  Future<void> speak(
+    String text, {
+    void Function()? onComplete,
+    bool keepActions = false,
+  }) async {
+    final p = await prepare(text, keepActions: keepActions);
+    if (p == null) {
+      onComplete?.call();
+      return;
+    }
+    await speakPrepared(p, onComplete: onComplete);
   }
 
   /// Finish the oldest in-flight utterance.
@@ -217,6 +250,24 @@ void main() {
       expect(tts.spoken, ['One.']);
     });
 
+    test('synthesizes the next chunk while the current one is playing',
+        () async {
+      final tts = FakeTts();
+      final queue = SpeechQueue(() => tts);
+      queue.start(onAllSpoken: () {});
+
+      queue.enqueue('First.');
+      queue.enqueue('Second.');
+      await Future<void>.delayed(Duration.zero);
+
+      // Only the first chunk is playing...
+      expect(tts.spoken, ['First.']);
+      // ...but the second one's synthesis is already in flight, so its audio
+      // is ready the moment the first finishes instead of costing a full
+      // round trip of silence at the sentence boundary.
+      expect(tts.prepared, ['First.', 'Second.']);
+    });
+
     test('enqueue after markComplete is ignored', () async {
       final tts = FakeTts();
       final queue = SpeechQueue(() => tts);
@@ -229,16 +280,19 @@ void main() {
   });
 }
 
-/// Throws on its first speak() call, succeeds afterwards.
+/// Throws on its first synthesis, succeeds afterwards.
 class _ThrowingOnceTts extends FakeTts {
   bool _thrown = false;
 
   @override
-  Future<void> speak(String text, {void Function()? onComplete}) async {
+  Future<PreparedSpeech?> prepare(
+    String text, {
+    bool keepActions = false,
+  }) async {
     if (!_thrown) {
       _thrown = true;
       throw Exception('synthesis failed');
     }
-    return super.speak(text, onComplete: onComplete);
+    return super.prepare(text, keepActions: keepActions);
   }
 }

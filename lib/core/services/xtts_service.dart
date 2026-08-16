@@ -157,20 +157,36 @@ class XttsService implements TtsProvider {
     return body;
   }
 
-  /// Pushes generation settings to `/set_tts_settings` before each synthesis.
-  /// Best-effort: failures don't block audio. Always-applied so user overrides
-  /// win even if another client (desktop) changes them mid-session.
+  // The settings body last successfully pushed, and the base URL it went to.
+  // Used to skip a redundant round trip — see _applySettings.
+  String? _lastSettingsJson;
+  String? _lastSettingsBase;
+
+  /// Pushes generation settings to `/set_tts_settings` before synthesis.
+  /// Best-effort: failures don't block audio.
+  ///
+  /// Only sent when the body (or the server) actually changed since the last
+  /// successful push. It used to go out unconditionally before *every*
+  /// synthesis, which in call mode meant an extra serialized round trip per
+  /// sentence chunk — pure latency in front of the audio the user is waiting
+  /// for. The re-send still happens whenever the user edits anything in
+  /// Settings, which is the case the always-apply behaviour existed for.
   Future<void> _applySettings(String base, SharedPreferences prefs) async {
+    final body = jsonEncode(settingsBody(prefs));
+    if (body == _lastSettingsJson && base == _lastSettingsBase) return;
     try {
       await _http
           .post(
             Uri.parse('$base/set_tts_settings'),
             headers: const {'Content-Type': 'application/json'},
-            body: jsonEncode(settingsBody(prefs)),
+            body: body,
           )
           .timeout(const Duration(seconds: 10));
+      _lastSettingsJson = body;
+      _lastSettingsBase = base;
     } catch (_) {
-      // non-fatal — synthesis proceeds with whatever the server holds
+      // non-fatal — synthesis proceeds with whatever the server holds. Leave
+      // the cache untouched so the next attempt retries the push.
     }
   }
 
@@ -249,83 +265,98 @@ class XttsService implements TtsProvider {
     void Function()? onComplete,
     bool keepActions = false,
   }) async {
-    // Speak the whole cleaned reply (markdown/action-stripped), not just
-    // quoted dialog — the full chat text is already sanitized upstream.
-    final spoken = stripForSpeech(text, keepActions: keepActions);
-    if (spoken.isEmpty) {
+    final PreparedSpeech? prepared;
+    try {
+      prepared = await prepare(text, keepActions: keepActions);
+    } catch (e) {
+      // Reset any "speaking" UI before propagating the failure.
+      debugPrint('[XTTS] speak FAILED: $e');
+      _complete();
+      rethrow;
+    }
+    if (prepared == null) {
       // Nothing to narrate (stage directions only, media-only reply, blocked
       // phrase, etc.). Still signal completion so callers like the call-mode
       // controller don't stay stuck in "Speaking…" forever.
       onComplete?.call();
       return;
     }
+    await speakPrepared(prepared, onComplete: onComplete);
+  }
 
-    await stop();
-    final epoch = ++_speakEpoch;
-    _onComplete = onComplete;
-    _isPlaying = true;
+  /// Network half of [speak]: clean the text, push settings if they changed,
+  /// and fetch the WAV. Does not touch the player, so a caller can run this
+  /// for the next utterance while the current one is still playing.
+  @override
+  Future<PreparedSpeech?> prepare(
+    String text, {
+    bool keepActions = false,
+  }) async {
+    // Speak the whole cleaned reply (markdown/action-stripped), not just
+    // quoted dialog — the full chat text is already sanitized upstream.
+    final spoken = stripForSpeech(text, keepActions: keepActions);
+    if (spoken.isEmpty) return null;
 
     final prefs = await SharedPreferences.getInstance();
-    if (epoch != _speakEpoch) return;
     final base = await _baseUrl(prefs);
     final speaker = prefs.getString(XttsPrefs.speaker) ?? '';
     final language =
         prefs.getString(XttsPrefs.language) ?? XttsPrefs.defaultLanguage;
 
     if (speaker.isEmpty) {
-      _complete(epoch: epoch);
       throw Exception('No XTTS speaker selected. Pick one in Settings → Voice.');
     }
 
     debugPrint(
-      '[XTTS] speak: base=$base speaker="$speaker" lang=$language '
+      '[XTTS] prepare: base=$base speaker="$speaker" lang=$language '
       'text=${spoken.length} chars',
     );
     await _applySettings(base, prefs);
-    if (epoch != _speakEpoch) return;
 
     final sw = Stopwatch()..start();
-    try {
-      final res = await _http
-          .post(
-            Uri.parse('$base/tts_to_audio/'),
-            headers: const {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'text': spoken,
-              'speaker_wav': speaker,
-              'language': language,
-            }),
-          )
-          .timeout(const Duration(seconds: 45));
-      sw.stop();
-      if (epoch != _speakEpoch) return;
-      debugPrint(
-        '[XTTS] POST /tts_to_audio/ -> HTTP ${res.statusCode}, '
-        '${res.bodyBytes.length} bytes in ${sw.elapsedMilliseconds}ms',
-      );
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        throw Exception('XTTS HTTP ${res.statusCode}: ${res.body}');
-      }
+    final res = await _http
+        .post(
+          Uri.parse('$base/tts_to_audio/'),
+          headers: const {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'text': spoken,
+            'speaker_wav': speaker,
+            'language': language,
+          }),
+        )
+        .timeout(const Duration(seconds: 45));
+    sw.stop();
+    debugPrint(
+      '[XTTS] POST /tts_to_audio/ -> HTTP ${res.statusCode}, '
+      '${res.bodyBytes.length} bytes in ${sw.elapsedMilliseconds}ms',
+    );
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw Exception('XTTS HTTP ${res.statusCode}: ${res.body}');
+    }
+    return PreparedSpeech(res.bodyBytes);
+  }
 
-      await _player.stop();
-      if (epoch != _speakEpoch) return;
-      try {
-        await _player.play(BytesSource(res.bodyBytes, mimeType: 'audio/wav'));
-        if (epoch != _speakEpoch) {
-          await _player.stop();
-          return;
-        }
-        _isPlaying = true;
-        debugPrint('[XTTS] playback started');
-      } catch (e) {
-        debugPrint('[XTTS] play() failed: $e');
-        _complete(epoch: epoch);
-        rethrow;
+  @override
+  Future<void> speakPrepared(
+    PreparedSpeech prepared, {
+    void Function()? onComplete,
+  }) async {
+    await stop();
+    final epoch = ++_speakEpoch;
+    _onComplete = onComplete;
+    _isPlaying = true;
+    try {
+      await _player.play(
+        BytesSource(prepared.bytes, mimeType: prepared.mimeType),
+      );
+      if (epoch != _speakEpoch) {
+        await _player.stop();
+        return;
       }
+      _isPlaying = true;
+      debugPrint('[XTTS] playback started');
     } catch (e) {
-      if (epoch != _speakEpoch) return;
-      // Reset any "speaking" UI before propagating the failure.
-      debugPrint('[XTTS] speak FAILED: $e');
+      debugPrint('[XTTS] play() failed: $e');
       _complete(epoch: epoch);
       rethrow;
     }

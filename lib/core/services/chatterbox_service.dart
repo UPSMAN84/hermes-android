@@ -133,24 +133,38 @@ class ChatterboxService implements TtsProvider {
     void Function()? onComplete,
     bool keepActions = false,
   }) async {
-    // Reuse the XTTS text cleaning, but speak the whole cleaned reply — not
-    // just quoted dialog.
-    final spoken = XttsService.stripForSpeech(text, keepActions: keepActions);
-    if (spoken.isEmpty) {
+    final PreparedSpeech? prepared;
+    try {
+      prepared = await prepare(text, keepActions: keepActions);
+    } catch (e) {
+      debugPrint('[Chatterbox] speak FAILED: $e');
+      _complete();
+      rethrow;
+    }
+    if (prepared == null) {
       // Nothing to narrate (stage directions only, media-only reply, blocked
       // phrase, etc.). Still signal completion so callers like the call-mode
       // controller don't stay stuck in "Speaking…" forever.
       onComplete?.call();
       return;
     }
+    await speakPrepared(prepared, onComplete: onComplete);
+  }
 
-    await stop();
-    final epoch = ++_speakEpoch;
-    _onComplete = onComplete;
-    _isPlaying = true;
+  /// Network half of [speak] — see [TtsProvider.prepare]. Kept separate so the
+  /// call-mode speech queue can synthesize the next sentence while the current
+  /// one is still playing instead of leaving dead air at every boundary.
+  @override
+  Future<PreparedSpeech?> prepare(
+    String text, {
+    bool keepActions = false,
+  }) async {
+    // Reuse the XTTS text cleaning, but speak the whole cleaned reply — not
+    // just quoted dialog.
+    final spoken = XttsService.stripForSpeech(text, keepActions: keepActions);
+    if (spoken.isEmpty) return null;
 
     final prefs = await SharedPreferences.getInstance();
-    if (epoch != _speakEpoch) return;
     final base = await _baseUrl(prefs);
     final voice = prefs.getString(ChatterboxPrefs.voice) ?? '';
     final language =
@@ -201,45 +215,43 @@ class ChatterboxService implements TtsProvider {
     }
     if (voice.isNotEmpty) request.fields['voice'] = voice;
 
-    try {
-      final streamed = await request.send().timeout(
-        const Duration(seconds: 45),
+    final streamed = await request.send().timeout(const Duration(seconds: 45));
+    final bytes = await streamed.stream.toBytes().timeout(
+      const Duration(seconds: 45),
+    );
+    debugPrint(
+      '[Chatterbox] POST /tts -> HTTP ${streamed.statusCode}, '
+      '${bytes.length} bytes',
+    );
+    if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
+      throw Exception(
+        'Chatterbox HTTP ${streamed.statusCode}: ${String.fromCharCodes(bytes)}',
       );
-      if (epoch != _speakEpoch) return;
-      final bytes = await streamed.stream.toBytes().timeout(
-        const Duration(seconds: 45),
-      );
-      if (epoch != _speakEpoch) return;
-      debugPrint(
-        '[Chatterbox] POST /tts -> HTTP ${streamed.statusCode}, '
-        '${bytes.length} bytes',
-      );
-      if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
-        throw Exception(
-          'Chatterbox HTTP ${streamed.statusCode}: ${String.fromCharCodes(bytes)}',
-        );
-      }
+    }
+    return PreparedSpeech(Uint8List.fromList(bytes));
+  }
 
-      await _player.stop();
-      if (epoch != _speakEpoch) return;
-      try {
-        await _player.play(
-          BytesSource(Uint8List.fromList(bytes), mimeType: 'audio/wav'),
-        );
-        if (epoch != _speakEpoch) {
-          await _player.stop();
-          return;
-        }
-        _isPlaying = true;
-        debugPrint('[Chatterbox] playback started');
-      } catch (e) {
-        debugPrint('[Chatterbox] play() failed: $e');
-        _complete(epoch: epoch);
-        rethrow;
+  @override
+  Future<void> speakPrepared(
+    PreparedSpeech prepared, {
+    void Function()? onComplete,
+  }) async {
+    await stop();
+    final epoch = ++_speakEpoch;
+    _onComplete = onComplete;
+    _isPlaying = true;
+    try {
+      await _player.play(
+        BytesSource(prepared.bytes, mimeType: prepared.mimeType),
+      );
+      if (epoch != _speakEpoch) {
+        await _player.stop();
+        return;
       }
+      _isPlaying = true;
+      debugPrint('[Chatterbox] playback started');
     } catch (e) {
-      if (epoch != _speakEpoch) return;
-      debugPrint('[Chatterbox] speak FAILED: $e');
+      debugPrint('[Chatterbox] play() failed: $e');
       _complete(epoch: epoch);
       rethrow;
     }

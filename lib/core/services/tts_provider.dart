@@ -2,10 +2,26 @@
 // call controller hold a [TtsProvider] and call speak/stop/dispose without
 // caring whether it is XTTS-v2 or Chatterbox behind it. Which one is built is
 // decided by the `tts_provider` shared-preference (see [ttsProviderForPrefs]).
+import 'dart:typed_data';
+
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'chatterbox_service.dart';
 import 'xtts_service.dart';
+
+/// Audio synthesized ahead of the moment it is needed.
+///
+/// Exists so a caller can overlap synthesis with playback: [TtsProvider.speak]
+/// is synthesize-then-play in one blocking call, which forced a strictly
+/// serial pipeline — every sentence boundary in a streaming reply cost a full
+/// synthesis round trip of silence. [TtsProvider.prepare] does only the
+/// network half, and [TtsProvider.speakPrepared] plays the result.
+class PreparedSpeech {
+  const PreparedSpeech(this.bytes, {this.mimeType = 'audio/wav'});
+
+  final Uint8List bytes;
+  final String mimeType;
+}
 
 /// Common TTS backend interface.
 abstract class TtsProvider {
@@ -19,6 +35,21 @@ abstract class TtsProvider {
     String text, {
     void Function()? onComplete,
     bool keepActions = false,
+  });
+
+  /// Synthesize [text] without playing it. Returns null when there is nothing
+  /// speakable left after cleaning (stage directions only, media-only reply,
+  /// blocked phrase). Throws on a synthesis failure, same as [speak].
+  ///
+  /// Callers that need low latency across several utterances should prepare
+  /// the next one while the current one is playing.
+  Future<PreparedSpeech?> prepare(String text, {bool keepActions = false});
+
+  /// Play audio already synthesized by [prepare]. Stops anything currently
+  /// playing first, exactly like [speak].
+  Future<void> speakPrepared(
+    PreparedSpeech prepared, {
+    void Function()? onComplete,
   });
 
   /// Stop any in-progress playback.
