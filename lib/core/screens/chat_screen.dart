@@ -9,6 +9,7 @@ import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
@@ -46,11 +47,24 @@ class ChatScreen extends StatefulWidget {
   final CharacterSummary? character;
   final CharacterCard? characterCard;
 
+  /// Test seam. Production never passes these.
+  ///
+  /// ChatScreen owns the app's riskiest logic -- the optimistic send, the
+  /// token stream, the interrupted-turn recovery -- and none of it was
+  /// reachable from a test, because the HTTP client and the TTS backend were
+  /// constructed inside the State from `connection`. These two overrides are
+  /// the whole seam: everything else the screen touches is either pure or
+  /// already mockable (SharedPreferences).
+  final http.Client? httpClient;
+  final TtsProvider Function()? ttsOverride;
+
   const ChatScreen({
     required this.connection,
     required this.session,
     this.character,
     this.characterCard,
+    this.httpClient,
+    this.ttsOverride,
     super.key,
   });
 
@@ -94,7 +108,8 @@ class _ChatScreenState extends State<ChatScreen> {
   final SpeechRecognitionCoordinator _speechCoordinator =
       SpeechRecognitionCoordinator.instance;
   SpeechToText get _speechToText => _speechCoordinator.speech;
-  late TtsProvider _xtts = XttsService(fallbackHost: widget.connection.host);
+  late TtsProvider _xtts =
+      widget.ttsOverride?.call() ?? XttsService(fallbackHost: widget.connection.host);
   bool _speechAvailable = false;
   bool _listening = false;
   bool _voiceReplyEnabled = true;
@@ -241,6 +256,7 @@ class _ChatScreenState extends State<ChatScreen> {
       baseUrl: widget.connection.baseUrl,
       apiKey: widget.connection.apiKey,
       pathPrefix: widget.connection.gatewayPrefix ?? '',
+      httpClient: widget.httpClient,
     );
     _gateway = GatewayChatClient(_client);
     _fetchMessages();
@@ -439,6 +455,9 @@ class _ChatScreenState extends State<ChatScreen> {
   /// once prefs are available. speak()/stop() read [_xtts] fresh each call, so
   /// a mid-init swap is safe.
   Future<void> _initTtsProvider() async {
+    // An injected backend is the one the test wants; don't swap it out from
+    // under them for whatever the prefs happen to say.
+    if (widget.ttsOverride != null) return;
     final prefs = await SharedPreferences.getInstance();
     final selected = await ttsProviderForPrefs(
       prefs,
