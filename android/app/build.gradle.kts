@@ -44,6 +44,16 @@ android {
    buildTypes {
        release {
            signingConfig = signingConfigs.getByName("release")
+           // Shrink the Java/Kotlin half of the app. Dart is AOT-compiled and
+           // tree-shaken separately, but the plugin code and Android resources
+           // shipped unshrunk before this. Keep rules for the plugins that are
+           // reached reflectively / from the manifest live in proguard-rules.pro.
+           isMinifyEnabled = true
+           isShrinkResources = true
+           proguardFiles(
+               getDefaultProguardFile("proguard-android-optimize.txt"),
+               "proguard-rules.pro",
+           )
        }
    }
 }

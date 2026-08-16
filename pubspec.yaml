@@ -13,13 +13,6 @@ dependencies:
   # UI
   cupertino_icons: ^1.0.8
   flutter_markdown: ^0.7.6
-  google_fonts: ^6.2.1
-
-  # State management
-  flutter_riverpod: ^2.6.1
-
-  # Navigation
-  go_router: ^14.0.0
 
   # Network
   http: ^1.2.0
@@ -29,16 +22,22 @@ dependencies:
   path_provider: ^2.1.5
 
   # Data models
-  json_annotation: ^4.9.0
   uuid: ^4.5.1
 
   # Misc
-  url_launcher: ^6.3.0
   package_info_plus: ^8.0.0
 
-  # Markdown syntax highlighting
-  highlight: ^0.7.0
   speech_to_text: ^7.4.0
+
+  # Removed as unused (nothing in lib/ or test/ imported them):
+  #   flutter_riverpod, go_router, json_annotation, url_launcher, highlight.
+  # State is plain StatefulWidget, navigation is bare Navigator/MaterialPageRoute,
+  # models are hand-written fromJson, and flutter_markdown does its own
+  # highlighting.
+  #
+  # google_fonts was also removed: the one face it supplied (Cinzel, for the
+  # wordmark) is now bundled under assets/fonts, so there is no runtime font
+  # fetch and no offline fallback to the wrong face. See core/utils/brand.dart.
 
   # TTS via XTTS-v2 server (returns WAV bytes we play locally)
   audioplayers: ^6.1.0
@@ -67,3 +66,14 @@ flutter:
   uses-material-design: true
   assets:
     - assets/
+  fonts:
+    # Bundled rather than fetched at runtime by google_fonts, which hit
+    # fonts.gstatic.com during the first frame and fell back to the default
+    # face when that failed — so the brand wordmark was wrong on any device
+    # without internet access, which for a LAN-only gateway app is normal.
+    # Only the 700 weight is shipped because that is the only one used.
+    # SIL Open Font License, see assets/fonts/OFL.txt.
+    - family: Cinzel
+      fonts:
+        - asset: assets/fonts/Cinzel-Bold.ttf
+          weight: 700

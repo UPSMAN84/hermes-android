@@ -1,19 +1,19 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
-import 'package:google_fonts/google_fonts.dart';
-import 'package:media_kit/media_kit.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'core/services/connection_manager.dart';
 import 'core/screens/chat_screen.dart';
 import 'core/screens/session_list_screen.dart';
+import 'core/utils/brand.dart';
 import 'core/utils/responsive.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  // Initialize the media_kit native backend (libmp/FFmpeg) used by the inline
-  // video player for ComfyUI-generated clips. Must run before any Player is
-  // created.
-  MediaKit.ensureInitialized();
+  // media_kit's native backend (libmp/FFmpeg) is NOT initialized here any
+  // more: loading those shared objects is a chunk of work in front of the
+  // first frame, and most launches never open a chat containing a video. It
+  // is initialized lazily instead, on the first _VideoBubble — see
+  // ensureMediaKitInitialized() in chat_screen.dart.
   // Foreground service used by phone-call-mode (to keep the voice loop alive
   // when backgrounded / screen locks) and by chat sends (to keep the SSE
   // stream alive while waiting on a reply, without needing the app in the
@@ -156,11 +156,9 @@ class HermesHeader extends StatelessWidget {
         children: [
           Text(
             'HERMES',
-            style: GoogleFonts.cinzel(
+            style: hermesWordmark(
               fontSize: 28,
-              fontWeight: FontWeight.w700,
               color: const Color(0xFFD4AF37),
-              letterSpacing: 6,
             ),
           ),
           if (subtitle != null) ...[
@@ -707,11 +705,7 @@ class _HomeScreenState extends State<HomeScreen> {
       appBar: AppBar(
         title: Text(
           'HERMES',
-          style: GoogleFonts.cinzel(
-            fontWeight: FontWeight.w700,
-            letterSpacing: 6,
-            fontSize: 22,
-          ),
+          style: hermesWordmark(fontSize: 22),
         ),
         centerTitle: true,
       ),
