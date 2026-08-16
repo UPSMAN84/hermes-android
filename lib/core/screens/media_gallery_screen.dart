@@ -28,36 +28,52 @@ class MediaGalleryScreen extends StatelessWidget {
     return (tile * media.devicePixelRatio).round();
   }
 
-  List<String> _collectImageUrls() {
-    // A filename can legitimately resurface in tool content more than once
-    // (e.g. a post-render verification step that lists the output dir) —
-    // dedup by URL so the same picture doesn't get a second gallery tile.
+  /// One gallery tile: the image plus the transcript row that produced it, so
+  /// tapping it can take the reader back to that point in the conversation.
+  static List<({String url, Map<String, dynamic> source})> _collect(
+    List<Map<String, dynamic>> messages,
+    String comfyBaseUrl,
+  ) {
     final seen = <String>{};
-    final urls = <String>[];
+    final out = <({String url, Map<String, dynamic> source})>[];
     for (final msg in messages) {
       final role = (msg['role'] as String?) ?? '';
       if (role == 'tool') {
         final raw = (msg['content'] as String?) ?? '';
         for (final name in ComfyUi.extractMediaFilenames(raw)) {
-          if (!ComfyUi.isVideo(name)) {
-            final url = ComfyUi.viewUrl(comfyBaseUrl, name);
-            if (seen.add(url)) urls.add(url);
-          }
+          if (ComfyUi.isVideo(name)) continue;
+          final url = ComfyUi.viewUrl(comfyBaseUrl, name);
+          if (seen.add(url)) out.add((url: url, source: msg));
         }
       } else if (role == 'user') {
         for (final url in parseMessageContent(msg['content']).imageUrls) {
-          if (seen.add(url)) urls.add(url);
+          if (seen.add(url)) out.add((url: url, source: msg));
         }
       }
     }
-    return urls;
+    return out;
   }
 
   @override
   Widget build(BuildContext context) {
-    final urls = _collectImageUrls();
+    final tiles = _collect(messages, comfyBaseUrl);
+    final urls = tiles.map((t) => t.url).toList();
     return Scaffold(
-      appBar: AppBar(title: Text('Images (${urls.length})')),
+      appBar: AppBar(
+        title: Text('Images (${urls.length})'),
+        bottom: urls.isEmpty
+            ? null
+            : PreferredSize(
+                preferredSize: const Size.fromHeight(20),
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 6),
+                  child: Text(
+                    'Tap to view · long-press to find it in the chat',
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ),
+              ),
+      ),
       body: urls.isEmpty
           ? Center(
               child: Text(
@@ -73,14 +89,23 @@ class MediaGalleryScreen extends StatelessWidget {
                 mainAxisSpacing: 4,
               ),
               itemCount: urls.length,
-              itemBuilder: (context, i) => CachedMediaThumbnail(
-                url: urls[i],
-                borderRadius: 4,
+              itemBuilder: (context, i) => GestureDetector(
+                // Keyed on the url so a tile keeps its element (and its
+                // resolved image) if the grid is rebuilt, and so tests can
+                // address a specific tile.
+                key: ValueKey(tiles[i].url),
+                // Long-press rather than tap, so the existing tap-to-zoom is
+                // preserved — the gallery is still mostly for looking.
+                onLongPress: () => Navigator.pop(context, tiles[i].source),
+                child: CachedMediaThumbnail(
+                  url: urls[i],
+                  borderRadius: 4,
                 // Without a decode bound these tiles decoded generated images
                 // at native resolution — a 1536² PNG is ~9MB of bitmap, so a
                 // 40-image chat tried to hold hundreds of MB to draw a grid of
                 // ~130pt thumbnails. Decode at tile size instead.
-                decodeWidth: _tileDecodeWidth(context),
+                  decodeWidth: _tileDecodeWidth(context),
+                ),
               ),
             ),
     );

@@ -36,6 +36,9 @@ import 'media_gallery_screen.dart';
 import 'session_list_screen.dart';
 import 'skills_screen.dart';
 
+/// Identifies the in-chat search field.
+const Key searchFieldKey = Key('chat-search-field');
+
 class ChatScreen extends StatefulWidget {
   final SavedConnection connection;
   final Session session;
@@ -496,6 +499,7 @@ class _ChatScreenState extends State<ChatScreen> {
     _dashboard?.close();
     _textController.removeListener(_onTextChanged);
     _textController.dispose();
+    _searchController.dispose();
     _scrollController.removeListener(_onScroll);
     _scrollController.dispose();
     super.dispose();
@@ -1551,13 +1555,20 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
+      appBar: _searching
+          ? _buildSearchAppBar()
+          : AppBar(
         title: Text(
           _characterName ?? widget.session.title,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
         ),
         actions: [
+          IconButton(
+            icon: const Icon(Icons.search),
+            tooltip: 'Search this chat',
+            onPressed: _toggleSearch,
+          ),
           IconButton(
             icon: const Icon(Icons.history),
             tooltip: 'All chats',
@@ -1581,15 +1592,7 @@ class _ChatScreenState extends State<ChatScreen> {
                   _toggleAutoContinue();
                   break;
                 case 'gallery':
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => MediaGalleryScreen(
-                        messages: _messages,
-                        comfyBaseUrl: _comfyBaseUrl,
-                      ),
-                    ),
-                  );
+                  _openGallery();
                   break;
                 case 'call':
                   Navigator.push(
@@ -1733,6 +1736,74 @@ class _ChatScreenState extends State<ChatScreen> {
             ],
           ),
         ),
+    );
+  }
+
+  /// Opens the image gallery. Long-pressing a tile there pops back with the
+  /// message that produced it, which we then scroll to and flash — the
+  /// gallery doubles as an index into the conversation, not just a lightbox.
+  Future<void> _openGallery() async {
+    final source = await Navigator.push<Map<String, dynamic>>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => MediaGalleryScreen(
+          messages: _messages,
+          comfyBaseUrl: _comfyBaseUrl,
+        ),
+      ),
+    );
+    if (source == null || !mounted) return;
+    await _jumpToMessage(source);
+  }
+
+  /// App bar replacement while searching: query field plus hit counter and
+  /// prev/next stepping. Matches are flashed in place rather than shown in a
+  /// separate results list, so you land in the conversation with its context
+  /// around you instead of reading an excerpt out of context.
+  PreferredSizeWidget _buildSearchAppBar() {
+    final hits = _searchHits.length;
+    return AppBar(
+      leading: IconButton(
+        icon: const Icon(Icons.arrow_back),
+        tooltip: 'Close search',
+        onPressed: _toggleSearch,
+      ),
+      title: TextField(
+        // Keyed so tests can target it unambiguously: the composer is also a
+        // TextField, and Scaffold places body before appBar in its child list.
+        key: searchFieldKey,
+        controller: _searchController,
+        autofocus: true,
+        textInputAction: TextInputAction.search,
+        decoration: const InputDecoration(
+          hintText: 'Search this chat…',
+          border: InputBorder.none,
+        ),
+        onChanged: _runSearch,
+        onSubmitted: (_) => _stepSearch(-1),
+      ),
+      actions: [
+        if (_searchQuery.isNotEmpty)
+          Center(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4),
+              child: Text(
+                hits == 0 ? 'none' : '${_searchCursor + 1}/$hits',
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ),
+          ),
+        IconButton(
+          icon: const Icon(Icons.keyboard_arrow_up),
+          tooltip: 'Previous match',
+          onPressed: hits == 0 ? null : () => _stepSearch(-1),
+        ),
+        IconButton(
+          icon: const Icon(Icons.keyboard_arrow_down),
+          tooltip: 'Next match',
+          onPressed: hits == 0 ? null : () => _stepSearch(1),
+        ),
+      ],
     );
   }
 
@@ -2089,23 +2160,107 @@ class _ChatScreenState extends State<ChatScreen> {
   int _flashId = 0;
   final GlobalKey _flashAnchorKey = GlobalKey();
 
-  Future<void> _jumpToSpokenMessage() async {
-    final speaking = _speakingMessage;
-    if (speaking == null) return;
+  Future<void> _jumpToSpokenMessage() =>
+      _jumpToRow((row) => _isSpeakingMessage(row));
 
+  /// Scrolls to the first message row matching [matches] and flashes it.
+  ///
+  /// The target can legitimately be absent — a refetch may have replaced the
+  /// transcript since whatever pointed at it was captured — so a miss is a
+  /// no-op rather than an error.
+  Future<void> _jumpToRow(
+    bool Function(Map<String, dynamic> row) matches,
+  ) async {
     final display = _displayList();
     var index = -1;
     for (var i = 0; i < display.rows.length; i++) {
       final row = display.rows[i];
-      if (row is Map<String, dynamic> && _isSpeakingMessage(row)) {
+      if (row is Map<String, dynamic> && matches(row)) {
         index = i;
         break;
       }
     }
-    // The spoken message can legitimately be absent — a refetch may have
-    // replaced the transcript since playback started.
     if (index < 0) return;
 
+    setState(() {
+      _flashRowKey = display.keys[index];
+      _flashId++;
+    });
+    await _revealRow(index);
+  }
+
+  /// Jump to a specific message, e.g. the one that produced an image the user
+  /// tapped in the gallery. Matched by identity first, falling back to
+  /// role+text so it still resolves across a refetch that rebuilt the maps.
+  Future<void> _jumpToMessage(Map<String, dynamic> target) {
+    final targetText = parseMessageContent(target['content']).text;
+    final targetRole = target['role'] as String?;
+    return _jumpToRow((row) {
+      if (identical(row, target)) return true;
+      return (row['role'] as String?) == targetRole &&
+          parseMessageContent(row['content']).text == targetText;
+    });
+  }
+
+  // ── In-chat search ──────────────────────────────────────────────────
+  bool _searching = false;
+  String _searchQuery = '';
+  final _searchController = TextEditingController();
+
+  /// Display-row indices matching the current query, in transcript order.
+  List<int> _searchHits = const [];
+  int _searchCursor = 0;
+
+  void _toggleSearch() {
+    setState(() {
+      _searching = !_searching;
+      if (!_searching) {
+        _searchController.clear();
+        _searchQuery = '';
+        _searchHits = const [];
+        _searchCursor = 0;
+        _flashRowKey = null;
+      }
+    });
+  }
+
+  void _runSearch(String query) {
+    final q = query.trim().toLowerCase();
+    final hits = <int>[];
+    if (q.isNotEmpty) {
+      final rows = _displayList().rows;
+      for (var i = 0; i < rows.length; i++) {
+        final row = rows[i];
+        if (row is! Map<String, dynamic>) continue;
+        final text = parseMessageContent(row['content']).text;
+        if (text.toLowerCase().contains(q)) hits.add(i);
+      }
+    }
+    setState(() {
+      _searchQuery = q;
+      _searchHits = hits;
+      // Land on the most recent match: in a long roleplay the thing you are
+      // looking for is far more often the last time it came up than the first.
+      _searchCursor = hits.isEmpty ? 0 : hits.length - 1;
+    });
+    if (hits.isNotEmpty) _revealSearchHit();
+  }
+
+  void _stepSearch(int delta) {
+    if (_searchHits.isEmpty) return;
+    setState(() {
+      _searchCursor =
+          (_searchCursor + delta) % _searchHits.length;
+      if (_searchCursor < 0) _searchCursor += _searchHits.length;
+    });
+    _revealSearchHit();
+  }
+
+  Future<void> _revealSearchHit() async {
+    if (_searchHits.isEmpty) return;
+    final index = _searchHits[_searchCursor];
+    final display = _displayList();
+    if (index >= display.rows.length) return;
     setState(() {
       _flashRowKey = display.keys[index];
       _flashId++;

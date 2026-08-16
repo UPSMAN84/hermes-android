@@ -311,6 +311,88 @@ void main() {
     await tester.pumpAndSettle();
   });
 
+  group('in-chat search', () {
+    Future<void> openWith(WidgetTester tester, List<Map<String, dynamic>> msgs)
+        async {
+      await tester.pumpWidget(_app(_FakeGateway(messages: msgs), _SilentTts()));
+      await tester.pumpAndSettle();
+      await tester.tap(find.byTooltip('Search this chat'));
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('counts matches and reports none for a miss', (tester) async {
+      await openWith(tester, [
+        _FakeGateway.msg('user', 'tell me about the gold necklace'),
+        _FakeGateway.msg('assistant', 'the necklace is old'),
+        _FakeGateway.msg('assistant', 'unrelated reply'),
+      ]);
+
+      await tester.enterText(find.byKey(searchFieldKey), 'necklace');
+      await tester.pumpAndSettle();
+      expect(find.text('2/2'), findsOneWidget);
+
+      await tester.enterText(find.byKey(searchFieldKey), 'zzzz');
+      await tester.pumpAndSettle();
+      expect(find.text('none'), findsOneWidget);
+    });
+
+    testWidgets('starts at the most recent match and wraps both ways',
+        (tester) async {
+      await openWith(tester, [
+        _FakeGateway.msg('user', 'match one'),
+        _FakeGateway.msg('assistant', 'filler'),
+        _FakeGateway.msg('user', 'match two'),
+      ]);
+
+      await tester.enterText(find.byKey(searchFieldKey), 'match');
+      await tester.pumpAndSettle();
+      // Newest first: in a long chat the thing you want is usually the last
+      // time it came up.
+      expect(find.text('2/2'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Next match'));
+      await tester.pumpAndSettle();
+      expect(find.text('1/2'), findsOneWidget, reason: 'wraps forward');
+
+      await tester.tap(find.byTooltip('Previous match'));
+      await tester.pumpAndSettle();
+      expect(find.text('2/2'), findsOneWidget, reason: 'wraps backward');
+    });
+
+    testWidgets('search is case-insensitive', (tester) async {
+      await openWith(tester, [
+        _FakeGateway.msg('assistant', 'The Necklace Is Gold'),
+      ]);
+      await tester.enterText(find.byKey(searchFieldKey), 'necklace is');
+      await tester.pumpAndSettle();
+      expect(find.text('1/1'), findsOneWidget);
+    });
+
+    testWidgets('closing search restores the normal app bar', (tester) async {
+      await openWith(tester, [_FakeGateway.msg('assistant', 'hello')]);
+      expect(find.byTooltip('Close search'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('Close search'));
+      await tester.pumpAndSettle();
+
+      expect(find.byTooltip('Search this chat'), findsOneWidget);
+      expect(find.text('Test chat'), findsOneWidget);
+    });
+
+    testWidgets('tool rows are not searchable, only real messages',
+        (tester) async {
+      // Tool output is raw JSON and often huge; matching inside it would bury
+      // the reader in hits they cannot act on.
+      await openWith(tester, [
+        {'role': 'tool', 'content': 'searchtoken in tool output'},
+        _FakeGateway.msg('assistant', 'a normal reply'),
+      ]);
+      await tester.enterText(find.byKey(searchFieldKey), 'searchtoken');
+      await tester.pumpAndSettle();
+      expect(find.text('none'), findsOneWidget);
+    });
+  });
+
   testWidgets('a 404 on the transcript shows an empty chat, not an error',
       (tester) async {
     // A brand-new client-generated session does not exist server-side yet.

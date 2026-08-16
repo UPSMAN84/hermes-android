@@ -25,6 +25,10 @@ class CachedMediaThumbnail extends StatefulWidget {
   /// same Bearer token as the rest of the API; ComfyUI's /view does not).
   final Map<String, String>? headers;
 
+  /// Replaces the built-in tap-to-zoom. Used by the gallery, where tapping a
+  /// tile should take you to the message that produced it instead.
+  final VoidCallback? onTap;
+
   /// Decode width in pixels. Character cards are full-resolution PNGs — up
   /// to 6MB, which decodes to ~25MB of bitmap — so a grid of them at full
   /// size will OOM the app. Set this to roughly the on-screen width.
@@ -36,6 +40,7 @@ class CachedMediaThumbnail extends StatefulWidget {
     this.borderRadius = 0,
     this.headers,
     this.decodeWidth,
+    this.onTap,
     super.key,
   });
 
@@ -127,7 +132,8 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
       return ClipRRect(
         borderRadius: BorderRadius.circular(widget.borderRadius),
         child: GestureDetector(
-          onTap: () => _openFullscreen(context, Image.memory(dataBytes)),
+          onTap: widget.onTap ??
+              () => _openFullscreen(context, Image.memory(dataBytes)),
           child: Image.memory(
             dataBytes,
             fit: widget.fit,
@@ -158,7 +164,8 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
             return _broken(context);
           }
           return GestureDetector(
-            onTap: () => _openFullscreen(context, Image.file(file)),
+            onTap: widget.onTap ??
+                () => _openFullscreen(context, Image.file(file)),
             child: Image.file(
               file,
               fit: widget.fit,
