@@ -51,6 +51,13 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
   // reply streams (see _flushPendingTokens), so that flickered ~8x/second.
   Future<File>? _fileFuture;
 
+  // Decoded once per source, NOT in build(): base64Decode of a ~1MB
+  // attachment ran on every rebuild — 8x/second while a reply streams — and
+  // handed Image.memory a brand-new Uint8List each time. MemoryImage keys the
+  // ImageCache on list identity, so every one of those was a cache miss and a
+  // full JPEG re-decode.
+  Uint8List? _dataBytes;
+
   @override
   void initState() {
     super.initState();
@@ -65,7 +72,9 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
   }
 
   void _resolve() {
-    _fileFuture = widget.url.startsWith('data:')
+    final isData = widget.url.startsWith('data:');
+    _dataBytes = isData ? _decodeDataUri(widget.url) : null;
+    _fileFuture = isData
         ? null
         : MediaCacheService.fileFor(widget.url, headers: widget.headers);
   }
@@ -103,7 +112,7 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
   @override
   Widget build(BuildContext context) {
     if (widget.url.startsWith('data:')) {
-      final dataBytes = _decodeDataUri(widget.url);
+      final dataBytes = _dataBytes;
       // A data: URI that failed to decode has no network fallback worth
       // attempting — data URIs aren't fetchable URLs — so show the broken
       // state directly instead of the old behavior of falling through to
@@ -119,7 +128,13 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
         borderRadius: BorderRadius.circular(widget.borderRadius),
         child: GestureDetector(
           onTap: () => _openFullscreen(context, Image.memory(dataBytes)),
-          child: Image.memory(dataBytes, fit: widget.fit),
+          child: Image.memory(
+            dataBytes,
+            fit: widget.fit,
+            // Attachments are full-size camera/gallery photos; honour the
+            // caller's decode bound here too, not just on the file path.
+            cacheWidth: widget.decodeWidth,
+          ),
         ),
       );
     }

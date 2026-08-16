@@ -2,6 +2,8 @@
 // Uses REST endpoints: POST /api/sessions/{id}/chat and
 // GET /api/sessions/{id}/messages.
 import 'dart:async';
+import 'dart:io';
+import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -24,6 +26,8 @@ import '../services/media_cache_service.dart';
 import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
+import '../utils/reveal_row.dart';
+import '../utils/row_keys.dart';
 import '../widgets/cached_media_thumbnail.dart';
 import 'call_screen.dart';
 import 'character_picker_screen.dart';
@@ -81,6 +85,10 @@ class _ChatScreenState extends State<ChatScreen> {
   Uint8List? _pickedImageBytes;
   String? _pickedImageMimeType;
 
+  /// The picked image already base64-encoded. Computed in [_pickImage] so the
+  /// encode doesn't land on the main isolate when Send is tapped.
+  String? _pickedImageDataUrl;
+
   // Voice input / spoken replies
   final Object _speechOwner = Object();
   final SpeechRecognitionCoordinator _speechCoordinator =
@@ -125,6 +133,33 @@ class _ChatScreenState extends State<ChatScreen> {
   // whole turn to finish.
   final List<String> _liveMediaUrls = [];
 
+  // True once this gateway has been seen emitting a rendered `filename` on a
+  // completed media tool's hermes.tool.progress frame. That frame is the whole
+  // reason the read-after-write polling exists, so a server that sends it
+  // makes every poll pure waste: each poll refetches the ENTIRE transcript and
+  // jsonDecodes it on the UI isolate, and a turn with two generated images
+  // fired up to ten of those. Persisted per connection so the very first turn
+  // after a cold start doesn't pay for the discovery again.
+  bool _serverSendsMediaFilename = false;
+
+  static String _mediaFilenameCapKey(String connectionId) =>
+      'server_sends_media_filename_$connectionId';
+
+  Future<void> _loadMediaFilenameCapability() async {
+    final prefs = await SharedPreferences.getInstance();
+    final known =
+        prefs.getBool(_mediaFilenameCapKey(widget.connection.id)) ?? false;
+    if (!known || !mounted) return;
+    _serverSendsMediaFilename = true;
+  }
+
+  Future<void> _rememberMediaFilenameCapability() async {
+    if (_serverSendsMediaFilename) return;
+    _serverSendsMediaFilename = true;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_mediaFilenameCapKey(widget.connection.id), true);
+  }
+
   // Scroll management
   final _scrollController = ScrollController();
   bool _showScrollToBottom = false;
@@ -139,6 +174,34 @@ class _ChatScreenState extends State<ChatScreen> {
   static const _tokenFlushDelay = Duration(milliseconds: 120);
   final StringBuffer _pendingTokens = StringBuffer();
   Timer? _tokenFlushTimer;
+
+  /// Flush interval, widened as the in-progress reply grows.
+  ///
+  /// Every flush re-parses the WHOLE accumulated reply: flutter_markdown
+  /// re-runs md.Document over `data` whenever it changes (see
+  /// _MarkdownWidgetState.didUpdateWidget), so a fixed 120ms cadence makes
+  /// total parse work quadratic in reply length — a 20KB answer gets parsed
+  /// from scratch ~160 times, and the last parses are the expensive ones.
+  /// Backing off past a couple of KB keeps the start of a reply feeling live
+  /// (where the parse is cheap and the eye is on it) and stops paying 8Hz for
+  /// re-parsing a wall of text nobody is reading character-by-character.
+  ///
+  /// Deliberately NOT solved by rendering the streaming bubble as plain Text:
+  /// that would drop the character-chat dialogue/narration styling for the
+  /// whole duration of the reply and snap it in at the end.
+  Duration _flushDelayFor(int contentLength) {
+    if (contentLength < 2000) return _tokenFlushDelay;
+    if (contentLength < 8000) return const Duration(milliseconds: 250);
+    return const Duration(milliseconds: 400);
+  }
+
+  /// Length of the assistant reply currently being streamed into, used to
+  /// pick the flush cadence above.
+  int get _streamingContentLength {
+    if (_messages.isEmpty || _messages.last['role'] != 'assistant') return 0;
+    final content = _messages.last['content'];
+    return content is String ? content.length : 0;
+  }
 
   // In-chat "/" commands, mirroring a small subset of the Telegram gateway
   // adapter's slash-command menu (/model, /new, /skills). These are handled
@@ -175,6 +238,7 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     _gateway = GatewayChatClient(_client);
     _fetchMessages();
+    _loadMediaFilenameCapability();
     _loadVerboseMode();
     _initVoice();
     _loadComfyUrl();
@@ -378,6 +442,7 @@ class _ChatScreenState extends State<ChatScreen> {
   Future<void> _loadComfyUrl() async {
     final url = await ComfyUi.loadBaseUrl();
     if (!mounted) return;
+    _invalidateDisplayList();
     setState(() => _comfyBaseUrl = url);
   }
 
@@ -641,11 +706,12 @@ class _ChatScreenState extends State<ChatScreen> {
     if (_scrollController.hasClients) {
       _lastPixels = _scrollController.position.pixels;
     }
-    final atBottom =
-        _scrollController.hasClients &&
-        _scrollController.position.pixels >=
-            _scrollController.position.maxScrollExtent - 200;
-    if (atBottom != !_showScrollToBottom && _streaming) {
+    // Previously gated on _streaming, which meant the flag only ever went
+    // true mid-reply and then stayed stale — and nothing rendered it anyway.
+    // Being scrolled up is worth an escape hatch whether or not a reply is in
+    // flight, so this now just tracks the position.
+    final atBottom = isNearBottom(_scrollController);
+    if (atBottom == _showScrollToBottom) {
       setState(() => _showScrollToBottom = !atBottom);
     }
   }
@@ -666,15 +732,8 @@ class _ChatScreenState extends State<ChatScreen> {
     });
   }
 
-  void _scrollToBottom() {
-    if (_scrollController.hasClients) {
-      _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOut,
-      );
-    }
-  }
+  Future<void> _scrollToBottom() =>
+      scrollToEnd(_scrollController, isMounted: () => mounted);
 
   Future<void> _fetchMessages() async {
     // A manual/refresh fetch supersedes any in-flight late-media poll.
@@ -714,6 +773,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       final errStr = e.toString();
       if (errStr.contains('404') || errStr.contains('not found')) {
+        _invalidateDisplayList();
         setState(() {
           _messages = [];
           _loading = false;
@@ -781,6 +841,13 @@ class _ChatScreenState extends State<ChatScreen> {
   /// chat. Re-pull a few times with a short delay; adopt the first fetch whose
   /// media set is larger than what we're already showing, then stop.
   Future<void> _pollForLateMedia() async {
+    // On a server that reports rendered filenames mid-stream there is nothing
+    // for this to discover: the media is already in _liveMediaUrls, and onDone
+    // now keeps any entry the refetch hasn't caught up with instead of
+    // clearing it, so a late-landing tool row no longer makes the image blink
+    // out. Skipping the poll saves up to four full-transcript refetches and
+    // main-isolate jsonDecodes per turn.
+    if (_serverSendsMediaFilename) return;
     final gen = _mediaPollGen;
     var known = _mediaUrlsIn(_messages).length;
     for (var attempt = 0; attempt < 4; attempt++) {
@@ -826,6 +893,7 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted || gen != _mediaPollGen || !_streaming) return;
       final fresh = _mediaUrlsIn(messages).difference(known);
       if (fresh.isNotEmpty) {
+        _invalidateDisplayList();
         setState(() {
           // Guarded like the fast path's equivalent add (below): two polls
           // completing close together on a legacy (no-filename) server must
@@ -841,6 +909,9 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   void _extractToolMessages(List<Map<String, dynamic>> messages) {
+    // Always called immediately before _messages is replaced, so this single
+    // bump covers both inputs at every refetch site.
+    _invalidateDisplayList();
     _toolMessages.clear();
     for (final msg in messages) {
       final role = (msg['role'] as String?) ?? '';
@@ -1066,23 +1137,13 @@ class _ChatScreenState extends State<ChatScreen> {
     // whether the message was typed or dictated.
     _awaitingVoiceReply = _voiceReplyEnabled;
 
-    // Build conversation history for the SSE request. Must be chronological
-    // (oldest first) and must only contain roles the model understands — a
-    // raw 'tool' message would otherwise be sent as if the user typed the
-    // tool's raw output, polluting subsequent replies.
-    final history = <Map<String, dynamic>>[];
-    for (final m in _messages) {
-      final rawRole = m['role'];
-      if (rawRole != 'user' && rawRole != 'assistant' && rawRole != 'agent') {
-        continue;
-      }
-      final content = parseMessageContent(m['content']).text.trim();
-      if (content.isEmpty) continue;
-      history.add({
-        'role': rawRole == 'agent' ? 'assistant' : rawRole,
-        'content': content,
-      });
-    }
+    // No history is sent. sendMessageStreaming always sets
+    // X-Hermes-Session-Id, and with a session id the gateway rebuilds the
+    // conversation from its own DB and discards any client-supplied history
+    // (see GatewayChatClient.buildChatCompletionMessages). Serializing the
+    // whole transcript into every request body just to have the server throw
+    // it away cost hundreds of KB of upload per turn on a long chat, delaying
+    // the first token for nothing.
 
     // Keep the exact optimistic rows and attachment together so a failed
     // multimodal send can remove only its own UI rows and restore the draft.
@@ -1090,6 +1151,7 @@ class _ChatScreenState extends State<ChatScreen> {
       text: text,
       imageBytes: _pickedImageBytes,
       imageMimeType: _pickedImageMimeType,
+      imageDataUrl: _pickedImageDataUrl,
     );
 
     // Snapshot before the optimistic rows go in, so onError can tell a
@@ -1100,6 +1162,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     // Invalidate any in-flight late-media poll from the previous turn.
     _mediaPollGen++;
+    _invalidateDisplayList();
     setState(() {
       _sending = true;
       _streaming = true;
@@ -1107,6 +1170,7 @@ class _ChatScreenState extends State<ChatScreen> {
       pendingSend.appendOptimisticRows(_messages);
       _pickedImageBytes = null;
       _pickedImageMimeType = null;
+      _pickedImageDataUrl = null;
       _liveMediaUrls.clear();
     });
 
@@ -1125,13 +1189,15 @@ class _ChatScreenState extends State<ChatScreen> {
       await _gateway.sendMessageStreaming(
       message: text,
       sessionId: widget.session.id,
-      history: history,
       imageDataUrls: pendingSend.imageDataUrls,
       cancelToken: _streamCancelToken,
       onToken: (token) {
         if (!mounted) return;
         _pendingTokens.write(token);
-        _tokenFlushTimer ??= Timer(_tokenFlushDelay, _flushPendingTokens);
+        _tokenFlushTimer ??= Timer(
+          _flushDelayFor(_streamingContentLength),
+          _flushPendingTokens,
+        );
       },
       onToolProgress: (progress) {
         if (!mounted) return;
@@ -1151,14 +1217,18 @@ class _ChatScreenState extends State<ChatScreen> {
           final messages = await _client.getMessages(widget.session.id);
           if (!mounted) return;
           _extractToolMessages(messages);
+          final settled = _mediaUrlsIn(messages);
           setState(() {
             _messages = messages;
             _streaming = false;
             _sending = false;
             _showScrollToBottom = false;
-            // The real message list now carries whatever _liveMediaUrls was
-            // standing in for — drop it so nothing renders twice.
-            _liveMediaUrls.clear();
+            // Drop only the URLs the refetched transcript actually carries, so
+            // nothing renders twice. Anything whose tool-result row hasn't
+            // been persisted yet stays put rather than blinking out and
+            // reappearing a poll later — that flash is what _pollForLateMedia
+            // used to paper over.
+            _liveMediaUrls.removeWhere(settled.contains);
           });
           // The image tool's result row may land just after this refetch;
           // poll briefly so a freshly generated image doesn't require leaving
@@ -1285,12 +1355,14 @@ class _ChatScreenState extends State<ChatScreen> {
       // sent. Mirrors onDone's success-path refetch, minus auto-continue/
       // voice-reply (an interrupted turn isn't a "reply finished" event).
       _extractToolMessages(serverMessages);
+      final settled = _mediaUrlsIn(serverMessages);
       setState(() {
         _messages = serverMessages!;
         _sending = false;
         _streaming = false;
         _awaitingVoiceReply = false;
-        _liveMediaUrls.clear();
+        // Same rule as onDone: keep anything the server hasn't persisted yet.
+        _liveMediaUrls.removeWhere(settled.contains);
       });
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -1316,6 +1388,7 @@ class _ChatScreenState extends State<ChatScreen> {
       return;
     }
 
+    _invalidateDisplayList();
     setState(() {
       _sending = false;
       _streaming = false;
@@ -1323,6 +1396,9 @@ class _ChatScreenState extends State<ChatScreen> {
       pending.rollbackOptimisticRows(_messages);
       _pickedImageBytes = pending.imageBytes;
       _pickedImageMimeType = pending.imageMimeType;
+      // Reuse the already-encoded data URL rather than paying for the base64
+      // again on the retry path.
+      _pickedImageDataUrl = pending.imageDataUrls?.firstOrNull;
       // Restore the typed text so the user doesn't lose their message on a
       // transient failure. Put the cursor at the end of the restored text.
       _textController.text = pending.text;
@@ -1358,6 +1434,7 @@ class _ChatScreenState extends State<ChatScreen> {
         ? '$emoji $display — done'
         : '$emoji $display — $status';
 
+    _invalidateDisplayList();
     setState(() {
       final idx = toolCallId.isEmpty
           ? -1
@@ -1386,8 +1463,12 @@ class _ChatScreenState extends State<ChatScreen> {
       // directly in the SSE payload — render off that and skip polling.
       final filename = progress['filename']?.toString();
       if (filename != null && filename.isNotEmpty) {
+        // Proof this gateway reports rendered filenames mid-stream, so the
+        // read-after-write polling can stay switched off from here on.
+        _rememberMediaFilenameCapability();
         final url = ComfyUi.viewUrl(_comfyBaseUrl, filename);
         if (!_liveMediaUrls.contains(url)) {
+          _invalidateDisplayList();
           setState(() => _liveMediaUrls.add(url));
         }
         return;
@@ -1525,18 +1606,31 @@ class _ChatScreenState extends State<ChatScreen> {
     final isDark = Theme.of(context).brightness == Brightness.dark;
     return Positioned.fill(
       child: IgnorePointer(
-        child: ColorFiltered(
-          colorFilter: ColorFilter.mode(
-            (isDark ? Colors.black : Colors.white).withValues(alpha: 0.25),
-            BlendMode.srcOver,
-          ),
-          child: CachedMediaThumbnail(
-            url: _client.characterImageUrl(_characterImagePath!),
-            headers: _client.authHeaders,
-            fit: BoxFit.cover,
-            // Decode near screen width, not the card's native resolution —
-            // these run to 6MB / ~25MB decoded.
-            decodeWidth: MediaQuery.of(context).size.width.round(),
+        // The backdrop never changes while a reply streams, but it shares a
+        // Stack with the chat column, so without this boundary every
+        // token-flush setState repainted a full-screen image. The veil is a
+        // plain overlay rather than a ColorFiltered wrapper for the same
+        // reason: ColorFiltered forces an offscreen layer on every repaint,
+        // and a flat translucent Container over the image is visually
+        // identical here (srcOver of a solid colour is exactly that).
+        child: RepaintBoundary(
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              CachedMediaThumbnail(
+                url: _client.characterImageUrl(_characterImagePath!),
+                headers: _client.authHeaders,
+                fit: BoxFit.cover,
+                // Decode near screen width, not the card's native resolution —
+                // these run to 6MB / ~25MB decoded.
+                decodeWidth: MediaQuery.of(context).size.width.round(),
+              ),
+              Container(
+                color: (isDark ? Colors.black : Colors.white).withValues(
+                  alpha: 0.25,
+                ),
+              ),
+            ],
           ),
         ),
       ),
@@ -1551,12 +1645,96 @@ class _ChatScreenState extends State<ChatScreen> {
           ),
           child: Column(
             children: [
-              Expanded(child: _buildBody()),
+              Expanded(
+                child: Stack(
+                  children: [
+                    _buildBody(),
+                    Positioned(
+                      right: 16,
+                      bottom: 12,
+                      child: _buildScrollToBottomButton(),
+                    ),
+                  ],
+                ),
+              ),
+              if (_speakingMessage != null) _buildSpeakingJumpBar(),
               if (_showingSlashSuggestions) _buildSlashSuggestions(),
               _buildInputBar(),
             ],
           ),
         ),
+    );
+  }
+
+  /// Escape hatch back to the newest message, shown once the view is scrolled
+  /// away from the bottom.
+  ///
+  /// Animated in and out rather than added and removed from the tree, so it
+  /// doesn't pop in and out during the small scroll jitters around the
+  /// threshold. IgnorePointer while hidden keeps it from eating taps aimed at
+  /// the bubble underneath.
+  Widget _buildScrollToBottomButton() {
+    final visible = _showScrollToBottom;
+    return IgnorePointer(
+      ignoring: !visible,
+      child: AnimatedOpacity(
+        opacity: visible ? 1 : 0,
+        duration: const Duration(milliseconds: 150),
+        child: AnimatedSlide(
+          offset: visible ? Offset.zero : const Offset(0, 0.4),
+          duration: const Duration(milliseconds: 150),
+          curve: Curves.easeOut,
+          child: FloatingActionButton.small(
+            heroTag: null,
+            tooltip: 'Jump to latest',
+            onPressed: _scrollToBottom,
+            child: const Icon(Icons.arrow_downward, size: 20),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Shown while a message is being replayed aloud: names it and offers to
+  /// scroll back to it. Only the manual per-message replay sets
+  /// [_speakingMessage] — an auto-spoken reply is the newest message and is
+  /// already at the bottom of the view, so there is nothing to jump to.
+  Widget _buildSpeakingJumpBar() {
+    final speaking = _speakingMessage;
+    if (speaking == null) return const SizedBox.shrink();
+    final preview = parseMessageContent(speaking['content']).text
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+    return Material(
+      color: Theme.of(context).colorScheme.surfaceContainerHighest,
+      child: InkWell(
+        onTap: _jumpToSpokenMessage,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Row(
+            children: [
+              const Icon(Icons.volume_up_rounded, size: 18),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  preview.isEmpty ? 'Speaking…' : preview,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ),
+              const SizedBox(width: 8),
+              Text(
+                'Jump to it',
+                style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  color: Theme.of(context).colorScheme.primary,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 
@@ -1696,6 +1874,7 @@ class _ChatScreenState extends State<ChatScreen> {
             onPressed: () => setState(() {
               _pickedImageBytes = null;
               _pickedImageMimeType = null;
+              _pickedImageDataUrl = null;
             }),
           ),
         ],
@@ -1723,9 +1902,14 @@ class _ChatScreenState extends State<ChatScreen> {
             'gif' => 'image/gif',
             _ => 'image/jpeg',
           };
+    // Encode here, on the async pick path, not in _sendMessage — see
+    // buildImageDataUrl.
+    final dataUrl = await Isolate.run(() => buildImageDataUrl(bytes, mime));
+    if (!mounted) return;
     setState(() {
       _pickedImageBytes = bytes;
       _pickedImageMimeType = mime;
+      _pickedImageDataUrl = dataUrl;
     });
   }
 
@@ -1768,9 +1952,210 @@ class _ChatScreenState extends State<ChatScreen> {
       );
     }
 
-    // Build display list: consecutive tool messages grouped into cards,
-    // interleaved with user/assistant bubbles. Images rendered by the ComfyUI
-    // tool are detected by filename in the tool content and shown inline.
+    final display = _displayList();
+
+    return ListView.builder(
+      controller: _scrollController,
+      padding: const EdgeInsets.only(bottom: 4),
+      itemCount: display.rows.length,
+      // Load-bearing alongside the keys below, not an optimization. In a lazy
+      // list a keyed child that moved index is discarded and rebuilt unless
+      // the sliver can locate it — so keys WITHOUT this are worse than no keys
+      // at all. Proven both ways in test/list_element_reuse_test.dart.
+      findChildIndexCallback: (key) => display.indexByKey[key],
+      itemBuilder: (context, index) {
+        final item = display.rows[index];
+        final key = display.keys[index];
+
+        final Widget child;
+        if (item is List<Map<String, dynamic>>) {
+          child = _ToolProgressCard(items: item, verbose: _verboseMode);
+        } else if (item is List<String>) {
+          // Generated media (images/videos) extracted from tool results.
+          child = _MediaRow(urls: item);
+        } else {
+          final msg = item as Map<String, dynamic>;
+          final role = (msg['role'] as String?) ?? 'assistant';
+          final parsed = parseMessageContent(msg['content']);
+          final isUser = role == 'user';
+
+          child = _MessageBubble(
+            content: parsed.text,
+            imageUrls: parsed.imageUrls,
+            isUser: isUser,
+            verbose: _verboseMode,
+            metadata: msg,
+            isSpeaking: _isSpeakingMessage(msg),
+            onReplay: isUser ? null : () => _replayMessage(msg),
+            // In a character chat the reply sits directly on the card art:
+            // no bubble fill, dialogue in yellow, *narration* in bold black.
+            roleplay: _characterImagePath != null,
+          );
+        }
+
+        // The row key goes on a KeyedSubtree rather than on the row widget
+        // itself, so the jump target can be wrapped without displacing the
+        // key the sliver matches on.
+        return KeyedSubtree(
+          key: key,
+          child: key == _flashRowKey
+              ? _FlashHighlight(
+                  key: _flashAnchorKey,
+                  flashId: _flashId,
+                  child: child,
+                )
+              : child,
+        );
+      },
+    );
+  }
+
+  // ── Jump to the message being spoken ────────────────────────────────
+  //
+  // Tapping replay on an old message and then scrolling away leaves no way
+  // back to it short of hunting. These track the jump target so it can be
+  // located and flashed once it is on screen.
+  Key? _flashRowKey;
+  int _flashId = 0;
+  final GlobalKey _flashAnchorKey = GlobalKey();
+
+  Future<void> _jumpToSpokenMessage() async {
+    final speaking = _speakingMessage;
+    if (speaking == null) return;
+
+    final display = _displayList();
+    var index = -1;
+    for (var i = 0; i < display.rows.length; i++) {
+      final row = display.rows[i];
+      if (row is Map<String, dynamic> && _isSpeakingMessage(row)) {
+        index = i;
+        break;
+      }
+    }
+    // The spoken message can legitimately be absent — a refetch may have
+    // replaced the transcript since playback started.
+    if (index < 0) return;
+
+    setState(() {
+      _flashRowKey = display.keys[index];
+      _flashId++;
+    });
+    await _revealRow(index);
+  }
+
+  /// Scrolls [index] into view — see [revealRow] for why this needs more than
+  /// one pass. `alignment` puts the message a little below the top edge so it
+  /// reads as "here" rather than being jammed under the app bar.
+  Future<void> _revealRow(int index) => revealRow(
+    controller: _scrollController,
+    index: index,
+    rowCount: () => _displayList().rows.length,
+    anchorContext: () => _flashAnchorKey.currentContext,
+    isMounted: () => mounted,
+  );
+
+  // ── Display list ────────────────────────────────────────────────────
+  //
+  // Deriving the rendered row list walks the ENTIRE transcript: every
+  // message parsed, tool groups assembled, media URLs harvested and deduped,
+  // and a pile of fresh Lists/Sets allocated. That ran on every rebuild —
+  // which during a streaming reply means several times a second (see
+  // _flushPendingTokens) — to produce a list identical to the previous one
+  // except for the final bubble's text. On a long session that was thousands
+  // of message-visits per second and a steady stream of garbage.
+  //
+  // The result is cached and reused until one of its inputs actually changes.
+  // Token flushes deliberately do NOT invalidate it: the cached list holds
+  // references to the same message maps, so a mutated `content` is picked up
+  // for free by the bubble that renders it.
+  _DisplayRows? _displayCache;
+  ({
+    int revision,
+    int messageCount,
+    int toolCount,
+    int liveMediaCount,
+    String comfyBaseUrl,
+    bool lastMessageEmpty,
+  })? _displayCacheKey;
+
+  /// Bumped by [_invalidateDisplayList] whenever _messages, _toolMessages,
+  /// _liveMediaUrls or _comfyBaseUrl are mutated in a way the row list depends
+  /// on. Anything that touches those must call it.
+  int _displayRevision = 0;
+
+  void _invalidateDisplayList() => _displayRevision++;
+
+  /// The optimistic assistant row starts empty and is therefore skipped by the
+  /// builder below; it has to appear the moment the first token lands. That is
+  /// the one content mutation the cache must notice, so it is part of the key.
+  bool get _lastMessageEmpty {
+    if (_messages.isEmpty) return false;
+    final content = _messages.last['content'];
+    return content is String && content.isEmpty;
+  }
+
+  _DisplayRows _displayList() {
+    final key = (
+      revision: _displayRevision,
+      messageCount: _messages.length,
+      toolCount: _toolMessages.length,
+      liveMediaCount: _liveMediaUrls.length,
+      comfyBaseUrl: _comfyBaseUrl,
+      lastMessageEmpty: _lastMessageEmpty,
+    );
+    final cached = _displayCache;
+    if (cached != null && key == _displayCacheKey) return cached;
+    final built = _keyRows(_buildDisplayList());
+    _displayCache = built;
+    _displayCacheKey = key;
+    return built;
+  }
+
+  /// The assistant reply currently being streamed into, if any — it gets a
+  /// sentinel key rather than a content-derived one. See [messageRowKey].
+  Map<String, dynamic>? get _streamingTailMessage {
+    if (!_streaming || _messages.isEmpty) return null;
+    final last = _messages.last;
+    return (last['role'] as String?) == 'assistant' ? last : null;
+  }
+
+  /// Attaches a stable, unique key to each row and builds the key→index map
+  /// that findChildIndexCallback needs.
+  _DisplayRows _keyRows(List<dynamic> rows) {
+    final keys = <Key>[];
+    final indexByKey = <Key, int>{};
+    final seen = <String, int>{};
+    final streamingTail = _streamingTailMessage;
+
+    for (var i = 0; i < rows.length; i++) {
+      final row = rows[i];
+      final String base;
+      if (row is List<Map<String, dynamic>>) {
+        base = toolRowKey(
+          row.isEmpty ? null : row.first['toolCallId']?.toString(),
+        );
+      } else if (row is List<String>) {
+        base = mediaRowKey(row.isEmpty ? null : row.first);
+      } else {
+        final msg = row as Map<String, dynamic>;
+        base = messageRowKey(
+          role: (msg['role'] as String?) ?? 'assistant',
+          text: parseMessageContent(msg['content']).text,
+          id: msg['id']?.toString(),
+          streaming: streamingTail != null && identical(msg, streamingTail),
+        );
+      }
+      final key = ValueKey(disambiguate(base, seen));
+      keys.add(key);
+      indexByKey[key] = i;
+    }
+    return _DisplayRows(rows, keys, indexByKey);
+  }
+
+  /// Build display list: consecutive tool messages grouped into cards,
+  /// interleaved with user/assistant bubbles. Images rendered by the ComfyUI
+  /// tool are detected by filename in the tool content and shown inline.
+  List<dynamic> _buildDisplayList() {
     final toolQueue = List<Map<String, dynamic>>.from(_toolMessages);
     final displayMessages = <dynamic>[];
     final currentGroup = <Map<String, dynamic>>[];
@@ -1830,47 +2215,107 @@ class _ChatScreenState extends State<ChatScreen> {
     }
 
     // A generated image that landed mid-stream, before the turn's final
-    // getMessages() refetch — see _pollForLiveMedia.
-    if (_streaming && _liveMediaUrls.isNotEmpty) {
+    // getMessages() refetch — see _pollForLiveMedia. Not gated on _streaming:
+    // onDone keeps any entry the refetch hasn't caught up with, and dropping
+    // the row the instant the turn ended is exactly the flash-out that made
+    // the late-media polling necessary.
+    if (_liveMediaUrls.isNotEmpty) {
       displayMessages.add(_liveMediaUrls.toList());
     }
 
-    return ListView.builder(
-      controller: _scrollController,
-      padding: const EdgeInsets.only(bottom: 4),
-      itemCount: displayMessages.length,
-      itemBuilder: (context, index) {
-        final item = displayMessages[index];
+    return displayMessages;
+  }
+}
 
-        if (item is List<Map<String, dynamic>>) {
-          return _ToolProgressCard(items: item, verbose: _verboseMode);
-        }
+/// Tints a row briefly, then fades back, to mark where a jump landed.
+///
+/// Driven by [flashId] rather than by mounting: the target row's element
+/// survives repeated jumps to the same message, so a mount-triggered
+/// animation would only ever play once.
+class _FlashHighlight extends StatefulWidget {
+  const _FlashHighlight({
+    required this.flashId,
+    required this.child,
+    super.key,
+  });
 
-        if (item is List<String>) {
-          // Generated media (images/videos) extracted from tool results.
-          return _MediaRow(urls: item);
-        }
+  final int flashId;
+  final Widget child;
 
-        final msg = item as Map<String, dynamic>;
-        final role = (msg['role'] as String?) ?? 'assistant';
-        final parsed = parseMessageContent(msg['content']);
-        final isUser = role == 'user';
+  @override
+  State<_FlashHighlight> createState() => _FlashHighlightState();
+}
 
-        return _MessageBubble(
-          content: parsed.text,
-          imageUrls: parsed.imageUrls,
-          isUser: isUser,
-          verbose: _verboseMode,
-          metadata: msg,
-          isSpeaking: _isSpeakingMessage(msg),
-          onReplay: isUser ? null : () => _replayMessage(msg),
-          // In a character chat the reply sits directly on the card art:
-          // no bubble fill, dialogue in yellow, *narration* in bold black.
-          roleplay: _characterImagePath != null,
-        );
-      },
+class _FlashHighlightState extends State<_FlashHighlight>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1200),
+  );
+
+  late final Animation<double> _opacity = TweenSequence<double>([
+    // Rise quickly so the eye catches it, linger, then fade out slowly.
+    TweenSequenceItem(tween: Tween(begin: 0.0, end: 1.0), weight: 15),
+    TweenSequenceItem(tween: ConstantTween(1.0), weight: 35),
+    TweenSequenceItem(tween: Tween(begin: 1.0, end: 0.0), weight: 50),
+  ]).animate(_controller);
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.forward();
+  }
+
+  @override
+  void didUpdateWidget(_FlashHighlight oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.flashId != widget.flashId) {
+      _controller.forward(from: 0);
+    }
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        widget.child,
+        // Ignores pointers so the replay button underneath stays tappable
+        // while the flash plays.
+        Positioned.fill(
+          child: IgnorePointer(
+            child: FadeTransition(
+              opacity: _opacity,
+              child: Container(
+                margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 2),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFD4AF37).withValues(alpha: 0.22),
+                  borderRadius: BorderRadius.circular(18),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
     );
   }
+}
+
+/// The transcript's rows plus their stable keys and a key→index map.
+///
+/// Keys and rows are built and cached together: recomputing keys on every
+/// rebuild would undo the point of caching the rows.
+class _DisplayRows {
+  const _DisplayRows(this.rows, this.keys, this.indexByKey);
+
+  final List<dynamic> rows;
+  final List<Key> keys;
+  final Map<Key, int> indexByKey;
 }
 
 class _MessageBubble extends StatelessWidget {
@@ -2189,25 +2634,67 @@ class _MediaRow extends StatelessWidget {
   Widget build(BuildContext context) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
+      // Keyed on the URL. Unlike the transcript's lazy ListView — where a key
+      // without findChildIndexCallback makes a moved child get discarded and
+      // rebuilt rather than reused — a Column builds all its children eagerly,
+      // so keys here genuinely let a clip keep its opened Player when the
+      // row's contents shift around it.
       children: urls.map((u) {
         final filename = Uri.parse(u).queryParameters['filename'] ?? '';
         return ComfyUi.isVideo(filename)
-            ? _VideoBubble(url: u)
-            : _ImageBubble(url: u);
+            ? _VideoBubble(url: u, key: ValueKey(u))
+            : _ImageBubble(url: u, key: ValueKey(u));
       }).toList(),
     );
   }
 }
 
-/// One generated image, fetched from ComfyUI's /view endpoint. Tappable to
-/// open full-screen with pinch-zoom.
-class _ImageBubble extends StatelessWidget {
+/// One generated image, resolved through [MediaCacheService] so a reopened
+/// chat reads it off disk instead of re-fetching it from the LAN gateway
+/// every time. Tappable to open full-screen with pinch-zoom.
+///
+/// This used to be a bare Image.network with no disk cache and no decode
+/// bound — every reopen re-downloaded the file, and a 1536² PNG decoded to
+/// ~9MB of bitmap, so a handful of them evicted Flutter's ImageCache and sent
+/// the whole transcript into repeated decode churn while scrolling.
+class _ImageBubble extends StatefulWidget {
   final String url;
-  const _ImageBubble({required this.url});
+  const _ImageBubble({required this.url, super.key});
+
+  @override
+  State<_ImageBubble> createState() => _ImageBubbleState();
+}
+
+class _ImageBubbleState extends State<_ImageBubble> {
+  // Built once, not in build(): a fresh Future per rebuild makes FutureBuilder
+  // resubscribe and drop back to `waiting`, which flickers the image to a
+  // spinner on every streaming-token flush.
+  Future<File>? _fileFuture;
+
+  @override
+  void initState() {
+    super.initState();
+    _resolve();
+  }
+
+  @override
+  void didUpdateWidget(_ImageBubble oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.url != widget.url) _resolve();
+  }
+
+  void _resolve() {
+    _fileFuture = MediaCacheService.fileFor(widget.url);
+  }
 
   @override
   Widget build(BuildContext context) {
-    final maxW = MediaQuery.of(context).size.width - 80;
+    final media = MediaQuery.of(context);
+    final maxW = media.size.width - 80;
+    // cacheWidth is in physical pixels, so scale by DPR — decoding at the
+    // logical width would look soft on any modern phone.
+    final decodeWidth = (maxW * media.devicePixelRatio).round();
+
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       constraints: BoxConstraints(maxWidth: maxW),
@@ -2216,40 +2703,50 @@ class _ImageBubble extends StatelessWidget {
         borderRadius: BorderRadius.circular(18),
         color: Theme.of(context).colorScheme.surfaceContainerHighest,
       ),
-      child: GestureDetector(
-        onTap: () => _openFull(context),
-        child: Image.network(
-          url,
-          fit: BoxFit.contain,
-          loadingBuilder: (context, child, progress) {
-            if (progress == null) return child;
-            final total = progress.expectedTotalBytes;
-            return SizedBox(
+      child: FutureBuilder<File>(
+        future: _fileFuture,
+        builder: (context, snapshot) {
+          if (snapshot.connectionState != ConnectionState.done) {
+            return const SizedBox(
               height: 160,
+              child: Center(child: CircularProgressIndicator()),
+            );
+          }
+          final file = snapshot.data;
+          if (snapshot.hasError || file == null) {
+            return const SizedBox(
+              height: 80,
               child: Center(
-                child: CircularProgressIndicator(
-                  value: total != null && total > 0
-                      ? progress.cumulativeBytesLoaded / total
-                      : null,
+                child: Text(
+                  'image unavailable',
+                  style: TextStyle(color: Colors.grey),
                 ),
               ),
             );
-          },
-          errorBuilder: (context, _, _) => const SizedBox(
-            height: 80,
-            child: Center(
-              child: Text(
-                'image unavailable',
-                style: TextStyle(color: Colors.grey),
+          }
+          return GestureDetector(
+            onTap: () => _openFull(context, file),
+            child: Image.file(
+              file,
+              fit: BoxFit.contain,
+              cacheWidth: decodeWidth,
+              errorBuilder: (context, _, _) => const SizedBox(
+                height: 80,
+                child: Center(
+                  child: Text(
+                    'image unavailable',
+                    style: TextStyle(color: Colors.grey),
+                  ),
+                ),
               ),
             ),
-          ),
-        ),
+          );
+        },
       ),
     );
   }
 
-  void _openFull(BuildContext context) {
+  void _openFull(BuildContext context, File file) {
     Navigator.of(context).push(
       MaterialPageRoute(
         builder: (_) => Scaffold(
@@ -2257,7 +2754,7 @@ class _ImageBubble extends StatelessWidget {
           appBar: AppBar(backgroundColor: Colors.black),
           body: SafeArea(
             child: Center(
-              child: InteractiveViewer(child: Image.network(url)),
+              child: InteractiveViewer(child: Image.file(file)),
             ),
           ),
         ),
@@ -2276,10 +2773,23 @@ class _ImageBubble extends StatelessWidget {
 /// ComfyUI/WAN clips.
 class _VideoBubble extends StatefulWidget {
   final String url;
-  const _VideoBubble({required this.url});
+  const _VideoBubble({required this.url, super.key});
 
   @override
   State<_VideoBubble> createState() => _VideoBubbleState();
+}
+
+/// Loads media_kit's native backend on first use.
+///
+/// This used to run unconditionally in main(), putting the shared-object load
+/// in front of the first frame on every cold start — including the majority of
+/// launches that never open a chat with a video in it. MediaKit.ensureInitialized
+/// is itself idempotent; the flag just avoids the repeat call per bubble.
+bool _mediaKitReady = false;
+void ensureMediaKitInitialized() {
+  if (_mediaKitReady) return;
+  MediaKit.ensureInitialized();
+  _mediaKitReady = true;
 }
 
 class _VideoBubbleState extends State<_VideoBubble> {
@@ -2292,13 +2802,17 @@ class _VideoBubbleState extends State<_VideoBubble> {
 
   final List<StreamSubscription<dynamic>> _subs = [];
 
+  /// Bumped on every [_openSource]. An open that resolves after a newer one
+  /// started must not flip this bubble to ready/failed for a clip that is no
+  /// longer the one being shown.
+  int _openEpoch = 0;
+
   @override
   void initState() {
     super.initState();
-    _init();
-  }
-
-  Future<void> _init() async {
+    // Must happen before the first Player is constructed. _player and
+    // _videoController are `late final`, so nothing has touched them yet.
+    ensureMediaKitInitialized();
     // Surface real decode/open failures instead of silently spinning forever.
     _subs.add(_player.stream.error.listen((e) {
       debugPrint('[media_kit] video error for ${widget.url}: $e');
@@ -2309,6 +2823,30 @@ class _VideoBubbleState extends State<_VideoBubble> {
     }));
     _subs.add(_player.stream.width.listen((_) => _updateAspect()));
     _subs.add(_player.stream.height.listen((_) => _updateAspect()));
+    _openSource();
+  }
+
+  /// The transcript's row list is rebuilt from scratch on every refetch, and
+  /// rows shift whenever a tool group or media row is inserted between
+  /// bubbles. Because rows are unkeyed, Flutter matches by index and UPDATES
+  /// this element rather than recreating it — so without this the State kept
+  /// its already-opened Player and went on playing the previous clip under a
+  /// row that now points at a different URL.
+  @override
+  void didUpdateWidget(_VideoBubble oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.url != widget.url) _openSource();
+  }
+
+  Future<void> _openSource() async {
+    final epoch = ++_openEpoch;
+    if (_ready || _failed) {
+      setState(() {
+        _ready = false;
+        _failed = false;
+        _playing = false;
+      });
+    }
     try {
       // Resolve through the disk cache first so a re-opened chat plays from
       // a local file instead of re-fetching the same clip from the LAN
@@ -2321,13 +2859,14 @@ class _VideoBubbleState extends State<_VideoBubble> {
       } catch (e) {
         debugPrint('[media_kit] cache fetch failed for ${widget.url}: $e');
       }
+      if (!mounted || epoch != _openEpoch) return;
       // Open paused so multiple clips in a transcript don't all autoplay.
       await _player.open(Media(source), play: false);
-      if (!mounted) return;
+      if (!mounted || epoch != _openEpoch) return;
       setState(() => _ready = true);
     } catch (e) {
       debugPrint('[media_kit] open failed for ${widget.url}: $e');
-      if (mounted) setState(() => _failed = true);
+      if (mounted && epoch == _openEpoch) setState(() => _failed = true);
     }
   }
 

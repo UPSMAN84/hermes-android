@@ -1,17 +1,28 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
+/// Builds the `data:` URL for an attachment.
+///
+/// Split out so callers can do the base64 encode when the image is PICKED
+/// rather than when Send is tapped. A 2000px/q85 JPEG is ~1MB in and ~1.4MB
+/// out, and doing that synchronously inside _sendMessage put a visible hitch
+/// on the main isolate at exactly the moment the user expects the message to
+/// appear. Picking is already async and off the critical path.
+String buildImageDataUrl(Uint8List bytes, String? mimeType) =>
+    'data:${mimeType ?? 'image/jpeg'};base64,${base64Encode(bytes)}';
+
 /// One optimistic chat turn, including any attachment needed for retry.
 class PendingChatSend {
   PendingChatSend({
     required this.text,
     required this.imageBytes,
     required this.imageMimeType,
+    String? imageDataUrl,
   }) {
     final bytes = imageBytes;
     imageDataUrls = bytes == null
         ? null
-        : ['data:${imageMimeType ?? 'image/jpeg'};base64,${base64Encode(bytes)}'];
+        : [imageDataUrl ?? buildImageDataUrl(bytes, imageMimeType)];
     final urls = imageDataUrls;
     localContent = urls == null
         ? text

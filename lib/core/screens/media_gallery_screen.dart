@@ -16,6 +16,18 @@ class MediaGalleryScreen extends StatelessWidget {
     super.key,
   });
 
+  static const int _columns = 3;
+
+  /// Physical-pixel width of one grid tile — what the thumbnails should be
+  /// decoded at. cacheWidth is in device pixels, so this scales by DPR.
+  static int _tileDecodeWidth(BuildContext context) {
+    final media = MediaQuery.of(context);
+    const outerPadding = 4.0 * 2;
+    const spacing = 4.0 * (_columns - 1);
+    final tile = (media.size.width - outerPadding - spacing) / _columns;
+    return (tile * media.devicePixelRatio).round();
+  }
+
   List<String> _collectImageUrls() {
     // A filename can legitimately resurface in tool content more than once
     // (e.g. a post-render verification step that lists the output dir) —
@@ -56,13 +68,20 @@ class MediaGalleryScreen extends StatelessWidget {
           : GridView.builder(
               padding: const EdgeInsets.all(4),
               gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
+                crossAxisCount: _columns,
                 crossAxisSpacing: 4,
                 mainAxisSpacing: 4,
               ),
               itemCount: urls.length,
-              itemBuilder: (context, i) =>
-                  CachedMediaThumbnail(url: urls[i], borderRadius: 4),
+              itemBuilder: (context, i) => CachedMediaThumbnail(
+                url: urls[i],
+                borderRadius: 4,
+                // Without a decode bound these tiles decoded generated images
+                // at native resolution — a 1536² PNG is ~9MB of bitmap, so a
+                // 40-image chat tried to hold hundreds of MB to draw a grid of
+                // ~130pt thumbnails. Decode at tile size instead.
+                decodeWidth: _tileDecodeWidth(context),
+              ),
             ),
     );
   }
