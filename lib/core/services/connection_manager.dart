@@ -135,12 +135,25 @@ class ApiClient {
   final String baseUrl;
   final String _apiKey;
 
+  /// Ceiling on any single request.
+  ///
+  /// Without one, a half-open socket — the phone handing off between wifi and
+  /// cellular, a VPN reconnecting, a middlebox dropping the connection without
+  /// sending a RST — produces neither bytes nor an error, so the await never
+  /// resolves and the screen sits on its spinner forever with no way to
+  /// retry. Generous rather than tight: a long transcript over a slow LAN link
+  /// is a legitimately slow response, not a stall.
+  static const Duration defaultRequestTimeout = Duration(seconds: 30);
+
+  final Duration requestTimeout;
+
   // Keep the public parameter name `apiKey` while storing it privately.
   ApiClient({
     required String baseUrl,
     required String apiKey,
     String pathPrefix = '',
     http.Client? httpClient,
+    this.requestTimeout = defaultRequestTimeout,
   }) : _apiKey = apiKey,
        baseUrl = SavedConnection.joinBaseUrl(baseUrl, pathPrefix),
        _http = httpClient ?? http.Client();
@@ -150,13 +163,14 @@ class ApiClient {
     'Content-Type': 'application/json',
   };
 
+  /// GET [url] with the standard auth headers, bounded by [requestTimeout].
+  Future<http.Response> _get(String url) =>
+      _http.get(Uri.parse(url), headers: _headers).timeout(requestTimeout);
+
   // ── Session listing ──────────────────────────────────────────────────
 
   Future<List<Session>> getSessions() async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/api/sessions'),
-      headers: _headers,
-    );
+    final res = await _get('$baseUrl/api/sessions');
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
     }
@@ -171,10 +185,7 @@ class ApiClient {
   // ── Messages ─────────────────────────────────────────────────────────
 
   Future<List<Map<String, dynamic>>> getMessages(String sessionId) async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/api/sessions/$sessionId/messages'),
-      headers: _headers,
-    );
+    final res = await _get('$baseUrl/api/sessions/$sessionId/messages');
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
     }
@@ -185,10 +196,9 @@ class ApiClient {
 
   Future<void> deleteSession(String sessionId) async {
     final encodedId = Uri.encodeComponent(sessionId);
-    final res = await _http.delete(
-      Uri.parse('$baseUrl/api/sessions/$encodedId'),
-      headers: _headers,
-    );
+    final res = await _http
+        .delete(Uri.parse('$baseUrl/api/sessions/$encodedId'), headers: _headers)
+        .timeout(requestTimeout);
     // Treat a stale local row as already synced: the remote no longer has it,
     // so the UI can safely remove it from history.
     if (res.statusCode == 404) return;
@@ -204,10 +214,7 @@ class ApiClient {
   // exported cards are named by UUID).
 
   Future<List<CharacterSummary>> getCharacters() async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/api/characters'),
-      headers: _headers,
-    );
+    final res = await _get('$baseUrl/api/characters');
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
     }
@@ -223,9 +230,8 @@ class ApiClient {
   /// Full persona for one card. Fetched on demand — a card is ~10KB of
   /// prose, so the listing deliberately omits it.
   Future<CharacterCard> getCharacterCard(String imagePath) async {
-    final res = await _http.get(
-      Uri.parse('$baseUrl/api/characters/card?path=${Uri.encodeQueryComponent(imagePath)}'),
-      headers: _headers,
+    final res = await _get(
+      '$baseUrl/api/characters/card?path=${Uri.encodeQueryComponent(imagePath)}',
     );
     if (res.statusCode != 200) {
       throw Exception('HTTP ${res.statusCode}: ${res.body}');
@@ -635,6 +641,13 @@ class DashboardClient {
   bool get _usesPasswordAuth =>
       (_username?.isNotEmpty ?? false) && (_password?.isNotEmpty ?? false);
 
+  /// Ceiling on any single dashboard request — same reasoning as
+  /// [ApiClient.defaultRequestTimeout]. Shorter because these are small
+  /// control-plane calls (model info, cron jobs, skills), not transcripts.
+  static const Duration defaultRequestTimeout = Duration(seconds: 20);
+
+  final Duration requestTimeout;
+
   DashboardClient({
     required String host,
     int port = 9119,
@@ -644,6 +657,7 @@ class DashboardClient {
     String? username,
     String? password,
     http.Client? httpClient,
+    this.requestTimeout = defaultRequestTimeout,
   }) : _proxied = proxied,
        _username = username,
        _password = password,
@@ -672,15 +686,17 @@ class DashboardClient {
   /// cookie. Throws on failure (bad credentials → 401, etc.).
   Future<String> _login() async {
     try {
-      final res = await _http.post(
-        Uri.parse('$_baseUrl/auth/password-login'),
-        headers: const {'Content-Type': 'application/json'},
-        body: jsonEncode({
-          'provider': 'basic',
-          'username': _username,
-          'password': _password,
-        }),
-      );
+      final res = await _http
+          .post(
+            Uri.parse('$_baseUrl/auth/password-login'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'provider': 'basic',
+              'username': _username,
+              'password': _password,
+            }),
+          )
+          .timeout(requestTimeout);
       if (res.statusCode == 401) {
         throw Exception('Dashboard login failed: invalid username or password');
       }
@@ -717,7 +733,8 @@ class DashboardClient {
 
   Future<String> _fetchToken() async {
     try {
-      final res = await _http.get(Uri.parse('$_baseUrl/'));
+      final res =
+          await _http.get(Uri.parse('$_baseUrl/')).timeout(requestTimeout);
       if (res.statusCode != 200) throw Exception('Dashboard not reachable');
       final match = RegExp(
         r'window\.__HERMES_SESSION_TOKEN__="([^"]+)";',
@@ -754,10 +771,9 @@ class DashboardClient {
     bool retried = false,
   }) async {
     final headers = await _authHeaders();
-    final res = await _http.get(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-    );
+    final res = await _http
+        .get(Uri.parse('$_baseUrl/api/$endpoint'), headers: headers)
+        .timeout(requestTimeout);
     if (res.statusCode == 401 && !retried) {
       _resetAuth();
       return apiGet(endpoint, retried: true);
@@ -771,10 +787,9 @@ class DashboardClient {
     bool retried = false,
   }) async {
     final headers = await _authHeaders();
-    final res = await _http.get(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-    );
+    final res = await _http
+        .get(Uri.parse('$_baseUrl/api/$endpoint'), headers: headers)
+        .timeout(requestTimeout);
     if (res.statusCode == 401 && !retried) {
       _resetAuth();
       return apiGetList(endpoint, retried: true);
@@ -794,11 +809,13 @@ class DashboardClient {
     bool retried = false,
   }) async {
     final headers = await _authHeaders();
-    final res = await _http.post(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-      body: body != null ? jsonEncode(body) : null,
-    );
+    final res = await _http
+        .post(
+          Uri.parse('$_baseUrl/api/$endpoint'),
+          headers: headers,
+          body: body != null ? jsonEncode(body) : null,
+        )
+        .timeout(requestTimeout);
     if (res.statusCode == 401 && !retried) {
       _resetAuth();
       return apiPost(endpoint, body: body, retried: true);
@@ -811,10 +828,9 @@ class DashboardClient {
 
   Future<void> apiDelete(String endpoint, {bool retried = false}) async {
     final headers = await _authHeaders();
-    final res = await _http.delete(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-    );
+    final res = await _http
+        .delete(Uri.parse('$_baseUrl/api/$endpoint'), headers: headers)
+        .timeout(requestTimeout);
     if (res.statusCode == 401 && !retried) {
       _resetAuth();
       return apiDelete(endpoint, retried: true);
@@ -830,11 +846,13 @@ class DashboardClient {
     bool retried = false,
   }) async {
     final headers = await _authHeaders();
-    final res = await _http.put(
-      Uri.parse('$_baseUrl/api/$endpoint'),
-      headers: headers,
-      body: body != null ? jsonEncode(body) : null,
-    );
+    final res = await _http
+        .put(
+          Uri.parse('$_baseUrl/api/$endpoint'),
+          headers: headers,
+          body: body != null ? jsonEncode(body) : null,
+        )
+        .timeout(requestTimeout);
     if (res.statusCode == 401 && !retried) {
       _resetAuth();
       return apiPut(endpoint, body: body, retried: true);

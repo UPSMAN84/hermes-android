@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -788,4 +789,65 @@ void main() {
       expect(map['dashboard_proxied'], true);
     });
   });
+
+  group('Request timeouts', () {
+    // A half-open socket -- wifi/cellular handoff, a VPN reconnect, a
+    // middlebox dropping the connection without a RST -- yields neither bytes
+    // nor an error. Before these timeouts existed the await simply never
+    // resolved, so the screen sat on its spinner forever with no retry path.
+    test('ApiClient.getMessages gives up instead of hanging forever', () {
+      final client = ApiClient(
+        baseUrl: 'http://host:8642',
+        apiKey: 'k',
+        requestTimeout: const Duration(milliseconds: 50),
+        httpClient: _HangingClient(),
+      );
+      expect(
+        client.getMessages('session-1'),
+        throwsA(isA<TimeoutException>()),
+      );
+    });
+
+    test('ApiClient.getSessions gives up instead of hanging forever', () {
+      final client = ApiClient(
+        baseUrl: 'http://host:8642',
+        apiKey: 'k',
+        requestTimeout: const Duration(milliseconds: 50),
+        httpClient: _HangingClient(),
+      );
+      expect(client.getSessions(), throwsA(isA<TimeoutException>()));
+    });
+
+    test('DashboardClient.apiGet gives up instead of hanging forever', () {
+      final client = DashboardClient(
+        host: 'host',
+        proxied: true,
+        requestTimeout: const Duration(milliseconds: 50),
+        httpClient: _HangingClient(),
+      );
+      expect(client.getModelInfo(), throwsA(isA<TimeoutException>()));
+    });
+
+    test('a response inside the budget still succeeds', () async {
+      final client = ApiClient(
+        baseUrl: 'http://host:8642',
+        apiKey: 'k',
+        requestTimeout: const Duration(seconds: 5),
+        httpClient: MockClient((request) async {
+          return http.Response(jsonEncode({'data': []}), 200);
+        }),
+      );
+      expect(await client.getMessages('session-1'), isEmpty);
+    });
+  });
+}
+
+/// Accepts the request and then never responds — the half-open socket case.
+class _HangingClient extends http.BaseClient {
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) =>
+      Completer<http.StreamedResponse>().future;
+
+  @override
+  void close() {}
 }
