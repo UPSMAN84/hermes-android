@@ -31,10 +31,16 @@ abstract class TtsProvider {
   /// [keepActions] speaks `*narration*` instead of stripping it — set in
   /// character chats, where actions are half the reply rather than a stray
   /// stage direction. See XttsService.stripForSpeech.
+  ///
+  /// [voiceOverride] picks a specific speaker/voice (XTTS speaker filename or
+  /// Chatterbox voice filename, matching whichever backend this instance is)
+  /// instead of the app-wide one configured in Settings — used for a
+  /// per-character voice. Null/empty falls back to the global setting.
   Future<void> speak(
     String text, {
     void Function()? onComplete,
     bool keepActions = false,
+    String? voiceOverride,
   });
 
   /// Synthesize [text] without playing it. Returns null when there is nothing
@@ -43,7 +49,11 @@ abstract class TtsProvider {
   ///
   /// Callers that need low latency across several utterances should prepare
   /// the next one while the current one is playing.
-  Future<PreparedSpeech?> prepare(String text, {bool keepActions = false});
+  Future<PreparedSpeech?> prepare(
+    String text, {
+    bool keepActions = false,
+    String? voiceOverride,
+  });
 
   /// Play audio already synthesized by [prepare]. Stops anything currently
   /// playing first, exactly like [speak].

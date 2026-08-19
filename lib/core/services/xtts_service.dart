@@ -3,6 +3,7 @@
 // Replaces the on-device flutter_tts engine: assistant text is POSTed to the
 // server's /tts_to_audio/ endpoint, which returns a WAV we play locally with
 // audioplayers. Speaker + language selection persist in SharedPreferences.
+import 'dart:async';
 import 'dart:convert';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:http/http.dart' as http;
@@ -44,8 +45,24 @@ class XttsService implements TtsProvider {
   // Notifies the owner (e.g. chat screen) when playback ends, is stopped, or
   // fails — so per-message "speaking" UI can reset. Set fresh on each speak().
   void Function()? _onComplete;
-  int _speakEpoch = 0;
+
+  // Single generation counter spanning the whole speak/prepare/play
+  // lifecycle, not just playback. stop() bumps it immediately, and speak()
+  // checks it after prepare()'s network round trip returns -- without this,
+  // Stop only discarded audio that was *already playing*; a synthesis
+  // request already in flight when Stop was pressed would still complete
+  // and get handed to speakPrepared() (which stops+re-claims its own epoch
+  // unconditionally), so stale audio could start playing well after the
+  // user stopped it and the mic had re-armed.
+  int _opEpoch = 0;
   bool _isPlaying = false;
+
+  // Signaled by stop() to abort whatever prepare() network call is currently
+  // in flight, raced via Future.any -- without this, Stop only discarded
+  // audio that was already playing; a synthesis request already in flight
+  // would still run to completion (up to its full 45s timeout) before
+  // speak() ever got a chance to check the epoch below.
+  Completer<Never>? _cancelSignal;
 
   @override
   bool get isPlaying => _isPlaying;
@@ -64,7 +81,7 @@ class XttsService implements TtsProvider {
   // and is ignored — prevents the prior speak's onComplete firing after the
   // new speak has registered its own callback.
   void _complete({int? epoch}) {
-    if (epoch != null && epoch != _speakEpoch) return;
+    if (epoch != null && epoch != _opEpoch) return;
     final cb = _onComplete;
     _onComplete = null;
     _isPlaying = false;
@@ -264,15 +281,43 @@ class XttsService implements TtsProvider {
     String text, {
     void Function()? onComplete,
     bool keepActions = false,
+    String? voiceOverride,
   }) async {
+    // Claim this operation's generation *before* the network round trip, not
+    // after -- otherwise a stop() that lands while prepare() is in flight has
+    // nothing to invalidate yet, and the stale audio plays anyway once
+    // prepare() eventually resolves.
+    final epoch = ++_opEpoch;
     final PreparedSpeech? prepared;
     try {
-      prepared = await prepare(text, keepActions: keepActions);
+      prepared = await prepare(
+        text,
+        keepActions: keepActions,
+        voiceOverride: voiceOverride,
+      );
     } catch (e) {
+      if (epoch != _opEpoch) {
+        // stop() closed the in-flight request's client (or a newer speak()
+        // superseded this one) -- an intentional interruption, not a real
+        // failure. Fire onComplete like any other stop so the caller's
+        // "speaking" UI clears, but don't surface an error for it.
+        debugPrint('[XTTS] speak: synthesis aborted by stop()/supersede: $e');
+        onComplete?.call();
+        return;
+      }
       // Reset any "speaking" UI before propagating the failure.
       debugPrint('[XTTS] speak FAILED: $e');
       _complete();
       rethrow;
+    }
+    if (epoch != _opEpoch) {
+      // stop() (or a newer speak()) arrived while synthesis was in flight --
+      // this reply is obsolete, drop it instead of playing it late. Still
+      // fire onComplete (matches "stopped" in the documented contract) so
+      // the caller's "speaking" UI doesn't stay stuck forever.
+      debugPrint('[XTTS] speak: discarding stale synthesis (stopped/superseded)');
+      onComplete?.call();
+      return;
     }
     if (prepared == null) {
       // Nothing to narrate (stage directions only, media-only reply, blocked
@@ -291,6 +336,7 @@ class XttsService implements TtsProvider {
   Future<PreparedSpeech?> prepare(
     String text, {
     bool keepActions = false,
+    String? voiceOverride,
   }) async {
     // Speak the whole cleaned reply (markdown/action-stripped), not just
     // quoted dialog — the full chat text is already sanitized upstream.
@@ -299,7 +345,10 @@ class XttsService implements TtsProvider {
 
     final prefs = await SharedPreferences.getInstance();
     final base = await _baseUrl(prefs);
-    final speaker = prefs.getString(XttsPrefs.speaker) ?? '';
+    final speaker =
+        (voiceOverride?.isNotEmpty ?? false)
+        ? voiceOverride!
+        : prefs.getString(XttsPrefs.speaker) ?? '';
     final language =
         prefs.getString(XttsPrefs.language) ?? XttsPrefs.defaultLanguage;
 
@@ -313,27 +362,38 @@ class XttsService implements TtsProvider {
     );
     await _applySettings(base, prefs);
 
+    // Race the request against stop()'s cancel signal so a Stop press aborts
+    // this prepare() promptly instead of waiting out the full timeout.
+    final cancel = Completer<Never>();
+    _cancelSignal = cancel;
     final sw = Stopwatch()..start();
-    final res = await _http
-        .post(
-          Uri.parse('$base/tts_to_audio/'),
-          headers: const {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'text': spoken,
-            'speaker_wav': speaker,
-            'language': language,
-          }),
-        )
-        .timeout(const Duration(seconds: 45));
-    sw.stop();
-    debugPrint(
-      '[XTTS] POST /tts_to_audio/ -> HTTP ${res.statusCode}, '
-      '${res.bodyBytes.length} bytes in ${sw.elapsedMilliseconds}ms',
-    );
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      throw Exception('XTTS HTTP ${res.statusCode}: ${res.body}');
+    try {
+      final res = await Future.any<http.Response>([
+        _http
+            .post(
+              Uri.parse('$base/tts_to_audio/'),
+              headers: const {'Content-Type': 'application/json'},
+              body: jsonEncode({
+                'text': spoken,
+                'speaker_wav': speaker,
+                'language': language,
+              }),
+            )
+            .timeout(const Duration(seconds: 45)),
+        cancel.future,
+      ]);
+      sw.stop();
+      debugPrint(
+        '[XTTS] POST /tts_to_audio/ -> HTTP ${res.statusCode}, '
+        '${res.bodyBytes.length} bytes in ${sw.elapsedMilliseconds}ms',
+      );
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        throw Exception('XTTS HTTP ${res.statusCode}: ${res.body}');
+      }
+      return PreparedSpeech(res.bodyBytes);
+    } finally {
+      if (identical(_cancelSignal, cancel)) _cancelSignal = null;
     }
-    return PreparedSpeech(res.bodyBytes);
   }
 
   @override
@@ -342,14 +402,14 @@ class XttsService implements TtsProvider {
     void Function()? onComplete,
   }) async {
     await stop();
-    final epoch = ++_speakEpoch;
+    final epoch = ++_opEpoch;
     _onComplete = onComplete;
     _isPlaying = true;
     try {
       await _player.play(
         BytesSource(prepared.bytes, mimeType: prepared.mimeType),
       );
-      if (epoch != _speakEpoch) {
+      if (epoch != _opEpoch) {
         await _player.stop();
         return;
       }
@@ -362,11 +422,14 @@ class XttsService implements TtsProvider {
     }
   }
 
-  /// Stops any in-progress playback and resets "speaking" UI.
+  /// Stops any in-progress playback (or pending synthesis) and resets
+  /// "speaking" UI.
   @override
   Future<void> stop() {
     debugPrint('[XTTS] stop()');
-    final epoch = ++_speakEpoch;
+    final epoch = ++_opEpoch;
+    _cancelSignal?.completeError(const _SynthesisCancelled());
+    _cancelSignal = null;
     _complete(epoch: epoch);
     return _player.stop();
   }
@@ -379,10 +442,23 @@ class XttsService implements TtsProvider {
 
   @override
   void dispose() {
-    _speakEpoch++;
+    _opEpoch++;
+    _cancelSignal?.completeError(const _SynthesisCancelled());
+    _cancelSignal = null;
     _onComplete = null;
     _isPlaying = false;
     _player.dispose();
     _http.close();
   }
+}
+
+/// Thrown into the in-flight [Future.any] race in [XttsService.prepare] when
+/// [XttsService.stop] (or [XttsService.dispose]) fires while a synthesis
+/// request is still pending, so the caller unwinds immediately instead of
+/// waiting out the request's full timeout.
+class _SynthesisCancelled implements Exception {
+  const _SynthesisCancelled();
+
+  @override
+  String toString() => 'XTTS synthesis cancelled by stop()';
 }

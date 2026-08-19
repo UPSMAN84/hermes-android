@@ -48,12 +48,22 @@ dependencies:
   # video_player (hardware-first ExoPlayer, no software fallback) failed on —
   # ComfyUI/WAN outputs regularly hit those formats.
   media_kit: ^1.1.11
-  media_kit_video: ^1.2.5
+  # 2.0.1: only breaking change since 1.2.5 is removing the screen_brightness/
+  # volume_controller dependencies (2.0.0 CHANGELOG) -- unused by this app,
+  # since only Player/VideoController/Video/VideoControllerConfiguration and
+  # NativePlayer.setProperty are used here. Verified via CHANGELOG.md before
+  # bumping, previously left unmerged on chore/media-kit-video-2 pending a
+  # device to confirm playback (that branch predates the real black-screen
+  # root cause fix in chat_screen.dart's _VideoBubbleState -- see there).
+  media_kit_video: ^2.0.1
   media_kit_libs_video: ^1.0.5
   flutter_foreground_task: ^10.0.0
 
   # User-side image attach (gallery picker) for multimodal chat messages
   image_picker: ^1.1.2
+  share_plus: ^13.3.0
+  gal: ^2.3.3
+  flutter_local_notifications: ^22.3.0
 
 dev_dependencies:
   flutter_test:

@@ -100,6 +100,29 @@ class _SessionListScreenState extends State<SessionListScreen> {
     }
   }
 
+  Future<void> _renameSession(Session session) async {
+    final newTitle = await showDialog<String>(
+      context: context,
+      builder: (_) => _RenameSessionDialog(initialTitle: session.title),
+    );
+    if (newTitle == null || newTitle.isEmpty || !mounted) return;
+    if (newTitle == session.title) return;
+
+    try {
+      await _client.renameSession(session.id, newTitle);
+      if (!mounted) return;
+      setState(() {
+        final index = _sessions.indexWhere((s) => s.id == session.id);
+        if (index >= 0) _sessions[index] = session.copyWithTitle(newTitle);
+      });
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not rename session: $e')));
+    }
+  }
+
   Future<void> _deleteSession(Session session) async {
     if (_deletingSessionIds.contains(session.id)) return;
     setState(() => _deletingSessionIds.add(session.id));
@@ -356,7 +379,34 @@ class _SessionListScreenState extends State<SessionListScreen> {
                       height: 20,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : null,
+                  : PopupMenuButton<String>(
+                      tooltip: 'Session options',
+                      onSelected: (choice) {
+                        if (choice == 'rename') {
+                          _renameSession(session);
+                        } else if (choice == 'delete') {
+                          _confirmDeleteSession(session);
+                        }
+                      },
+                      itemBuilder: (context) => const [
+                        PopupMenuItem(
+                          value: 'rename',
+                          child: ListTile(
+                            leading: Icon(Icons.edit_outlined),
+                            title: Text('Rename'),
+                            contentPadding: EdgeInsets.zero,
+                          ),
+                        ),
+                        PopupMenuItem(
+                          value: 'delete',
+                          child: ListTile(
+                            leading: Icon(Icons.delete_outline),
+                            title: Text('Delete'),
+                            contentPadding: EdgeInsets.zero,
+                          ),
+                        ),
+                      ],
+                    ),
               title: Text(
                 session.title,
                 maxLines: 1,
@@ -401,6 +451,59 @@ class _SessionListScreenState extends State<SessionListScreen> {
           );
         },
       ),
+    );
+  }
+}
+
+/// Content of the rename dialog. Owns its TextEditingController as a
+/// StatefulWidget rather than the caller creating/disposing one around
+/// showDialog() -- a dialog Route is still mounted through its exit
+/// transition when the Navigator.pop() await resolves, so disposing right
+/// after that produces "A TextEditingController was used after being
+/// disposed." (hit and fixed the same way in chat_screen.dart's
+/// _EditMessageDialog). Owning it here lets the framework dispose it at the
+/// correct point in this Element's own lifecycle instead.
+class _RenameSessionDialog extends StatefulWidget {
+  final String initialTitle;
+  const _RenameSessionDialog({required this.initialTitle});
+
+  @override
+  State<_RenameSessionDialog> createState() => _RenameSessionDialogState();
+}
+
+class _RenameSessionDialogState extends State<_RenameSessionDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initialTitle);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Rename session'),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        decoration: const InputDecoration(
+          hintText: 'Session title',
+          border: OutlineInputBorder(),
+        ),
+        onSubmitted: (value) => Navigator.pop(context, value.trim()),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _controller.text.trim()),
+          child: const Text('Save'),
+        ),
+      ],
     );
   }
 }

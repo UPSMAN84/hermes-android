@@ -240,18 +240,21 @@ class _CronScreenState extends State<CronScreen> {
     );
     if (result == null || !mounted) return;
 
-    // createJob has no no_agent parameter, so a "script only" job is created
-    // in two round trips: create, then a follow-up flag update. If the first
-    // succeeds and the second fails (or never runs because the id came back
-    // empty), the job already exists server-side -- that must not be reported
-    // as "failed to add" (which reads as nothing happened) or left off the
-    // refreshed list.
-    Map<String, dynamic>? created;
+    // The backend's create endpoint accepts no_agent + script directly
+    // (validated atomically server-side -- no_agent=true with no script
+    // 400s before anything is created), so this is one call. It used to be
+    // create-then-PATCH-the-flag in two round trips: if the create succeeded
+    // and the follow-up flag PATCH failed, an enabled agent-driven job was
+    // left live even though the user asked for "script only" -- and since
+    // the dialog never collected a script path at all, that PATCH was
+    // guaranteed to 400 every time (no_agent requires a script server-side).
     try {
-      created = await _client.createJob(
+      await _client.createJob(
         name: result['name']?.toString() ?? '',
         prompt: result['prompt']?.toString() ?? '',
         schedule: result['schedule']?.toString() ?? '',
+        script: result['script']?.toString(),
+        noAgent: result['no_agent'] == true,
       );
     } catch (e) {
       if (mounted) {
@@ -265,35 +268,12 @@ class _CronScreenState extends State<CronScreen> {
       return;
     }
 
-    String? flagError;
-    if (result['no_agent'] == true) {
-      final jobId =
-          created['id']?.toString() ?? created['job_id']?.toString() ?? '';
-      if (jobId.isNotEmpty) {
-        try {
-          await _client.updateJob(jobId, {'no_agent': true});
-        } catch (e) {
-          flagError = '$e';
-        }
-      } else {
-        flagError = 'server did not return a job id';
-      }
-    }
-
     if (!mounted) return;
     await _loadJobs();
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      flagError == null
-          ? const SnackBar(content: Text('Cron job added'))
-          : SnackBar(
-              content: Text(
-                'Job added, but "script only" flag failed to save: $flagError',
-                style: const TextStyle(color: Colors.black87),
-              ),
-              backgroundColor: Colors.orange,
-            ),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('Cron job added')));
   }
 
   Future<void> _showEditJobDialog(Map<String, dynamic> job) async {
@@ -304,6 +284,7 @@ class _CronScreenState extends State<CronScreen> {
       initialPrompt: job['prompt'] as String? ?? '',
       initialSchedule: _editableSchedule(job),
       initialNoAgent: job['no_agent'] == true,
+      initialScript: job['script'] as String? ?? '',
     );
     if (result == null || !mounted) return;
 
@@ -336,10 +317,12 @@ class _CronScreenState extends State<CronScreen> {
     String initialPrompt = '',
     String initialSchedule = '',
     bool initialNoAgent = false,
+    String initialScript = '',
   }) async {
     final nameCtrl = TextEditingController(text: initialName);
     final promptCtrl = TextEditingController(text: initialPrompt);
     final scheduleCtrl = TextEditingController(text: initialSchedule);
+    final scriptCtrl = TextEditingController(text: initialScript);
     var noAgent = initialNoAgent;
 
     try {
@@ -362,8 +345,8 @@ class _CronScreenState extends State<CronScreen> {
                   const SizedBox(height: 12),
                   TextField(
                     controller: promptCtrl,
-                    decoration: const InputDecoration(
-                      labelText: 'Prompt',
+                    decoration: InputDecoration(
+                      labelText: noAgent ? 'Prompt (optional)' : 'Prompt',
                       hintText: 'What should the agent do?',
                     ),
                     maxLines: 3,
@@ -386,6 +369,16 @@ class _CronScreenState extends State<CronScreen> {
                     ),
                     onChanged: (value) => setDialogState(() => noAgent = value),
                   ),
+                  if (noAgent) ...[
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: scriptCtrl,
+                      decoration: const InputDecoration(
+                        labelText: 'Script path',
+                        hintText: 'Path to the script this job runs',
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -399,14 +392,34 @@ class _CronScreenState extends State<CronScreen> {
                   final name = nameCtrl.text.trim();
                   final prompt = promptCtrl.text.trim();
                   final schedule = scheduleCtrl.text.trim();
+                  final script = scriptCtrl.text.trim();
 
-                  if (name.isEmpty || prompt.isEmpty || schedule.isEmpty) {
+                  if (name.isEmpty || schedule.isEmpty) {
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      const SnackBar(
+                        content: Text('Name and schedule are required'),
+                      ),
+                    );
+                    return;
+                  }
+
+                  // Matches the backend's own validation
+                  // (_validate_dashboard_cron_effective_job): a script-only
+                  // job needs a script path (the prompt is optional there),
+                  // while an agent job needs a prompt.
+                  if (noAgent && script.isEmpty) {
                     ScaffoldMessenger.of(ctx).showSnackBar(
                       const SnackBar(
                         content: Text(
-                          'Name, prompt, and schedule are required',
+                          '"Script only" jobs need a script path',
                         ),
                       ),
+                    );
+                    return;
+                  }
+                  if (!noAgent && prompt.isEmpty) {
+                    ScaffoldMessenger.of(ctx).showSnackBar(
+                      const SnackBar(content: Text('Prompt is required')),
                     );
                     return;
                   }
@@ -431,6 +444,7 @@ class _CronScreenState extends State<CronScreen> {
                     'prompt': prompt,
                     'schedule': schedule,
                     'no_agent': noAgent,
+                    'script': script,
                   });
                 },
                 child: Text(actionLabel),
@@ -443,6 +457,7 @@ class _CronScreenState extends State<CronScreen> {
       nameCtrl.dispose();
       promptCtrl.dispose();
       scheduleCtrl.dispose();
+      scriptCtrl.dispose();
     }
   }
 

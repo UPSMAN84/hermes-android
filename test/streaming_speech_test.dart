@@ -25,6 +25,7 @@ class FakeTts implements TtsProvider {
   Future<PreparedSpeech?> prepare(
     String text, {
     bool keepActions = false,
+    String? voiceOverride,
   }) async {
     prepared.add(text);
     return PreparedSpeech(Uint8List.fromList(utf8.encode(text)));
@@ -45,8 +46,13 @@ class FakeTts implements TtsProvider {
     String text, {
     void Function()? onComplete,
     bool keepActions = false,
+    String? voiceOverride,
   }) async {
-    final p = await prepare(text, keepActions: keepActions);
+    final p = await prepare(
+      text,
+      keepActions: keepActions,
+      voiceOverride: voiceOverride,
+    );
     if (p == null) {
       onComplete?.call();
       return;
@@ -369,11 +375,16 @@ class _ThrowingOnceTts extends FakeTts {
   Future<PreparedSpeech?> prepare(
     String text, {
     bool keepActions = false,
+    String? voiceOverride,
   }) async {
     if (!_thrown) {
       _thrown = true;
       throw Exception('synthesis failed');
     }
-    return super.prepare(text, keepActions: keepActions);
+    return super.prepare(
+      text,
+      keepActions: keepActions,
+      voiceOverride: voiceOverride,
+    );
   }
 }

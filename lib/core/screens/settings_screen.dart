@@ -62,6 +62,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   Future<void> _setTtsProvider(String provider) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(ttsProviderPrefKey, provider);
+    if (!mounted) return;
     setState(() => _ttsProvider = provider);
   }
 
@@ -560,6 +561,7 @@ class _VerboseToggleState extends State<_VerboseToggle> {
   Future<void> _set(bool value) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('verbose_mode', value);
+    if (!mounted) return;
     setState(() => _verbose = value);
   }
 
@@ -593,6 +595,7 @@ class _ThemeToggleState extends State<_ThemeToggle> {
 
   Future<void> _loadMode() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     setState(() => _mode = prefs.getString('theme_mode') ?? 'system');
   }
 
@@ -722,6 +725,7 @@ class _VoicePickerState extends State<_VoicePicker> {
     final prefs = await SharedPreferences.getInstance();
     final normalized = XttsService.normalizeBaseUrl(_urlController.text);
     await prefs.setString(XttsPrefs.baseUrl, normalized);
+    if (!mounted) return;
     _urlController.text = normalized;
     await _load();
   }
@@ -733,6 +737,7 @@ class _VoicePickerState extends State<_VoicePicker> {
     } else {
       await prefs.setString(XttsPrefs.speaker, speaker);
     }
+    if (!mounted) return;
     setState(() => _selectedSpeaker = speaker);
   }
 
@@ -740,6 +745,7 @@ class _VoicePickerState extends State<_VoicePicker> {
     if (language == null) return;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(XttsPrefs.language, language);
+    if (!mounted) return;
     setState(() => _selectedLanguage = language);
   }
 
@@ -877,6 +883,7 @@ class _ComfyUrlFieldState extends State<_ComfyUrlField> {
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     _urlController.text =
         prefs.getString(ComfyUiPrefs.baseUrl) ?? ComfyUiPrefs.defaultBaseUrl;
   }
@@ -885,8 +892,8 @@ class _ComfyUrlFieldState extends State<_ComfyUrlField> {
     final prefs = await SharedPreferences.getInstance();
     final normalized = ComfyUi.normalizeBaseUrl(_urlController.text);
     await prefs.setString(ComfyUiPrefs.baseUrl, normalized);
-    _urlController.text = normalized;
     if (!mounted) return;
+    _urlController.text = normalized;
     setState(() => _saved = true);
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted) setState(() => _saved = false);
@@ -991,6 +998,7 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
       _error = null;
     });
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     _urlController.text = resolveTtsBaseUrl(
       configured: prefs.getString(ChatterboxPrefs.baseUrl) ??
           ChatterboxPrefs.defaultBaseUrl,
@@ -1044,6 +1052,7 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
     final prefs = await SharedPreferences.getInstance();
     final normalized = ChatterboxService.normalizeBaseUrl(_urlController.text);
     await prefs.setString(ChatterboxPrefs.baseUrl, normalized);
+    if (!mounted) return;
     _urlController.text = normalized;
     await _load();
   }
@@ -1051,6 +1060,7 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
   Future<void> _setModel(String model) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(ChatterboxPrefs.model, model);
+    if (!mounted) return;
     setState(() => _model = model);
   }
 
@@ -1061,6 +1071,7 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
     } else {
       await prefs.setString(ChatterboxPrefs.voice, voice);
     }
+    if (!mounted) return;
     setState(() => _selectedVoice = voice);
   }
 
@@ -1415,6 +1426,7 @@ class _TtsParamsCardState extends State<_TtsParamsCard> {
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
     _temp.text = _fmt(prefs.getDouble(XttsPrefs.temperature));
     _lengthPenalty.text = _fmt(prefs.getDouble(XttsPrefs.lengthPenalty));
     _repetitionPenalty.text = _fmt(prefs.getDouble(XttsPrefs.repetitionPenalty));

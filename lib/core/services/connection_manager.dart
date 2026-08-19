@@ -194,6 +194,23 @@ class ApiClient {
     return list.whereType<Map<String, dynamic>>().toList();
   }
 
+  /// Renames a session. The gateway also accepts `pinned`/`archived` on this
+  /// same PATCH endpoint, but only `title` is exposed here -- nothing in the
+  /// app surfaces pin/archive yet.
+  Future<void> renameSession(String sessionId, String title) async {
+    final encodedId = Uri.encodeComponent(sessionId);
+    final res = await _http
+        .patch(
+          Uri.parse('$baseUrl/api/sessions/$encodedId'),
+          headers: _headers,
+          body: jsonEncode({'title': title}),
+        )
+        .timeout(requestTimeout);
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      throw Exception('HTTP ${res.statusCode}: ${res.body}');
+    }
+  }
+
   Future<void> deleteSession(String sessionId) async {
     final encodedId = Uri.encodeComponent(sessionId);
     final res = await _http
@@ -314,7 +331,26 @@ class GatewayChatClient {
   final ApiClient _api;
   final String _baseUrl;
 
-  GatewayChatClient(this._api) : _baseUrl = _api.baseUrl;
+  /// How long the stream may go without producing a single chunk (including
+  /// SSE `: keepalive` comments) before it's treated as stalled. The gateway
+  /// sends a keepalive every 30s when otherwise idle (see
+  /// CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS in gateway/platforms/api_server.py),
+  /// so a healthy stream always produces a chunk well inside this window.
+  static const Duration defaultIdleTimeout = Duration(seconds: 75);
+
+  final Duration idleTimeout;
+
+  /// Bounds how long a single connect attempt waits for response headers.
+  /// Overridable for tests -- production callers should not need to.
+  static const Duration defaultConnectTimeout = Duration(seconds: 15);
+
+  final Duration connectTimeout;
+
+  GatewayChatClient(
+    this._api, {
+    this.idleTimeout = defaultIdleTimeout,
+    this.connectTimeout = defaultConnectTimeout,
+  }) : _baseUrl = _api.baseUrl;
 
   /// Generate a client-side session ID: `mob-<timestamp>-<uuid>`.
   static String generateSessionId() {
@@ -432,6 +468,24 @@ class GatewayChatClient {
     return null;
   }
 
+  /// Extracts an SSE frame's joined `data:` lines the same way
+  /// [parseSseFrame] does, and reports whether it equals [expected] (the
+  /// literal `[DONE]` terminator, for callers that need to know a normal
+  /// finish was seen -- something parseSseFrame itself discards, since it
+  /// returns null for both `[DONE]` and "no usable data" alike).
+  static bool _frameDataIs(String frame, String expected) {
+    final dataLines = <String>[];
+    for (final rawLine in frame.split('\n')) {
+      final line = rawLine.trimRight();
+      if (line.isEmpty || line.startsWith(':')) continue;
+      if (line.startsWith('data:')) {
+        dataLines.add(line.substring(5).trimLeft());
+      }
+    }
+    if (dataLines.isEmpty) return false;
+    return dataLines.join('\n').trim() == expected;
+  }
+
   /// Send a message and stream the assistant response token-by-token.
   Future<void> sendMessageStreaming({
     required String message,
@@ -475,7 +529,6 @@ class GatewayChatClient {
       // neither an exception nor a response, so without this the await below
       // never resolves and neither the retry ladder nor a cancelToken check
       // ever gets a chance to run.
-      const connectTimeout = Duration(seconds: 15);
 
       http.StreamedResponse? response;
       for (var attempt = 1; attempt <= maxConnectAttempts; attempt++) {
@@ -493,6 +546,20 @@ class GatewayChatClient {
         try {
           response = await _api._http.send(request).timeout(connectTimeout);
           break;
+        } on TimeoutException {
+          // Future.timeout() does NOT cancel the underlying send() -- it only
+          // makes this await give up early. The request may already be fully
+          // transmitted and being processed server-side (the gateway handles
+          // streaming before its non-streaming idempotency check), so retrying
+          // here would risk sending a genuine duplicate turn, not just a
+          // duplicate connection attempt. A pre-response timeout is therefore
+          // terminal, unlike a connection-level failure below where the TCP
+          // handshake itself never completed and nothing was sent.
+          onError(
+            'Connection timed out waiting for a response '
+            '(${connectTimeout.inSeconds}s)',
+          );
+          return;
         } catch (e) {
           if (cancelToken?._cancelled == true) {
             onDone();
@@ -523,6 +590,16 @@ class GatewayChatClient {
       }
 
       String buffer = '';
+      // Set once the literal `data: [DONE]` frame is seen -- the gateway's
+      // explicit signal that this turn finished normally (mirrors the OpenAI
+      // streaming convention; confirmed on the live gateway: the final frame
+      // before the socket closes is always `data: [DONE]`). Without this, a
+      // stream that just stops -- a dropped connection, a proxy timeout, any
+      // clean-but-premature socket close -- looks IDENTICAL at the Dart
+      // StreamSubscription level to a normal finish: both fire onDone with no
+      // exception. That silently reported a truncated/interrupted reply as a
+      // full success (spoken, persisted, auto-continued on).
+      var sawDone = false;
       // SSE frames are separated by a blank line. RFC 8895 mandates CRLF but
       // servers (and proxies) frequently emit LF or a mix — accept any.
       final frameDelimiter = RegExp(r'\r?\n\r?\n');
@@ -531,29 +608,66 @@ class GatewayChatClient {
         if (m == null) return false;
         final frame = buffer.substring(0, m.start);
         buffer = buffer.substring(m.end);
+        if (_frameDataIs(frame, '[DONE]')) sawDone = true;
         final token = parseSseFrame(frame, onToolProgress: onToolProgress);
         if (token != null && token.isNotEmpty) onToken(token);
         return true;
       }
 
+      // Bounds a stream that stalls AFTER the connection is established and
+      // bytes have already flowed -- connectTimeout above only covers the
+      // handshake. A middlebox or dead worker that stops sending without
+      // closing the socket produces neither more data nor an error, so
+      // without this the subscription's onDone/onError never fire and the
+      // caller is stuck on "generating" forever. Reset on every raw chunk,
+      // not just parsed tokens, so SSE keepalive comments count as activity.
       final completer = Completer<void>();
       late StreamSubscription<String> sub;
+      Timer? idleTimer;
+      void resetIdleTimer() {
+        idleTimer?.cancel();
+        idleTimer = Timer(idleTimeout, () {
+          sub.cancel();
+          onError('Stream stalled: no data received for ${idleTimeout.inSeconds}s');
+          if (!completer.isCompleted) completer.complete();
+        });
+      }
+
+      resetIdleTimer();
       sub = resp.stream.transform(utf8.decoder).listen(
         (chunk) {
+          resetIdleTimer();
           buffer += chunk;
           while (flushFrame()) {}
         },
         onDone: () {
+          idleTimer?.cancel();
           // Stream ended: flush any final frame whose terminator was lost
           // (some servers close without the trailing blank line).
           if (buffer.trim().isNotEmpty) {
+            if (_frameDataIs(buffer, '[DONE]')) sawDone = true;
             final token = parseSseFrame(buffer, onToolProgress: onToolProgress);
             if (token != null && token.isNotEmpty) onToken(token);
           }
-          onDone();
+          if (sawDone) {
+            onDone();
+          } else {
+            // The socket closed cleanly (no exception -- this is Dart's
+            // StreamSubscription onDone, not onError) but never produced the
+            // gateway's own "this turn finished" signal. Indistinguishable
+            // from a real finish at the transport level, so without sawDone
+            // this silently reported a truncated/interrupted reply as a full
+            // success: spoken via TTS, persisted as-is, and auto-continued on
+            // top of. Routing it through onError instead reuses the existing
+            // interrupted-reply recovery path (chat_screen.dart's
+            // _handleSendError already checks the gateway for a persisted
+            // partial turn and surfaces it correctly).
+            onError('Connection closed before the reply finished');
+          }
           if (!completer.isCompleted) completer.complete();
         },
         onError: (e) {
+          idleTimer?.cancel();
           onError(e.toString());
           if (!completer.isCompleted) completer.complete();
         },
@@ -568,6 +682,7 @@ class GatewayChatClient {
       // gateway/platforms/api_server.py) — the same server-side behavior
       // Telegram's cancel button relies on.
       cancelToken?._bind(() {
+        idleTimer?.cancel();
         sub.cancel();
         onDone();
         if (!completer.isCompleted) completer.complete();
@@ -886,6 +1001,8 @@ class DashboardClient {
     required String schedule,
     String name = '',
     String deliver = 'local',
+    String? script,
+    bool noAgent = false,
   }) => apiPost(
     'cron/jobs',
     body: {
@@ -893,6 +1010,8 @@ class DashboardClient {
       'schedule': schedule,
       'name': name,
       'deliver': deliver,
+      if (script != null && script.isNotEmpty) 'script': script,
+      'no_agent': noAgent,
     },
   );
 

@@ -21,14 +21,16 @@ class _SilentTts implements TtsProvider {
   @override
   bool get isPlaying => false;
   @override
-  Future<PreparedSpeech?> prepare(String text, {bool keepActions = false}) async =>
-      null;
+  Future<PreparedSpeech?> prepare(String text,
+      {bool keepActions = false, String? voiceOverride}) async => null;
   @override
   Future<void> speakPrepared(PreparedSpeech prepared,
       {void Function()? onComplete}) async => onComplete?.call();
   @override
   Future<void> speak(String text,
-      {void Function()? onComplete, bool keepActions = false}) async {
+      {void Function()? onComplete,
+      bool keepActions = false,
+      String? voiceOverride}) async {
     spoken.add(text);
     onComplete?.call();
   }
@@ -99,9 +101,14 @@ class _FakeClient extends http.BaseClient {
       final err = gw.sendError;
       if (err != null) throw err;
       return http.StreamedResponse(
-        Stream.fromIterable(
-          gw.streamFrames.map((f) => utf8.encode(gw._sse(f))),
-        ),
+        Stream.fromIterable([
+          ...gw.streamFrames.map((f) => utf8.encode(gw._sse(f))),
+          // Real completions always close with the literal `[DONE]` frame --
+          // sendMessageStreaming uses its presence to tell a normal finish
+          // apart from a dropped connection, so a fake "successful" stream
+          // without it would be misreported as interrupted.
+          utf8.encode('data: [DONE]\n\n'),
+        ]),
         200,
         request: request,
       );
@@ -390,6 +397,106 @@ void main() {
       await tester.enterText(find.byKey(searchFieldKey), 'searchtoken');
       await tester.pumpAndSettle();
       expect(find.text('none'), findsOneWidget);
+    });
+  });
+
+  group('edit & regenerate (resend as new message, not in-place)', () {
+    testWidgets('regenerate is only offered on the last assistant message',
+        (tester) async {
+      final gw = _FakeGateway(messages: [
+        _FakeGateway.msg('user', 'first question'),
+        _FakeGateway.msg('assistant', 'first answer'),
+        _FakeGateway.msg('user', 'second question'),
+        _FakeGateway.msg('assistant', 'second answer'),
+      ]);
+
+      await tester.pumpWidget(_app(gw, _SilentTts()));
+      await tester.pumpAndSettle();
+
+      expect(
+        find.byTooltip('Ask again (sends as a new message)'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('regenerate re-sends the last user turn as a new message',
+        (tester) async {
+      final gw = _FakeGateway(messages: [
+        _FakeGateway.msg('user', 'tell me a joke'),
+        _FakeGateway.msg('assistant', 'why did the chicken...'),
+      ])
+        ..streamFrames = ['a new joke'];
+
+      await tester.pumpWidget(_app(gw, _SilentTts()));
+      await tester.pumpAndSettle();
+
+      gw.messages = [
+        ...gw.messages,
+        _FakeGateway.msg('user', 'tell me a joke'),
+        _FakeGateway.msg('assistant', 'a new joke'),
+      ];
+      await tester.tap(find.byTooltip('Ask again (sends as a new message)'));
+      await tester.pumpAndSettle();
+
+      expect(gw.sendCount, 1);
+      final body = jsonDecode(gw.sentBodies.single) as Map<String, dynamic>;
+      final sent = (body['messages'] as List).cast<Map<String, dynamic>>();
+      // Only the re-sent turn, not the old reply it's meant to supersede --
+      // there is no server endpoint to remove the old one, so the old
+      // assistant reply stays in the transcript and a second one is appended.
+      expect(sent.single['content'], 'tell me a joke');
+    });
+
+    testWidgets('edit & resend sends the edited text as a new message',
+        (tester) async {
+      final gw = _FakeGateway(messages: [
+        _FakeGateway.msg('user', 'origanl typo'),
+      ])
+        ..streamFrames = ['fixed reply'];
+
+      await tester.pumpWidget(_app(gw, _SilentTts()));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Edit & resend as a new message'));
+      await tester.pumpAndSettle();
+
+      // Pre-filled with the original message's text.
+      expect(find.widgetWithText(TextField, 'origanl typo'), findsOneWidget);
+
+      await tester.enterText(
+        find.widgetWithText(TextField, 'origanl typo'),
+        'original fixed',
+      );
+      gw.messages = [
+        ...gw.messages,
+        _FakeGateway.msg('user', 'original fixed'),
+        _FakeGateway.msg('assistant', 'fixed reply'),
+      ];
+      await tester.tap(find.text('Send'));
+      await tester.pumpAndSettle();
+
+      expect(gw.sendCount, 1);
+      final body = jsonDecode(gw.sentBodies.single) as Map<String, dynamic>;
+      final sent = (body['messages'] as List).cast<Map<String, dynamic>>();
+      expect(sent.single['content'], 'original fixed');
+      // The original (with its typo) is untouched -- edit doesn't rewrite it.
+      expect(find.text('origanl typo'), findsOneWidget);
+    });
+
+    testWidgets('cancelling edit does not send anything', (tester) async {
+      final gw = _FakeGateway(messages: [
+        _FakeGateway.msg('user', 'leave me alone'),
+      ]);
+
+      await tester.pumpWidget(_app(gw, _SilentTts()));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Edit & resend as a new message'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Cancel'));
+      await tester.pumpAndSettle();
+
+      expect(gw.sendCount, 0);
     });
   });
 

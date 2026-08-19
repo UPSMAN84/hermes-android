@@ -14,6 +14,7 @@ import 'package:speech_to_text/speech_to_text.dart';
 import 'call_audio.dart';
 import 'call_route_policy.dart';
 import 'connection_manager.dart';
+import 'foreground_service_lease.dart';
 import 'tts_provider.dart';
 import 'xtts_service.dart';
 import 'async_generation_gate.dart';
@@ -183,7 +184,7 @@ class CallController extends ChangeNotifier {
     }
     await _startForegroundService();
     if (!_lifecycle.isCurrent(lifecycle)) {
-      await FlutterForegroundTask.stopService();
+      await _stopForegroundService();
       await CallAudio.stopCallAudio();
       return;
     }
@@ -272,31 +273,36 @@ class CallController extends ChangeNotifier {
     }
   }
 
-  /// Start the microphone-type foreground service so the call survives
-  /// backgrounding and screen lock. Called after the mic permission is granted
-  /// (speech_to_text.initialize), which Android 14+ requires for a microphone
-  /// foreground service. Best-effort: a failure does not block the call, only
-  /// background persistence.
+  /// True once this controller holds the shared foreground-service lease --
+  /// mirrors ForegroundServiceLease's acquire/release contract so hangUp()/
+  /// dispose() release exactly once per successful acquire, the same
+  /// discipline chat_screen.dart's _backgroundServiceActive uses. Without
+  /// this, an unconditional stopService() call here could kill an
+  /// unrelated overlapping chat background-send's protection (or vice
+  /// versa) -- see ForegroundServiceLease's doc comment.
+  bool _foregroundServiceActive = false;
+
+  /// Acquires the microphone-type foreground service lease so the call
+  /// survives backgrounding and screen lock. Called after the mic permission
+  /// is granted (speech_to_text.initialize), which Android 14+ requires for
+  /// a microphone foreground service. Best-effort: a failure does not block
+  /// the call, only background persistence.
   Future<void> _startForegroundService() async {
-    try {
-      final notifPerm =
-          await FlutterForegroundTask.checkNotificationPermission();
-      if (notifPerm != NotificationPermission.granted) {
-        await FlutterForegroundTask.requestNotificationPermission();
-      }
-      await FlutterForegroundTask.startService(
-        serviceId: 256,
-        notificationTitle: 'Hermes call',
-        notificationText: 'Voice call in progress',
-        serviceTypes: const [
-          ForegroundServiceTypes.microphone,
-          ForegroundServiceTypes.mediaPlayback,
-        ],
-        callback: callTaskStartCallback,
-      );
-    } catch (e) {
-      debugPrint('[Call] foreground service start failed: $e');
-    }
+    _foregroundServiceActive = await ForegroundServiceLease.acquire(
+      notificationTitle: 'Hermes call',
+      notificationText: 'Voice call in progress',
+      serviceTypes: const [
+        ForegroundServiceTypes.microphone,
+        ForegroundServiceTypes.mediaPlayback,
+      ],
+      callback: callTaskStartCallback,
+    );
+  }
+
+  Future<void> _stopForegroundService() async {
+    if (!_foregroundServiceActive) return;
+    _foregroundServiceActive = false;
+    await ForegroundServiceLease.release();
   }
 
   /// Start one listening turn. This front guard is the single gate for
@@ -375,7 +381,11 @@ class CallController extends ChangeNotifier {
   String _lastTranscript = '';
 
   void _onResult(SpeechRecognitionResult result, int epoch) {
-    if (!_active || epoch != _listenEpoch) return;
+    // _muted is redundant with the epoch bump setMuted() now does -- _muted
+    // is only ever set there -- but kept as a direct, obviously-correct
+    // guard rather than relying solely on the epoch invariant holding for
+    // every future path that might touch _muted.
+    if (!_active || _muted || epoch != _listenEpoch) return;
     final text = result.recognizedWords.trim();
     _speechRetryBackoff.reset();
     _listenRetryNotBefore = DateTime.fromMillisecondsSinceEpoch(0);
@@ -564,10 +574,23 @@ class CallController extends ChangeNotifier {
     if (muted) {
       _listenRetryTimer?.cancel();
       _listenRetryTimer = null;
-      _speech.stop();
+      // cancel(), not stop(): speech_to_text's own docs say cancel()
+      // guarantees "there will be no final result returned from the
+      // recognizer", implying (confirmed by reading the package source)
+      // that stop() does NOT make that guarantee -- it still delivers one
+      // more final result asynchronously after returning. That result would
+      // otherwise sail past _onResult's epoch check (unchanged until now)
+      // and get sent to the gateway as if the user hadn't muted at all.
+      // Bumping the epoch and clearing the buffer here is belt-and-braces
+      // on top of that, matching the same pattern _listen() already uses to
+      // invalidate a superseded session.
+      ++_listenEpoch;
+      _lastTranscript = '';
+      _speech.cancel();
     } else {
       _listen();
-    }  }
+    }
+  }
 
   Future<void> toggleSpeaker() async {
     // No-op once the call has ended: flipping isSpeakerphoneOn in MODE_NORMAL
@@ -595,9 +618,7 @@ class CallController extends ChangeNotifier {
     _audioFocusSubscription?.cancel();
     CallAudio.abandonAudioFocus();
     await _restoreAudio();
-    try {
-      await FlutterForegroundTask.stopService();
-    } catch (_) {}
+    await _stopForegroundService();
     try {
       await _speech.stop();
     } catch (_) {}
@@ -657,9 +678,7 @@ class CallController extends ChangeNotifier {
     try {
       _sendCancelToken?.cancel();
     } catch (_) {}
-    try {
-      FlutterForegroundTask.stopService();
-    } catch (_) {}
+    unawaited(_stopForegroundService());
     // Idempotent: skips the native call if hangUp() already restored audio.
     if (!_audioStopped) {
       _audioStopped = true;

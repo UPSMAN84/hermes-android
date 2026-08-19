@@ -13,6 +13,7 @@ import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
 import 'package:speech_to_text/speech_recognition_result.dart';
@@ -21,9 +22,13 @@ import '../models/pending_chat_send.dart';
 import '../services/speech_recognition_coordinator.dart';
 
 import '../services/background_activity_service.dart';
+import '../services/character_voice_prefs.dart';
+import '../services/chatterbox_service.dart';
 import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
 import '../services/media_cache_service.dart';
+import '../services/media_export_service.dart';
+import '../services/reply_notification_service.dart';
 import '../services/tts_provider.dart';
 import '../services/xtts_service.dart';
 import '../utils/responsive.dart';
@@ -634,6 +639,18 @@ class _ChatScreenState extends State<ChatScreen> {
   /// does, so the per-bubble stop/replay icon and the "jump to it" bar reflect
   /// an auto-spoken reply too. Previously only manual replay set it, which
   /// meant the more common path showed no speaking state at all.
+  /// The active character's assigned voice (see CharacterVoicePrefs), or
+  /// null when no character is active or it uses the app-wide default from
+  /// Settings. `_xtts`'s concrete type already reflects whichever backend
+  /// _initTtsProvider swapped in, so checking it directly is always accurate
+  /// to what's actually active -- no separate prefs read needed.
+  Future<String?> _characterVoiceOverride() async {
+    final imagePath = _characterImagePath;
+    if (imagePath == null) return null;
+    final provider = _xtts is ChatterboxService ? 'chatterbox' : 'xtts';
+    return CharacterVoicePrefs.get(imagePath, provider);
+  }
+
   Future<void> _speakAssistantText(
     String text, {
     void Function()? onComplete,
@@ -668,6 +685,7 @@ class _ChatScreenState extends State<ChatScreen> {
         spokenText,
         onComplete: finish,
         keepActions: _characterImagePath != null,
+        voiceOverride: await _characterVoiceOverride(),
       );
     } catch (e) {
       finish();
@@ -686,6 +704,32 @@ class _ChatScreenState extends State<ChatScreen> {
   /// Independent of [_voiceReplyEnabled] — manual replay works even when spoken
   /// replies are off — but requires an XTTS speaker to be configured.
   /// Tapping the message currently speaking stops it (toggle).
+  /// Opens [msg]'s text in an edit dialog; confirming sends the edited text
+  /// as a new message. See _MessageBubble.onEdit's doc comment for why this
+  /// can't replace the original message in place.
+  Future<void> _editAndResend(Map<String, dynamic> msg) async {
+    final original = parseMessageContent(msg['content']).text;
+    final edited = await showDialog<String>(
+      context: context,
+      builder: (_) => _EditMessageDialog(initialText: original),
+    );
+    if (edited == null || edited.isEmpty || !mounted) return;
+    await _sendMessage(textOverride: edited);
+  }
+
+  /// Re-sends the last user turn as a new message, producing a fresh reply
+  /// appended after the current one -- see _MessageBubble.onRegenerate's doc
+  /// comment for why this can't replace the last reply in place.
+  Future<void> _regenerateLastReply() async {
+    final lastUser = _messages.reversed.firstWhere(
+      (m) => (m['role'] as String?) == 'user',
+      orElse: () => const <String, dynamic>{},
+    );
+    final text = parseMessageContent(lastUser['content']).text.trim();
+    if (text.isEmpty) return;
+    await _sendMessage(textOverride: text);
+  }
+
   Future<void> _replayMessage(Map<String, dynamic> msg) async {
     final wasSpeaking = identical(msg, _speakingMessage);
     debugPrint(
@@ -729,6 +773,7 @@ class _ChatScreenState extends State<ChatScreen> {
       await _xtts.speak(
         content,
         keepActions: _characterImagePath != null,
+        voiceOverride: await _characterVoiceOverride(),
         onComplete: () {
           debugPrint('[Replay] playback complete');
           if (mounted) setState(() => _speakingMessage = null);
@@ -1307,6 +1352,29 @@ class _ChatScreenState extends State<ChatScreen> {
           // poll briefly so a freshly generated image doesn't require leaving
           // and reopening the chat to appear.
           _pollForLateMedia();
+          // The foreground service (started unconditionally above, not only
+          // when actually backgrounded) keeps the notification "Waiting for a
+          // reply…" up throughout, then just dismisses it on completion --
+          // nothing tells the user it's actually done if they weren't looking
+          // at the screen. Only worth a notification if they in fact weren't.
+          if (WidgetsBinding.instance.lifecycleState !=
+              AppLifecycleState.resumed) {
+            final lastAssistant = messages.reversed.firstWhere(
+              (m) => m['role'] == 'assistant',
+              orElse: () => const <String, dynamic>{},
+            );
+            final replyText =
+                parseMessageContent(lastAssistant['content']).text.trim();
+            if (replyText.isNotEmpty) {
+              ReplyNotificationService.showReplyReady(
+                widget.session.id,
+                title: 'Hermes replied',
+                preview: replyText.length > 200
+                    ? '${replyText.substring(0, 200)}…'
+                    : replyText,
+              );
+            }
+          }
           if (_awaitingVoiceReply) {
             _awaitingVoiceReply = false;
             final assistant = messages.reversed.firstWhere(
@@ -2128,6 +2196,14 @@ class _ChatScreenState extends State<ChatScreen> {
             metadata: msg,
             isSpeaking: _isSpeakingMessage(msg),
             onReplay: isUser ? null : () => _replayMessage(msg),
+            onEdit: isUser ? () => _editAndResend(msg) : null,
+            // Only the LAST assistant message -- see _MessageBubble.onRegenerate.
+            onRegenerate:
+                !isUser &&
+                    _messages.isNotEmpty &&
+                    identical(msg, _messages.last)
+                ? _regenerateLastReply
+                : null,
             // In a character chat the reply sits directly on the card art:
             // no bubble fill, dialogue in yellow, *narration* in bold black.
             roleplay: _characterImagePath != null,
@@ -2543,6 +2619,59 @@ class _DisplayRows {
   final Map<Key, int> indexByKey;
 }
 
+/// Content of the "Edit & resend" dialog. Owns its TextEditingController as
+/// a StatefulWidget rather than the caller creating and disposing one
+/// around showDialog(): a dialog Route doesn't leave the tree the instant
+/// its Navigator.pop() call returns -- it's still mounted through its exit
+/// transition -- so disposing a controller right after that await produced
+/// "A TextEditingController was used after being disposed." Owning it here
+/// means the framework disposes it at the correct point in the Element's
+/// own lifecycle instead of the caller guessing at the timing.
+class _EditMessageDialog extends StatefulWidget {
+  final String initialText;
+  const _EditMessageDialog({required this.initialText});
+
+  @override
+  State<_EditMessageDialog> createState() => _EditMessageDialogState();
+}
+
+class _EditMessageDialogState extends State<_EditMessageDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initialText);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Edit & resend'),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        maxLines: null,
+        decoration: const InputDecoration(
+          hintText: 'Message text',
+          border: OutlineInputBorder(),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(context, _controller.text.trim()),
+          child: const Text('Send'),
+        ),
+      ],
+    );
+  }
+}
+
 class _MessageBubble extends StatelessWidget {
   final String content;
   final List<String> imageUrls;
@@ -2551,6 +2680,20 @@ class _MessageBubble extends StatelessWidget {
   final Map<String, dynamic> metadata;
   final bool isSpeaking;
   final VoidCallback? onReplay;
+
+  /// User messages only. Opens an edit dialog pre-filled with this message's
+  /// text; confirming sends it as a brand-new message rather than replacing
+  /// this one -- the gateway has no endpoint to delete or truncate persisted
+  /// history (only an append-only /chat and a whole-history-copying /fork),
+  /// so a true in-place edit isn't possible without a gateway change.
+  final VoidCallback? onEdit;
+
+  /// Assistant messages only, and only wired at the call site for the LAST
+  /// message in the transcript (regenerating an older reply would append a
+  /// new one at the bottom, nowhere near the message that triggered it,
+  /// which reads as broken rather than as a regeneration). Re-sends the
+  /// preceding user turn as a new message for the same reason onEdit does.
+  final VoidCallback? onRegenerate;
 
   /// Character-chat styling: the assistant's reply drops its bubble fill so
   /// the card art shows through, with dialogue in yellow and *narration* in
@@ -2565,6 +2708,8 @@ class _MessageBubble extends StatelessWidget {
     this.metadata = const {},
     this.isSpeaking = false,
     this.onReplay,
+    this.onEdit,
+    this.onRegenerate,
     this.roleplay = false,
   });
 
@@ -2748,21 +2893,52 @@ class _MessageBubble extends StatelessWidget {
                     ),
             ),
           ),
-          // Per-message TTS replay (assistant messages only).
-          if (!isUser && onReplay != null)
+          // Per-message actions: TTS replay + regenerate (assistant only),
+          // edit & resend (user only).
+          if (onReplay != null || onRegenerate != null || onEdit != null)
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Align(
-                alignment: Alignment.centerLeft,
-                child: IconButton(
-                  padding: EdgeInsets.zero,
-                  constraints: const BoxConstraints(minWidth: 28, minHeight: 28),
-                  icon: Icon(
-                    isSpeaking ? Icons.stop_rounded : Icons.volume_up_rounded,
-                  ),
-                  tooltip: isSpeaking ? 'Stop' : 'Replay',
-                  color: isDark ? Colors.white54 : Colors.black45,
-                  onPressed: onReplay,
+                alignment:
+                    isUser ? Alignment.centerRight : Alignment.centerLeft,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (!isUser && onReplay != null)
+                      IconButton(
+                        padding: EdgeInsets.zero,
+                        constraints:
+                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        icon: Icon(
+                          isSpeaking
+                              ? Icons.stop_rounded
+                              : Icons.volume_up_rounded,
+                        ),
+                        tooltip: isSpeaking ? 'Stop' : 'Replay',
+                        color: isDark ? Colors.white54 : Colors.black45,
+                        onPressed: onReplay,
+                      ),
+                    if (!isUser && onRegenerate != null)
+                      IconButton(
+                        padding: EdgeInsets.zero,
+                        constraints:
+                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        icon: const Icon(Icons.refresh_rounded),
+                        tooltip: 'Ask again (sends as a new message)',
+                        color: isDark ? Colors.white54 : Colors.black45,
+                        onPressed: onRegenerate,
+                      ),
+                    if (isUser && onEdit != null)
+                      IconButton(
+                        padding: EdgeInsets.zero,
+                        constraints:
+                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        icon: const Icon(Icons.edit_outlined, size: 18),
+                        tooltip: 'Edit & resend as a new message',
+                        color: userTextColor.withValues(alpha: 0.6),
+                        onPressed: onEdit,
+                      ),
+                  ],
                 ),
               ),
             ),
@@ -2874,6 +3050,84 @@ class _MediaRow extends StatelessWidget {
   }
 }
 
+/// Share / save-to-gallery bottom sheet for a generated media bubble.
+/// Re-resolves [url] through MediaCacheService rather than threading a
+/// [File] through bubble state -- cheap once cached, and keeps both
+/// _ImageBubble and _VideoBubble from needing extra fields just for this.
+Future<void> _showMediaActions(
+  BuildContext context,
+  String url, {
+  required bool isVideo,
+}) async {
+  final action = await showModalBottomSheet<String>(
+    context: context,
+    builder: (sheetContext) => SafeArea(
+      child: Wrap(
+        children: [
+          ListTile(
+            leading: const Icon(Icons.ios_share),
+            title: const Text('Share'),
+            onTap: () => Navigator.pop(sheetContext, 'share'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.save_alt),
+            title: const Text('Save to Photos'),
+            onTap: () => Navigator.pop(sheetContext, 'save'),
+          ),
+        ],
+      ),
+    ),
+  );
+  if (action == null || !context.mounted) return;
+
+  final File file;
+  try {
+    file = await MediaCacheService.fileFor(url);
+  } catch (e) {
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not load media: $e')),
+      );
+    }
+    return;
+  }
+  if (!context.mounted) return;
+
+  if (action == 'share') {
+    await MediaExportService.share(file);
+    return;
+  }
+  final error = await MediaExportService.saveToGallery(file, isVideo: isVideo);
+  if (context.mounted) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(error ?? 'Saved to Photos')),
+    );
+  }
+}
+
+/// Small overlay button for [_showMediaActions], shared by _ImageBubble and
+/// _VideoBubble so the two don't each style their own.
+class _MediaActionButton extends StatelessWidget {
+  final VoidCallback onPressed;
+  const _MediaActionButton({required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black45,
+      shape: const CircleBorder(),
+      child: InkWell(
+        customBorder: const CircleBorder(),
+        onTap: onPressed,
+        child: const Padding(
+          padding: EdgeInsets.all(6),
+          child: Icon(Icons.more_vert, color: Colors.white, size: 18),
+        ),
+      ),
+    );
+  }
+}
+
 /// One generated image, resolved through [MediaCacheService] so a reopened
 /// chat reads it off disk instead of re-fetching it from the LAN gateway
 /// every time. Tappable to open full-screen with pinch-zoom.
@@ -2949,22 +3203,34 @@ class _ImageBubbleState extends State<_ImageBubble> {
               ),
             );
           }
-          return GestureDetector(
-            onTap: () => _openFull(context, file),
-            child: Image.file(
-              file,
-              fit: BoxFit.contain,
-              cacheWidth: decodeWidth,
-              errorBuilder: (context, _, _) => const SizedBox(
-                height: 80,
-                child: Center(
-                  child: Text(
-                    'image unavailable',
-                    style: TextStyle(color: Colors.grey),
+          return Stack(
+            children: [
+              GestureDetector(
+                onTap: () => _openFull(context, file),
+                child: Image.file(
+                  file,
+                  fit: BoxFit.contain,
+                  cacheWidth: decodeWidth,
+                  errorBuilder: (context, _, _) => const SizedBox(
+                    height: 80,
+                    child: Center(
+                      child: Text(
+                        'image unavailable',
+                        style: TextStyle(color: Colors.grey),
+                      ),
+                    ),
                   ),
                 ),
               ),
-            ),
+              Positioned(
+                top: 4,
+                right: 4,
+                child: _MediaActionButton(
+                  onPressed: () =>
+                      _showMediaActions(context, widget.url, isVideo: false),
+                ),
+              ),
+            ],
           );
         },
       ),
@@ -3017,9 +3283,32 @@ void ensureMediaKitInitialized() {
   _mediaKitReady = true;
 }
 
+/// media_kit hardcodes `cache-on-disk: yes` for every Player (see
+/// media_kit's native player real.dart) but never sets `cache-dir`, so on
+/// Android mpv has nowhere to put its demuxer cache file and logs
+///   lavf error: Failed to create file cache.
+/// on every open, silently falling back to memory-only buffering -- fine for
+/// short generated clips, but needlessly holds more in memory than intended
+/// for longer ones. getTemporaryDirectory() is async but the path is fixed
+/// for the life of the process, so fetch it once and reuse it.
+Future<String>? _mpvCacheDirFuture;
+Future<String> _mpvCacheDir() =>
+    _mpvCacheDirFuture ??= getTemporaryDirectory().then((d) => d.path);
+
 class _VideoBubbleState extends State<_VideoBubble> {
-  late final Player _player = Player();
-  late final VideoController _videoController = VideoController(_player);
+  // Both are assigned in initState, in this order, BEFORE the first _openSource().
+  //
+  // media_kit starts every Player with `--vid=no` ("to prevent redundant video
+  // decoding"); attaching a VideoController is what flips it to `--vid=auto`.
+  // These were previously `late final` field initializers, so the controller
+  // was not constructed until build() first read it -- which only happens once
+  // _ready is true, i.e. AFTER _player.open() had already run. Every clip was
+  // therefore opened with video decoding switched off, and since generated
+  // ComfyUI/WAN clips carry no audio track either, mpv selected no tracks at
+  // all ("No video or audio streams selected"), leaving width/height null and
+  // the bubble permanently black behind its play button.
+  late final Player _player;
+  late final VideoController _videoController;
   bool _ready = false;
   bool _failed = false;
   bool _playing = false;
@@ -3035,9 +3324,13 @@ class _VideoBubbleState extends State<_VideoBubble> {
   @override
   void initState() {
     super.initState();
-    // Must happen before the first Player is constructed. _player and
-    // _videoController are `late final`, so nothing has touched them yet.
+    // Must happen before the first Player is constructed.
     ensureMediaKitInitialized();
+    _player = Player();
+    // Attach the controller before _openSource() below: this is what sets
+    // `--vid=auto`, and Player.open() awaits an attached controller's
+    // initialization, so the media is opened with video decoding enabled.
+    _videoController = VideoController(_player);
     // Surface real decode/open failures instead of silently spinning forever.
     _subs.add(_player.stream.error.listen((e) {
       debugPrint('[media_kit] video error for ${widget.url}: $e');
@@ -3083,6 +3376,11 @@ class _VideoBubbleState extends State<_VideoBubble> {
         source = file.path;
       } catch (e) {
         debugPrint('[media_kit] cache fetch failed for ${widget.url}: $e');
+      }
+      if (!mounted || epoch != _openEpoch) return;
+      final platform = _player.platform;
+      if (platform is NativePlayer) {
+        await platform.setProperty('cache-dir', await _mpvCacheDir());
       }
       if (!mounted || epoch != _openEpoch) return;
       // Open paused so multiple clips in a transcript don't all autoplay.
@@ -3165,6 +3463,14 @@ class _VideoBubbleState extends State<_VideoBubble> {
               right: 0,
               bottom: 0,
               child: _VideoProgressBar(player: _player),
+            ),
+            Positioned(
+              top: 4,
+              right: 4,
+              child: _MediaActionButton(
+                onPressed: () =>
+                    _showMediaActions(context, widget.url, isVideo: true),
+              ),
             ),
           ],
         ),

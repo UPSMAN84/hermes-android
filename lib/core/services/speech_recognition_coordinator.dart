@@ -59,8 +59,35 @@ class SpeechRecognitionCoordinator {
 
   void release(Object owner) => _router.release(owner);
 
-  Future<bool> initialize() => _initialization ??= speech.initialize(
-        onStatus: _router.dispatchStatus,
-        onError: _router.dispatchError,
-      );
+  /// Concurrent callers within one attempt share the same in-flight Future
+  /// (the whole point of caching), but a FAILED attempt must not stick: the
+  /// underlying plugin's own initialize() only short-circuits on a prior
+  /// *success* (see speech_to_text's _initWorked guard), so it already
+  /// supports being retried after returning false -- e.g. the mic permission
+  /// wasn't granted yet on first launch, then was granted from Settings.
+  /// Caching `false` here forever would silently break voice input for the
+  /// rest of the app process past that point, with no way to recover short
+  /// of a restart.
+  Future<bool> initialize() {
+    final cached = _initialization;
+    if (cached != null) return cached;
+    // Cache the plugin's own Future directly, so callers see its exact
+    // value/error semantics. A second listener below only clears the cache
+    // on failure -- multiple listeners on one Future is normal Dart, so this
+    // doesn't alter what the caller observes.
+    final attempt = speech.initialize(
+      onStatus: _router.dispatchStatus,
+      onError: _router.dispatchError,
+    );
+    _initialization = attempt;
+    attempt.then(
+      (ok) {
+        if (!ok) _initialization = null;
+      },
+      onError: (Object _, StackTrace _) {
+        _initialization = null;
+      },
+    );
+    return attempt;
+  }
 }

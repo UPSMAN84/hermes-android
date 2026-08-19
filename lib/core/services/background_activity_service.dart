@@ -7,8 +7,9 @@
 // Mirrors CallController's identical use of flutter_foreground_task for
 // phone-call-mode; both share the 'hermes_background' notification channel
 // registered once in main.dart's FlutterForegroundTask.init().
-import 'package:flutter/foundation.dart';
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+
+import 'foreground_service_lease.dart';
 
 @pragma('vm:entry-point')
 void backgroundSendTaskStartCallback() {
@@ -29,34 +30,23 @@ class _BackgroundSendTaskHandler extends TaskHandler {
   Future<void> onDestroy(DateTime timestamp, bool isTimeout) async {}
 }
 
-/// Distinct from CallController's serviceId (256) so the two never collide
-/// if somehow both were active at once.
-const int backgroundSendServiceId = 257;
-
-/// Starts the foreground service. Safe to call while already running.
-/// Best-effort: a permission or platform failure is logged and swallowed —
-/// losing the background-keepalive just means the app behaves as it did
-/// before this feature (suspended when backgrounded), not a hard failure.
-Future<void> startBackgroundSendService() async {
-  try {
-    final notifPerm = await FlutterForegroundTask.checkNotificationPermission();
-    if (notifPerm != NotificationPermission.granted) {
-      await FlutterForegroundTask.requestNotificationPermission();
-    }
-    await FlutterForegroundTask.startService(
-      serviceId: backgroundSendServiceId,
-      notificationTitle: 'Hermes',
-      notificationText: 'Waiting for a reply…',
-      serviceTypes: const [ForegroundServiceTypes.dataSync],
-      callback: backgroundSendTaskStartCallback,
-    );
-  } catch (e) {
-    debugPrint('[BackgroundSend] foreground service start failed: $e');
-  }
+/// Acquires the shared foreground-service lease (see ForegroundServiceLease)
+/// so a chat send and phone-call mode can safely overlap without one killing
+/// the other's background protection. Returns true if background protection
+/// is actually in effect -- callers should only consider themselves
+/// protected (e.g. set a local "service active" flag) when this is true, and
+/// must call [stopBackgroundSendService] exactly once for every call here
+/// that returned true, matching the lease's acquire/release contract.
+/// Best-effort: a permission or platform failure just means the app behaves
+/// as it did before this feature (suspended when backgrounded), not a hard
+/// failure of the send itself.
+Future<bool> startBackgroundSendService() {
+  return ForegroundServiceLease.acquire(
+    notificationTitle: 'Hermes',
+    notificationText: 'Waiting for a reply…',
+    serviceTypes: const [ForegroundServiceTypes.dataSync],
+    callback: backgroundSendTaskStartCallback,
+  );
 }
 
-Future<void> stopBackgroundSendService() async {
-  try {
-    await FlutterForegroundTask.stopService();
-  } catch (_) {}
-}
+Future<void> stopBackgroundSendService() => ForegroundServiceLease.release();

@@ -2,8 +2,13 @@
 // pops with the chosen CharacterSummary; the caller loads the persona and
 // starts a fresh chat (see ChatScreen._pickCharacter).
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
+import '../services/character_voice_prefs.dart';
+import '../services/chatterbox_service.dart';
 import '../services/connection_manager.dart';
+import '../services/tts_provider.dart';
+import '../services/xtts_service.dart';
 import '../widgets/cached_media_thumbnail.dart';
 
 class CharacterPickerScreen extends StatefulWidget {
@@ -57,6 +62,94 @@ class _CharacterPickerScreenState extends State<CharacterPickerScreen> {
         _loading = false;
       });
     }
+  }
+
+  /// Assigns (or clears) a voice for [character], distinct from the app-wide
+  /// XTTS/Chatterbox voice in Settings. Fetches the speaker/voice list from
+  /// whichever backend is currently active in Settings -- the override is
+  /// only meaningful for that backend, since XTTS speaker filenames and
+  /// Chatterbox voice filenames are different sets (see CharacterVoicePrefs).
+  Future<void> _setCharacterVoice(CharacterSummary character) async {
+    final prefs = await SharedPreferences.getInstance();
+    final provider = prefs.getString(ttsProviderPrefKey) ?? 'xtts';
+    final current = await CharacterVoicePrefs.get(
+      character.primaryImage,
+      provider,
+    );
+    if (!mounted) return;
+
+    List<String> voices;
+    try {
+      if (provider == 'chatterbox') {
+        final svc = ChatterboxService(fallbackHost: widget.connection.host);
+        voices = await svc.getVoices();
+        svc.dispose();
+      } else {
+        final svc = XttsService(fallbackHost: widget.connection.host);
+        voices = await svc.getSpeakers();
+        svc.dispose();
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not load voices: $e')));
+      return;
+    }
+    if (!mounted) return;
+
+    // '' is the "use the app-wide default" sentinel, distinct from null
+    // (dialog dismissed / no change).
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (dialogContext) => SimpleDialog(
+        title: Text('Voice for ${character.name}'),
+        children: [
+          SimpleDialogOption(
+            onPressed: () => Navigator.pop(dialogContext, ''),
+            child: Row(
+              children: [
+                SizedBox(
+                  width: 24,
+                  child: current == null ? const Icon(Icons.check, size: 18) : null,
+                ),
+                const Text('Use app default'),
+              ],
+            ),
+          ),
+          for (final v in voices)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(dialogContext, v),
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: 24,
+                    child: current == v ? const Icon(Icons.check, size: 18) : null,
+                  ),
+                  Expanded(child: Text(v, overflow: TextOverflow.ellipsis)),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+    if (selected == null || !mounted) return;
+
+    await CharacterVoicePrefs.set(
+      character.primaryImage,
+      provider,
+      selected.isEmpty ? null : selected,
+    );
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          selected.isEmpty
+              ? 'Voice cleared for ${character.name}'
+              : 'Voice set for ${character.name}',
+        ),
+      ),
+    );
   }
 
   List<CharacterSummary> get _visible {
@@ -176,6 +269,7 @@ class _CharacterPickerScreenState extends State<CharacterPickerScreen> {
         character: visible[i],
         client: _client,
         onTap: () => Navigator.pop(context, visible[i]),
+        onSetVoice: () => _setCharacterVoice(visible[i]),
       ),
     );
   }
@@ -185,11 +279,13 @@ class _CharacterTile extends StatelessWidget {
   final CharacterSummary character;
   final ApiClient client;
   final VoidCallback onTap;
+  final VoidCallback onSetVoice;
 
   const _CharacterTile({
     required this.character,
     required this.client,
     required this.onTap,
+    required this.onSetVoice,
   });
 
   @override
@@ -203,18 +299,44 @@ class _CharacterTile extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
             Expanded(
-              child: IgnorePointer(
-                // The tile owns the tap; the thumbnail's own tap-to-zoom
-                // would otherwise swallow it and open a viewer instead of
-                // selecting the character.
-                child: CachedMediaThumbnail(
-                  url: client.characterImageUrl(character.primaryImage),
-                  headers: client.authHeaders,
-                  // Cards are full-res PNGs (up to 6MB / ~25MB decoded);
-                  // decode at roughly tile width so a 70-card grid doesn't
-                  // exhaust memory.
-                  decodeWidth: 400,
-                ),
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    child: IgnorePointer(
+                      // The tile owns the tap; the thumbnail's own tap-to-zoom
+                      // would otherwise swallow it and open a viewer instead of
+                      // selecting the character.
+                      child: CachedMediaThumbnail(
+                        url: client.characterImageUrl(character.primaryImage),
+                        headers: client.authHeaders,
+                        // Cards are full-res PNGs (up to 6MB / ~25MB decoded);
+                        // decode at roughly tile width so a 70-card grid
+                        // doesn't exhaust memory.
+                        decodeWidth: 400,
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    top: 4,
+                    right: 4,
+                    child: Material(
+                      color: Colors.black45,
+                      shape: const CircleBorder(),
+                      child: InkWell(
+                        customBorder: const CircleBorder(),
+                        onTap: onSetVoice,
+                        child: const Padding(
+                          padding: EdgeInsets.all(6),
+                          child: Icon(
+                            Icons.record_voice_over_outlined,
+                            color: Colors.white,
+                            size: 18,
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ),
             Padding(

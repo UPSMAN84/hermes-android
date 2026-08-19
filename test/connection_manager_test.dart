@@ -19,7 +19,11 @@ String? _header(http.BaseRequest request, String name) {
 
 /// Fake client for exercising [GatewayChatClient.sendMessageStreaming]'s
 /// connect retry ladder: throws on the first [failCount] calls to `send`,
-/// then returns an empty-but-successful streamed response.
+/// then returns a streamed response ending in the gateway's own `[DONE]`
+/// terminator -- a bare empty stream isn't a realistic "successful" SSE
+/// response (a real one always closes with `data: [DONE]`), and would
+/// actually be treated as an interrupted connection by the completion
+/// detection in sendMessageStreaming.
 class _CountingFailThenSucceedClient extends http.BaseClient {
   _CountingFailThenSucceedClient(this.failCount);
   final int failCount;
@@ -31,7 +35,26 @@ class _CountingFailThenSucceedClient extends http.BaseClient {
     if (sendCount <= failCount) {
       throw Exception('connection reset');
     }
-    return http.StreamedResponse(const Stream<List<int>>.empty(), 200);
+    return http.StreamedResponse(
+      Stream.value(utf8.encode('data: [DONE]\n\n')),
+      200,
+    );
+  }
+
+  @override
+  void close() {}
+}
+
+/// Never completes send() -- models a stalled handshake (weak wifi, VPN
+/// hiccup, a middlebox eating packets without RST) that produces neither a
+/// response nor an exception, only a timeout.
+class _NeverRespondingClient extends http.BaseClient {
+  int sendCount = 0;
+
+  @override
+  Future<http.StreamedResponse> send(http.BaseRequest request) {
+    sendCount++;
+    return Completer<http.StreamedResponse>().future;
   }
 
   @override
@@ -319,6 +342,42 @@ void main() {
       await client.deleteSession('mob-absent');
       client.close();
     });
+
+    test('renameSession PATCHes the new title', () async {
+      final client = ApiClient(
+        baseUrl: 'http://hermes.local:8642',
+        apiKey: 'valid-key',
+        httpClient: MockClient((request) async {
+          expect(request.method, 'PATCH');
+          expect(request.url.path, '/api/sessions/mob-123');
+          expect(request.headers['authorization'], 'Bearer valid-key');
+          expect(jsonDecode(request.body), {'title': 'A better title'});
+          return http.Response(
+            '{"object":"hermes.session","session":{"id":"mob-123"}}',
+            200,
+          );
+        }),
+      );
+
+      await client.renameSession('mob-123', 'A better title');
+      client.close();
+    });
+
+    test('renameSession throws on a server error', () async {
+      final client = ApiClient(
+        baseUrl: 'http://hermes.local:8642',
+        apiKey: 'valid-key',
+        httpClient: MockClient((request) async {
+          return http.Response('server error', 500);
+        }),
+      );
+
+      expect(
+        () => client.renameSession('mob-123', 'New title'),
+        throwsA(anything),
+      );
+      client.close();
+    });
   });
 
   group('GatewayChatClient', () {
@@ -408,6 +467,41 @@ void main() {
     );
 
     test(
+      'sendMessageStreaming does NOT retry after a connect timeout -- the '
+      'request may already have reached the server, so a second POST risks '
+      'a duplicate turn',
+      () async {
+        // Never completes: exercises the case Future.timeout() times out
+        // rather than the request throwing outright.
+        final hangingClient = _NeverRespondingClient();
+        final api = ApiClient(
+          baseUrl: 'http://example.test',
+          apiKey: 'k',
+          httpClient: hangingClient,
+        );
+        String? errorMsg;
+        var doneCalled = false;
+
+        await GatewayChatClient(
+          api,
+          connectTimeout: const Duration(milliseconds: 20),
+        ).sendMessageStreaming(
+          message: 'hi',
+          sessionId: 'sess1',
+          onToken: (_) {},
+          onDone: () => doneCalled = true,
+          onError: (e) => errorMsg = e,
+        );
+
+        // Exactly one attempt -- not maxConnectAttempts (4) -- proves the
+        // timeout path doesn't fall into the connect-failure retry ladder.
+        expect(hangingClient.sendCount, 1);
+        expect(errorMsg, contains('timed out'));
+        expect(doneCalled, isFalse);
+      },
+    );
+
+    test(
       'sendMessageStreaming bails out immediately if already cancelled, '
       'without sending a request',
       () async {
@@ -433,9 +527,184 @@ void main() {
         expect(doneCalled, isTrue);
       },
     );
+
+    test(
+      'sendMessageStreaming reports an error if the stream stalls after '
+      'the first chunk, instead of hanging forever',
+      () async {
+        // Emits one token frame, then never sends another chunk and never
+        // closes -- the exact shape of a middlebox/dead-worker stall where
+        // the socket stays open but produces nothing.
+        final controller = StreamController<List<int>>();
+        controller.add(
+          utf8.encode('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'),
+        );
+        final client = MockClient.streaming((request, bodyStream) async {
+          return http.StreamedResponse(controller.stream, 200);
+        });
+        final api = ApiClient(
+          baseUrl: 'http://example.test',
+          apiKey: 'k',
+          httpClient: client,
+        );
+
+        final tokens = <String>[];
+        var doneCalled = false;
+        String? errorMsg;
+
+        await GatewayChatClient(
+          api,
+          idleTimeout: const Duration(milliseconds: 50),
+        ).sendMessageStreaming(
+          message: 'hi',
+          sessionId: 'sess1',
+          onToken: tokens.add,
+          onDone: () => doneCalled = true,
+          onError: (e) => errorMsg = e,
+        );
+
+        expect(tokens, ['hi']);
+        expect(errorMsg, contains('stalled'));
+        expect(doneCalled, isFalse);
+        await controller.close();
+      },
+    );
+
+    test(
+      'a stream that closes cleanly without [DONE] is reported as an '
+      'error, not silently treated as a successful finish',
+      () async {
+        // Some tokens stream, then the socket just closes -- no exception,
+        // no `data: [DONE]` frame. Indistinguishable from a real finish at
+        // the transport level (both are a clean StreamSubscription onDone);
+        // only the missing [DONE] marks this as a truncated reply.
+        final client = MockClient.streaming((request, bodyStream) async {
+          return http.StreamedResponse(
+            Stream.fromIterable([
+              utf8.encode('data: {"choices":[{"delta":{"content":"par"}}]}\n\n'),
+              utf8.encode('data: {"choices":[{"delta":{"content":"tial"}}]}\n\n'),
+            ]),
+            200,
+          );
+        });
+        final api = ApiClient(
+          baseUrl: 'http://example.test',
+          apiKey: 'k',
+          httpClient: client,
+        );
+
+        final tokens = <String>[];
+        var doneCalled = false;
+        String? errorMsg;
+
+        await GatewayChatClient(api).sendMessageStreaming(
+          message: 'hi',
+          sessionId: 'sess1',
+          onToken: tokens.add,
+          onDone: () => doneCalled = true,
+          onError: (e) => errorMsg = e,
+        );
+
+        expect(tokens, ['par', 'tial']);
+        expect(errorMsg, contains('closed before the reply finished'));
+        expect(doneCalled, isFalse);
+      },
+    );
+
+    test(
+      'a stream that closes with [DONE] is reported as a normal success',
+      () async {
+        final client = MockClient.streaming((request, bodyStream) async {
+          return http.StreamedResponse(
+            Stream.fromIterable([
+              utf8.encode('data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'),
+              utf8.encode('data: [DONE]\n\n'),
+            ]),
+            200,
+          );
+        });
+        final api = ApiClient(
+          baseUrl: 'http://example.test',
+          apiKey: 'k',
+          httpClient: client,
+        );
+
+        final tokens = <String>[];
+        var doneCalled = false;
+        String? errorMsg;
+
+        await GatewayChatClient(api).sendMessageStreaming(
+          message: 'hi',
+          sessionId: 'sess1',
+          onToken: tokens.add,
+          onDone: () => doneCalled = true,
+          onError: (e) => errorMsg = e,
+        );
+
+        expect(tokens, ['ok']);
+        expect(doneCalled, isTrue);
+        expect(errorMsg, isNull);
+      },
+    );
   });
 
   group('DashboardClient', () {
+    test(
+      'createJob sends no_agent and script in the same create request '
+      '(atomic, not a follow-up PATCH)',
+      () async {
+        Map<String, dynamic>? sentBody;
+        final client = DashboardClient(
+          host: 'hermes.local',
+          port: 8642,
+          proxied: true,
+          httpClient: MockClient((request) async {
+            expect(request.method, 'POST');
+            expect(request.url.path, '/api/cron/jobs');
+            sentBody = jsonDecode(request.body) as Map<String, dynamic>;
+            return http.Response('{"id": "job1"}', 200);
+          }),
+        );
+
+        await client.createJob(
+          name: 'Backup',
+          prompt: '',
+          schedule: '0 9 * * *',
+          script: 'backup.py',
+          noAgent: true,
+        );
+
+        expect(sentBody, isNotNull);
+        expect(sentBody!['no_agent'], isTrue);
+        expect(sentBody!['script'], 'backup.py');
+        client.close();
+      },
+    );
+
+    test('createJob omits script when not given', () async {
+      Map<String, dynamic>? sentBody;
+      final client = DashboardClient(
+        host: 'hermes.local',
+        port: 8642,
+        proxied: true,
+        httpClient: MockClient((request) async {
+          sentBody = jsonDecode(request.body) as Map<String, dynamic>;
+          return http.Response('{"id": "job2"}', 200);
+        }),
+      );
+
+      await client.createJob(
+        name: 'Reminder',
+        prompt: 'Remind me to stretch',
+        schedule: 'every 2h',
+      );
+
+      expect(sentBody, isNotNull);
+      expect(sentBody!.containsKey('script'), isFalse);
+      expect(sentBody!['no_agent'], isFalse);
+      client.close();
+    });
+
     test('wraps cron job updates for dashboard endpoint', () {
       final updates = {'name': 'Daily', 'no_agent': true};
 

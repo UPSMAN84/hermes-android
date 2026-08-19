@@ -1,11 +1,17 @@
-// Memory browser screen — read memory entries from Hermes config.
+// Memory status screen — surfaces which memory backend is active and what
+// it holds, via the gateway's memory-status endpoint.
 //
-// Memory entries live in config.yaml under the 'memory' key as a list:
-//   memory:
-//     - target: user
-//       content: "User name..."
-//
-// API: GET /api/config returns the full config including memory.
+// API: GET /api/memory returns:
+//   {
+//     "active": "<provider name, or "" for the built-in file-based memory>",
+//     "providers": [{name, description, available, configured, status, setup}, ...],
+//     "builtin_files": {"memory": <bytes>, "user": <bytes>}
+//   }
+// There is no endpoint that returns memory *content* (individual facts) --
+// the gateway only exposes status/config, not a list of entries. An earlier
+// version of this screen expected `entries`/`memory` list keys that this
+// endpoint has never returned, so a valid 200 response always rendered as
+// "no memory entries" regardless of what was actually stored.
 import 'package:flutter/material.dart';
 import '../services/connection_manager.dart';
 
@@ -19,10 +25,11 @@ class MemoryScreen extends StatefulWidget {
 
 class _MemoryScreenState extends State<MemoryScreen> {
   late DashboardClient _client;
-  List<Map<String, dynamic>> _entries = [];
+  String _active = '';
+  Map<String, int> _builtinFiles = {};
+  List<Map<String, dynamic>> _providers = [];
   bool _loading = true;
   String? _error;
-  String? _source; // 'config' or 'api'
 
   @override
   void initState() {
@@ -52,55 +59,24 @@ class _MemoryScreenState extends State<MemoryScreen> {
     });
 
     try {
-      // Try dedicated /api/memory endpoint first. A successful call (even
-      // with zero entries) is authoritative -- only an actual failure (the
-      // endpoint doesn't exist on this server) should fall through to the
-      // /api/config heuristic below.
-      try {
-        final memData = await _client.apiGet('memory');
-        if (!mounted) return;
-        final items =
-            memData['entries'] as List? ?? memData['memory'] as List? ?? [];
-        setState(() {
-          _entries = items.whereType<Map<String, dynamic>>().toList();
-          _source = 'api';
-          _loading = false;
-        });
-        return;
-      } catch (_) {
-        // Endpoint not available — fall through to config
-      }
-
-      // Fallback: read memory from /api/config
-      final config = await _client.apiGet('config');
+      final data = await _client.apiGet('memory');
       if (!mounted) return;
-      final mem = config['memory'];
-
-      if (mem is List) {
-        // Memory is a list of {target, content}
-        setState(() {
-          _entries = mem.whereType<Map<String, dynamic>>().toList();
-          _source = 'config';
-          _loading = false;
-        });
-      } else if (mem is Map) {
-        // Memory is a map {key: value}
-        final items = <Map<String, dynamic>>[];
-        mem.forEach((key, value) {
-          items.add({'target': key, 'content': value.toString()});
-        });
-        setState(() {
-          _entries = items;
-          _source = 'config';
-          _loading = false;
-        });
-      } else {
-        setState(() {
-          _entries = [];
-          _source = 'config';
-          _loading = false;
-        });
-      }
+      final providers = (data['providers'] as List?)
+              ?.whereType<Map<String, dynamic>>()
+              .toList() ??
+          <Map<String, dynamic>>[];
+      final builtinRaw = data['builtin_files'];
+      final builtinFiles = <String, int>{
+        if (builtinRaw is Map)
+          for (final entry in builtinRaw.entries)
+            entry.key.toString(): (entry.value as num?)?.toInt() ?? 0,
+      };
+      setState(() {
+        _active = (data['active'] as String?)?.trim() ?? '';
+        _providers = providers;
+        _builtinFiles = builtinFiles;
+        _loading = false;
+      });
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -114,20 +90,7 @@ class _MemoryScreenState extends State<MemoryScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            const Text('Memory'),
-            if (_source != null)
-              Text(
-                'Source: $_source',
-                style: TextStyle(
-                  fontSize: 11,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
-              ),
-          ],
-        ),
+        title: const Text('Memory'),
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
@@ -137,6 +100,26 @@ class _MemoryScreenState extends State<MemoryScreen> {
       ),
       body: _buildBody(),
     );
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+  }
+
+  Color _statusColor(String status) {
+    switch (status) {
+      case 'ready':
+        return Colors.green;
+      case 'needs_config':
+        return Colors.orange;
+      case 'unavailable':
+      case 'missing':
+        return Colors.grey;
+      default:
+        return Colors.grey;
+    }
   }
 
   Widget _buildBody() {
@@ -174,75 +157,78 @@ class _MemoryScreenState extends State<MemoryScreen> {
       );
     }
 
-    if (_entries.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.psychology, size: 48, color: Colors.grey),
-            const SizedBox(height: 16),
-            Text(
-              'No memory entries',
-              style: Theme.of(context).textTheme.titleLarge,
-            ),
-            const SizedBox(height: 8),
-            Text(
-              'Memory entries are cross-session facts the agent remembers.\n'
-              'They are configured in ~/.hermes/config.yaml',
-              textAlign: TextAlign.center,
-              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                color: Theme.of(context).colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
     return RefreshIndicator(
       onRefresh: _loadMemory,
-      child: ListView.builder(
+      child: ListView(
         padding: const EdgeInsets.all(16),
-        itemCount: _entries.length,
-        itemBuilder: (context, index) {
-          final entry = _entries[index];
-          final target = entry['target'] as String? ?? 'memory';
-          final content = entry['content'] as String? ?? '';
-
-          return Card(
+        children: [
+          Card(
             margin: const EdgeInsets.only(bottom: 8),
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Row(
-                    children: [
-                      Chip(
-                        label: Text(
-                          target,
-                          // Explicit white: the chip's backgroundColor below is
-                          // always a dark shade800, but the label's default
-                          // color follows the ambient theme (near-black in
-                          // light mode) rather than auto-contrasting against a
-                          // manually-set background — dark-on-dark otherwise.
-                          style: const TextStyle(fontSize: 11, color: Colors.white),
-                        ),
-                        padding: EdgeInsets.zero,
-                        visualDensity: VisualDensity.compact,
-                        backgroundColor: target == 'user'
-                            ? Colors.blue.shade800
-                            : Colors.grey.shade800,
-                      ),
-                    ],
+                  Text(
+                    'Active backend',
+                    style: Theme.of(context).textTheme.labelMedium,
                   ),
-                  const SizedBox(height: 8),
-                  Text(content, style: Theme.of(context).textTheme.bodyMedium),
+                  const SizedBox(height: 4),
+                  Text(
+                    _active.isEmpty ? 'Built-in (file-based)' : _active,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
+                  if (_active.isEmpty) ...[
+                    const SizedBox(height: 12),
+                    Text(
+                      'MEMORY.md: ${_formatBytes(_builtinFiles['memory'] ?? 0)}',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    Text(
+                      'USER.md: ${_formatBytes(_builtinFiles['user'] ?? 0)}',
+                      style: Theme.of(context).textTheme.bodyMedium,
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Stored under ~/.hermes/memories/. Content isn\'t '
+                      'browsable from here -- this shows size only.',
+                      style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
                 ],
               ),
             ),
-          );
-        },
+          ),
+          if (_providers.isNotEmpty) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 8),
+              child: Text(
+                'Available providers',
+                style: Theme.of(context).textTheme.labelMedium,
+              ),
+            ),
+            for (final provider in _providers)
+              Card(
+                margin: const EdgeInsets.only(bottom: 8),
+                child: ListTile(
+                  title: Text(provider['name']?.toString() ?? ''),
+                  subtitle: Text(provider['description']?.toString() ?? ''),
+                  trailing: Chip(
+                    label: Text(
+                      provider['status']?.toString() ?? 'unknown',
+                      style: const TextStyle(fontSize: 11, color: Colors.white),
+                    ),
+                    padding: EdgeInsets.zero,
+                    visualDensity: VisualDensity.compact,
+                    backgroundColor:
+                        _statusColor(provider['status']?.toString() ?? ''),
+                  ),
+                ),
+              ),
+          ],
+        ],
       ),
     );
   }

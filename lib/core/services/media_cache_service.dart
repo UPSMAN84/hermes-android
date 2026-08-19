@@ -66,6 +66,15 @@ class MediaCacheService {
     return '${_hash(url)}$suffix';
   }
 
+  /// In-flight fetches, keyed by cache key. Two widgets referencing the same
+  /// URL (a thumbnail and its full view, a clip appearing twice in one
+  /// transcript) can both call [fileFor] before either has written to disk;
+  /// without this, both pass the exists()-check-miss above and both write to
+  /// the identical `<key>.tmp` path concurrently, racing each other's write
+  /// and rename. Coalescing to one shared Future makes every concurrent
+  /// caller for the same URL await a single fetch instead.
+  static final Map<String, Future<File>> _inflight = {};
+
   /// Returns a local [File] holding [url]'s bytes — served from disk if
   /// already downloaded, fetched and saved otherwise. Throws on a network
   /// failure with nothing cached yet (callers show their own error state).
@@ -74,9 +83,23 @@ class MediaCacheService {
   /// images are behind the same Bearer token as every other API route;
   /// ComfyUI's /view is not). Headers are NOT part of the cache key — the
   /// same URL is the same bytes regardless of who asked.
-  static Future<File> fileFor(String url, {Map<String, String>? headers}) async {
+  static Future<File> fileFor(String url, {Map<String, String>? headers}) {
+    final key = _keyFor(url);
+    final existing = _inflight[key];
+    if (existing != null) return existing;
+    final future = _fetch(url, key, headers);
+    _inflight[key] = future;
+    future.whenComplete(() => _inflight.remove(key));
+    return future;
+  }
+
+  static Future<File> _fetch(
+    String url,
+    String key,
+    Map<String, String>? headers,
+  ) async {
     final dir = await _cacheDir();
-    final file = File('${dir.path}/${_keyFor(url)}');
+    final file = File('${dir.path}/$key');
     if (await file.exists() && await file.length() > 0) {
       // Bound staleness: ComfyUI's output counters (TG_00084_.png) restart
       // when its output dir is cleared, so a reused filename would otherwise

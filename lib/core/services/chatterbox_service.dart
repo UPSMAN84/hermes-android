@@ -4,6 +4,7 @@
 // form to POST /tts; the server returns a WAV we play locally with
 // audioplayers. Voice + language + generation params persist in
 // SharedPreferences (see [ChatterboxPrefs]).
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:audioplayers/audioplayers.dart';
@@ -62,8 +63,17 @@ class ChatterboxService implements TtsProvider {
   // Completion callback (same contract as XttsService): fires once on natural
   // end, stop, or failure so "speaking" UI can reset.
   void Function()? _onComplete;
-  int _speakEpoch = 0;
+
+  // Single generation counter spanning the whole speak/prepare/play
+  // lifecycle -- see XttsService's matching field for the full rationale
+  // (stop() must invalidate synthesis that's still in flight, not just
+  // playback that's already started).
+  int _opEpoch = 0;
   bool _isPlaying = false;
+
+  // Signaled by stop() to abort a pending prepare() network call -- see
+  // XttsService's matching field for the full rationale.
+  Completer<Never>? _cancelSignal;
 
   @override
   bool get isPlaying => _isPlaying;
@@ -80,7 +90,7 @@ class ChatterboxService implements TtsProvider {
   // complete() is from a prior session and is ignored — prevents the prior
   // speak's onComplete firing after the new speak has registered its own.
   void _complete({int? epoch}) {
-    if (epoch != null && epoch != _speakEpoch) return;
+    if (epoch != null && epoch != _opEpoch) return;
     final cb = _onComplete;
     _onComplete = null;
     _isPlaying = false;
@@ -132,14 +142,40 @@ class ChatterboxService implements TtsProvider {
     String text, {
     void Function()? onComplete,
     bool keepActions = false,
+    String? voiceOverride,
   }) async {
+    // Claim this operation's generation *before* the network round trip --
+    // see XttsService.speak for the full rationale.
+    final epoch = ++_opEpoch;
     final PreparedSpeech? prepared;
     try {
-      prepared = await prepare(text, keepActions: keepActions);
+      prepared = await prepare(
+        text,
+        keepActions: keepActions,
+        voiceOverride: voiceOverride,
+      );
     } catch (e) {
+      if (epoch != _opEpoch) {
+        // stop() closed the in-flight request's client (or a newer speak()
+        // superseded this one) -- an intentional interruption, not a real
+        // failure. Fire onComplete like any other stop so the caller's
+        // "speaking" UI clears, but don't surface an error for it.
+        debugPrint('[Chatterbox] speak: synthesis aborted by stop()/supersede: $e');
+        onComplete?.call();
+        return;
+      }
       debugPrint('[Chatterbox] speak FAILED: $e');
       _complete();
       rethrow;
+    }
+    if (epoch != _opEpoch) {
+      // stop() (or a newer speak()) arrived while synthesis was in flight --
+      // this reply is obsolete, drop it instead of playing it late. Still
+      // fire onComplete (matches "stopped" in the documented contract) so
+      // the caller's "speaking" UI doesn't stay stuck forever.
+      debugPrint('[Chatterbox] speak: discarding stale synthesis (stopped/superseded)');
+      onComplete?.call();
+      return;
     }
     if (prepared == null) {
       // Nothing to narrate (stage directions only, media-only reply, blocked
@@ -158,6 +194,7 @@ class ChatterboxService implements TtsProvider {
   Future<PreparedSpeech?> prepare(
     String text, {
     bool keepActions = false,
+    String? voiceOverride,
   }) async {
     // Reuse the XTTS text cleaning, but speak the whole cleaned reply — not
     // just quoted dialog.
@@ -166,7 +203,10 @@ class ChatterboxService implements TtsProvider {
 
     final prefs = await SharedPreferences.getInstance();
     final base = await _baseUrl(prefs);
-    final voice = prefs.getString(ChatterboxPrefs.voice) ?? '';
+    final voice =
+        (voiceOverride?.isNotEmpty ?? false)
+        ? voiceOverride!
+        : prefs.getString(ChatterboxPrefs.voice) ?? '';
     final language =
         prefs.getString(ChatterboxPrefs.languageId) ??
             ChatterboxPrefs.defaultLanguage;
@@ -215,20 +255,30 @@ class ChatterboxService implements TtsProvider {
     }
     if (voice.isNotEmpty) request.fields['voice'] = voice;
 
-    final streamed = await request.send().timeout(const Duration(seconds: 45));
-    final bytes = await streamed.stream.toBytes().timeout(
-      const Duration(seconds: 45),
-    );
-    debugPrint(
-      '[Chatterbox] POST /tts -> HTTP ${streamed.statusCode}, '
-      '${bytes.length} bytes',
-    );
-    if (streamed.statusCode < 200 || streamed.statusCode >= 300) {
-      throw Exception(
-        'Chatterbox HTTP ${streamed.statusCode}: ${String.fromCharCodes(bytes)}',
-      );
+    // Race the request against stop()'s cancel signal so a Stop press aborts
+    // this prepare() promptly instead of waiting out the full timeout.
+    final cancel = Completer<Never>();
+    _cancelSignal = cancel;
+    try {
+      final (statusCode, bytes) = await Future.any<(int, Uint8List)>([
+        _sendMultipart(request),
+        cancel.future,
+      ]);
+      debugPrint('[Chatterbox] POST /tts -> HTTP $statusCode, ${bytes.length} bytes');
+      if (statusCode < 200 || statusCode >= 300) {
+        throw Exception('Chatterbox HTTP $statusCode: ${String.fromCharCodes(bytes)}');
+      }
+      return PreparedSpeech(bytes);
+    } finally {
+      if (identical(_cancelSignal, cancel)) _cancelSignal = null;
     }
-    return PreparedSpeech(Uint8List.fromList(bytes));
+  }
+
+  /// Sends [request] on the shared client and collects the full body.
+  Future<(int, Uint8List)> _sendMultipart(http.MultipartRequest request) async {
+    final streamed = await _http.send(request).timeout(const Duration(seconds: 45));
+    final bytes = await streamed.stream.toBytes().timeout(const Duration(seconds: 45));
+    return (streamed.statusCode, Uint8List.fromList(bytes));
   }
 
   @override
@@ -237,14 +287,14 @@ class ChatterboxService implements TtsProvider {
     void Function()? onComplete,
   }) async {
     await stop();
-    final epoch = ++_speakEpoch;
+    final epoch = ++_opEpoch;
     _onComplete = onComplete;
     _isPlaying = true;
     try {
       await _player.play(
         BytesSource(prepared.bytes, mimeType: prepared.mimeType),
       );
-      if (epoch != _speakEpoch) {
+      if (epoch != _opEpoch) {
         await _player.stop();
         return;
       }
@@ -260,7 +310,9 @@ class ChatterboxService implements TtsProvider {
   @override
   Future<void> stop() {
     debugPrint('[Chatterbox] stop()');
-    final epoch = ++_speakEpoch;
+    final epoch = ++_opEpoch;
+    _cancelSignal?.completeError(const _SynthesisCancelled());
+    _cancelSignal = null;
     _complete(epoch: epoch);
     return _player.stop();
   }
@@ -273,10 +325,23 @@ class ChatterboxService implements TtsProvider {
 
   @override
   void dispose() {
-    _speakEpoch++;
+    _opEpoch++;
+    _cancelSignal?.completeError(const _SynthesisCancelled());
+    _cancelSignal = null;
     _onComplete = null;
     _isPlaying = false;
     _player.dispose();
     _http.close();
   }
+}
+
+/// Thrown into the in-flight [Future.any] race in [ChatterboxService.prepare]
+/// when [ChatterboxService.stop] (or [ChatterboxService.dispose]) fires while
+/// a synthesis request is still pending, so the caller unwinds immediately
+/// instead of waiting out the request's full timeout.
+class _SynthesisCancelled implements Exception {
+  const _SynthesisCancelled();
+
+  @override
+  String toString() => 'Chatterbox synthesis cancelled by stop()';
 }
