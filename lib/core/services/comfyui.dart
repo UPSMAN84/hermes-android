@@ -5,6 +5,8 @@
 // *path* embedded in a tool-result string. ComfyUI already serves those files
 // over HTTP at GET /view?filename=<name>&type=output, so we extract the
 // filename from the tool content and build a fetchable URL the app renders.
+import 'dart:io';
+
 import '../models/comfy_workflow.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -86,5 +88,44 @@ class ComfyUi {
     return ComfyEndpoint.parse(
       normalizeBaseUrl(baseUrl),
     ).viewUri(ComfyOutputRef(filename: filename, type: type)).toString();
+  }
+
+  /// True when [baseUri] is plain HTTP to a host whose network scope the app
+  /// cannot prove is private, so the settings screen must require explicit
+  /// acknowledgement before saving it as the ComfyUI endpoint. HTTPS is
+  /// always exempt. A literal loopback, RFC1918, RFC4193, link-local, or
+  /// Tailscale/CGNAT (100.64.0.0/10) address is exempt; every other
+  /// plain-HTTP host requires acknowledgement -- including a Tailscale
+  /// *hostname* (e.g. `foo.tailnet.ts.net`), since a string can't be proven
+  /// private the way a literal address in a reserved range can.
+  static bool requiresPlainHttpWarning(Uri baseUri) {
+    if (baseUri.scheme != 'http') return false;
+    final host = baseUri.host;
+    final address = InternetAddress.tryParse(host);
+    if (address == null) return host.toLowerCase() != 'localhost';
+    if (address.isLoopback) return false;
+    return switch (address.type) {
+      InternetAddressType.IPv4 => !_isExemptIPv4(address.rawAddress),
+      InternetAddressType.IPv6 => !_isExemptIPv6(address.rawAddress),
+      _ => true,
+    };
+  }
+
+  static bool _isExemptIPv4(List<int> octets) {
+    final a = octets[0];
+    final b = octets[1];
+    if (a == 10) return true; // RFC1918 10.0.0.0/8
+    if (a == 172 && b >= 16 && b <= 31) return true; // RFC1918 172.16.0.0/12
+    if (a == 192 && b == 168) return true; // RFC1918 192.168.0.0/16
+    if (a == 169 && b == 254) return true; // link-local 169.254.0.0/16
+    if (a == 100 && b >= 64 && b <= 127) return true; // CGNAT/Tailscale
+    return false;
+  }
+
+  static bool _isExemptIPv6(List<int> bytes) {
+    final first = bytes[0];
+    if (first & 0xfe == 0xfc) return true; // RFC4193 fc00::/7
+    if (first == 0xfe && (bytes[1] & 0xc0) == 0x80) return true; // fe80::/10
+    return false;
   }
 }

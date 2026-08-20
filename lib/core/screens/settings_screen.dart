@@ -1,10 +1,15 @@
 // Settings screen for model selection, theme toggle, and app info.
 import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../models/comfy_workflow.dart';
 import '../services/connection_manager.dart';
 import '../services/chatterbox_service.dart';
 import '../services/comfyui.dart';
+import '../services/comfyui_client.dart';
+import '../services/generation_repository.dart';
+import '../services/generation_repository_host.dart';
 import '../services/tts_provider.dart';
+import '../services/workflow_document_port.dart';
 import '../services/xtts_service.dart';
 import '../services/tts_url.dart';
 import '../../main.dart';
@@ -359,8 +364,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
         // TTS engine selector.
         Card(
           child: Padding(
-            padding:
-                const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
             child: Row(
               children: [
                 const Text('TTS engine'),
@@ -376,7 +380,9 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   items: const [
                     DropdownMenuItem(value: 'xtts', child: Text('XTTS-v2')),
                     DropdownMenuItem(
-                        value: 'chatterbox', child: Text('Chatterbox')),
+                      value: 'chatterbox',
+                      child: Text('Chatterbox'),
+                    ),
                   ],
                   onChanged: (v) {
                     if (v != null) _setTtsProvider(v);
@@ -401,7 +407,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
 
         // ---- Section: Media ----
         _buildSectionHeader('Media'),
-        _ComfyUrlField(),
+        const ComfyEndpointSettings(),
         const SizedBox(height: 16),
 
         // ---- Section: Connection ----
@@ -528,7 +534,9 @@ class _AboutCardState extends State<_AboutCard> {
             Text(
               'Browse and manage your Hermes Agent sessions from your phone. '
               'Connects to a Hermes dashboard running on your local network.',
-              style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant),
+              style: TextStyle(
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
             ),
           ],
         ),
@@ -683,7 +691,8 @@ class _VoicePickerState extends State<_VoicePicker> {
 
     final prefs = await SharedPreferences.getInstance();
     _urlController.text = resolveTtsBaseUrl(
-      configured: prefs.getString(XttsPrefs.baseUrl) ?? XttsPrefs.defaultBaseUrl,
+      configured:
+          prefs.getString(XttsPrefs.baseUrl) ?? XttsPrefs.defaultBaseUrl,
       fallbackHost: widget.fallbackHost,
       defaultPort: 8020,
     );
@@ -701,8 +710,7 @@ class _VoicePickerState extends State<_VoicePicker> {
         _speakers = results[0];
         _languages = results[1];
         // Drop a stale saved speaker that the server no longer offers.
-        if (_selectedSpeaker != null &&
-            !_speakers.contains(_selectedSpeaker)) {
+        if (_selectedSpeaker != null && !_speakers.contains(_selectedSpeaker)) {
           _selectedSpeaker = null;
         }
         if (!_languages.contains(_selectedLanguage) && _languages.isNotEmpty) {
@@ -843,9 +851,7 @@ class _VoicePickerState extends State<_VoicePicker> {
                   ),
                 ),
                 items: _languages
-                    .map(
-                      (l) => DropdownMenuItem(value: l, child: Text(l)),
-                    )
+                    .map((l) => DropdownMenuItem(value: l, child: Text(l)))
                     .toList(),
                 onChanged: _setLanguage,
               ),
@@ -857,17 +863,41 @@ class _VoicePickerState extends State<_VoicePicker> {
   }
 }
 
+enum _ConnectionTestState { unknown, testing, connected, failed }
+
 /// ComfyUI server URL — the app fetches generated images from its /view
-/// endpoint. Defaults to the local bind; override with a LAN/Tailscale address
-/// reachable from the phone.
-class _ComfyUrlField extends StatefulWidget {
+/// endpoint and submits generation jobs through it. Unconfigured (no saved
+/// value, or the unreachable wildcard placeholder) leaves Create disabled;
+/// this field is strict where the old free-text field was permissive: it
+/// rejects anything that isn't a parseable HTTP(S) endpoint instead of
+/// silently normalizing it, and requires explicit acknowledgement before
+/// saving a plain-HTTP address whose network scope isn't provably private.
+class ComfyEndpointSettings extends StatefulWidget {
+  const ComfyEndpointSettings({
+    super.key,
+    this.clientFactory = const DefaultComfyUiClientFactory(),
+    this.launcher = const UrlLauncherExternalUriLauncher(),
+    this.clipboard = const ClipboardUriPort(),
+  });
+
+  final ComfyUiClientFactory clientFactory;
+  final ExternalUriLauncher launcher;
+  final UriClipboardPort clipboard;
+
   @override
-  State<_ComfyUrlField> createState() => _ComfyUrlFieldState();
+  State<ComfyEndpointSettings> createState() => _ComfyEndpointSettingsState();
 }
 
-class _ComfyUrlFieldState extends State<_ComfyUrlField> {
+class _ComfyEndpointSettingsState extends State<ComfyEndpointSettings> {
   final TextEditingController _urlController = TextEditingController();
+  String? _savedUrl;
+  String? _error;
+  bool _needsAcknowledgement = false;
+  bool _acknowledged = false;
   bool _saved = false;
+  _ConnectionTestState _connection = _ConnectionTestState.unknown;
+  String? _connectionInfo;
+  String? _connectionError;
 
   @override
   void initState() {
@@ -883,21 +913,119 @@ class _ComfyUrlFieldState extends State<_ComfyUrlField> {
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
+    final endpoint = await ComfyUiPrefs.loadConfiguredEndpoint(prefs);
     if (!mounted) return;
-    _urlController.text =
-        prefs.getString(ComfyUiPrefs.baseUrl) ?? ComfyUiPrefs.defaultBaseUrl;
+    setState(() {
+      _savedUrl = endpoint?.baseUri.toString();
+      _urlController.text = _savedUrl ?? '';
+    });
+  }
+
+  void _onFieldChanged(String _) {
+    setState(() {
+      _error = null;
+      _saved = false;
+      _connection = _ConnectionTestState.unknown;
+      _connectionInfo = null;
+      _connectionError = null;
+      try {
+        final raw = _urlController.text.trim();
+        final endpoint = raw.isEmpty ? null : ComfyEndpoint.parse(raw);
+        _needsAcknowledgement =
+            endpoint != null &&
+            ComfyUi.requiresPlainHttpWarning(endpoint.baseUri);
+        if (!_needsAcknowledgement) _acknowledged = false;
+      } on FormatException {
+        _needsAcknowledgement = false;
+      }
+    });
+  }
+
+  ComfyEndpoint? _parseOrShowError() {
+    final raw = _urlController.text.trim();
+    try {
+      return ComfyEndpoint.parse(raw);
+    } on FormatException {
+      setState(
+        () => _error =
+            'Enter a valid HTTP or HTTPS ComfyUI address, e.g. '
+            'http://192.168.1.50:8188.',
+      );
+      return null;
+    }
   }
 
   Future<void> _save() async {
+    final endpoint = _parseOrShowError();
+    if (endpoint == null) return;
+    if (ComfyUi.requiresPlainHttpWarning(endpoint.baseUri) && !_acknowledged) {
+      setState(() {
+        _needsAcknowledgement = true;
+        _error =
+            'Acknowledge that this address may not be private before '
+            'saving.';
+      });
+      return;
+    }
     final prefs = await SharedPreferences.getInstance();
-    final normalized = ComfyUi.normalizeBaseUrl(_urlController.text);
+    final normalized = endpoint.baseUri.toString();
     await prefs.setString(ComfyUiPrefs.baseUrl, normalized);
     if (!mounted) return;
-    _urlController.text = normalized;
-    setState(() => _saved = true);
+    setState(() {
+      _savedUrl = normalized;
+      _urlController.text = normalized;
+      _error = null;
+      _saved = true;
+    });
     Future.delayed(const Duration(seconds: 2), () {
       if (mounted) setState(() => _saved = false);
     });
+  }
+
+  Future<void> _testConnection() async {
+    final endpoint = _parseOrShowError();
+    if (endpoint == null) return;
+    setState(() {
+      _error = null;
+      _connection = _ConnectionTestState.testing;
+      _connectionInfo = null;
+      _connectionError = null;
+    });
+    final client = widget.clientFactory.create(
+      endpoint: endpoint,
+      clientId: 'settings-test-connection',
+    );
+    try {
+      final info = await client.checkConnection();
+      if (!mounted) return;
+      setState(() {
+        _connection = _ConnectionTestState.connected;
+        _connectionInfo = _describeConnection(info);
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _connection = _ConnectionTestState.failed;
+        _connectionError = _describeConnectionError(error);
+      });
+    } finally {
+      client.close();
+    }
+  }
+
+  Future<void> _openFrontend() async {
+    final endpoint = _parseOrShowError();
+    if (endpoint == null) return;
+    final uri = endpoint.baseUri;
+    final opened = await widget.launcher.open(uri);
+    if (opened) return;
+    await widget.clipboard.copy(uri);
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('No browser available — address copied instead.'),
+      ),
+    );
   }
 
   @override
@@ -905,37 +1033,127 @@ class _ComfyUrlFieldState extends State<_ComfyUrlField> {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(16),
-        child: Row(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Expanded(
-              child: TextField(
-                controller: _urlController,
-                decoration: const InputDecoration(
-                  labelText: 'ComfyUI server URL',
-                  hintText: 'http://0.0.0.0:8188',
-                  border: OutlineInputBorder(),
-                  contentPadding: EdgeInsets.symmetric(
-                    horizontal: 12,
-                    vertical: 10,
-                  ),
-                  isDense: true,
+            Text(
+              _savedUrl == null
+                  ? 'ComfyUI is not configured'
+                  : 'Configured: $_savedUrl',
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              key: const Key('comfy-endpoint'),
+              controller: _urlController,
+              decoration: const InputDecoration(
+                labelText: 'ComfyUI server URL',
+                hintText: 'http://192.168.1.50:8188',
+                border: OutlineInputBorder(),
+                contentPadding: EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
                 ),
-                keyboardType: TextInputType.url,
-                autocorrect: false,
-                onSubmitted: (_) => _save(),
+                isDense: true,
               ),
+              keyboardType: TextInputType.url,
+              autocorrect: false,
+              onChanged: _onFieldChanged,
+              onSubmitted: (_) => _save(),
             ),
-            const SizedBox(width: 8),
-            FilledButton.icon(
-              onPressed: _save,
-              icon: Icon(_saved ? Icons.check : Icons.save),
-              label: Text(_saved ? 'Saved' : 'Save'),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _error!,
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
+            if (_needsAcknowledgement) ...[
+              const SizedBox(height: 8),
+              CheckboxListTile(
+                key: const Key('comfy-plain-http-ack'),
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                controlAffinity: ListTileControlAffinity.leading,
+                value: _acknowledged,
+                onChanged: (value) =>
+                    setState(() => _acknowledged = value ?? false),
+                title: const Text(
+                  'This is plain HTTP to an address I cannot prove is '
+                  'private (not loopback, LAN, Tailscale, or a VPN). '
+                  'I understand traffic may be visible on the network.',
+                ),
+              ),
+            ],
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: _save,
+                  icon: Icon(_saved ? Icons.check : Icons.save),
+                  label: Text(_saved ? 'Saved' : 'Save'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _connection == _ConnectionTestState.testing
+                      ? null
+                      : _testConnection,
+                  icon: _connection == _ConnectionTestState.testing
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.wifi_tethering),
+                  label: const Text('Test connection'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _openFrontend,
+                  icon: const Icon(Icons.open_in_new),
+                  label: const Text('Open ComfyUI'),
+                ),
+              ],
             ),
+            if (_connection == _ConnectionTestState.connected) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Connected — ${_connectionInfo ?? 'ComfyUI reachable'}',
+                style: const TextStyle(color: Colors.green),
+              ),
+            ] else if (_connection == _ConnectionTestState.failed) ...[
+              const SizedBox(height: 8),
+              Text(
+                'Connection failed: ${_connectionError ?? 'unknown error'}',
+                style: TextStyle(color: Theme.of(context).colorScheme.error),
+              ),
+            ],
           ],
         ),
       ),
     );
   }
+}
+
+String _describeConnection(ComfyConnectionInfo info) {
+  final system = info.systemStats['system'];
+  final version = system is Map ? system['comfyui_version'] : null;
+  final devices = info.systemStats['devices'];
+  final deviceCount = devices is List ? devices.length : null;
+  return [
+    if (version is String) 'ComfyUI $version',
+    if (deviceCount != null) '$deviceCount device(s)',
+  ].join(' · ');
+}
+
+String _describeConnectionError(Object error) {
+  if (error is ComfyApiException) {
+    final status = error.statusCode == null
+        ? ''
+        : ' (HTTP ${error.statusCode})';
+    return '${error.message}$status';
+  }
+  return error.toString();
 }
 
 /// Chatterbox backend settings: server URL, voice (filename from the server's
@@ -1000,24 +1218,26 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
     final prefs = await SharedPreferences.getInstance();
     if (!mounted) return;
     _urlController.text = resolveTtsBaseUrl(
-      configured: prefs.getString(ChatterboxPrefs.baseUrl) ??
+      configured:
+          prefs.getString(ChatterboxPrefs.baseUrl) ??
           ChatterboxPrefs.defaultBaseUrl,
       fallbackHost: widget.fallbackHost,
       defaultPort: 8420,
     );
-    _model = prefs.getString(ChatterboxPrefs.model) ??
-        ChatterboxPrefs.defaultModel;
+    _model =
+        prefs.getString(ChatterboxPrefs.model) ?? ChatterboxPrefs.defaultModel;
     _selectedVoice = prefs.getString(ChatterboxPrefs.voice);
-    _langController.text = prefs.getString(ChatterboxPrefs.languageId) ??
+    _langController.text =
+        prefs.getString(ChatterboxPrefs.languageId) ??
         ChatterboxPrefs.defaultLanguage;
     final cfg = prefs.getDouble(ChatterboxPrefs.cfgWeight);
-    _cfgController.text =
-        (cfg ?? ChatterboxPrefs.defaultCfgWeight).toString();
+    _cfgController.text = (cfg ?? ChatterboxPrefs.defaultCfgWeight).toString();
     final exag = prefs.getDouble(ChatterboxPrefs.exaggeration);
-    _exagController.text =
-        (exag ?? ChatterboxPrefs.defaultExaggeration).toString();
-    final repetitionPenalty =
-        prefs.getDouble(ChatterboxPrefs.repetitionPenalty);
+    _exagController.text = (exag ?? ChatterboxPrefs.defaultExaggeration)
+        .toString();
+    final repetitionPenalty = prefs.getDouble(
+      ChatterboxPrefs.repetitionPenalty,
+    );
     _repetitionPenaltyController.text =
         (repetitionPenalty ?? ChatterboxPrefs.defaultRepetitionPenalty)
             .toString();
@@ -1032,8 +1252,9 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
     _topKController.text = (topK ?? ChatterboxPrefs.defaultTopK).toString();
 
     try {
-      _voices =
-          await _chatterbox.getVoices(baseUrlOverride: _urlController.text);
+      _voices = await _chatterbox.getVoices(
+        baseUrlOverride: _urlController.text,
+      );
       if (!mounted) return;
       if (_selectedVoice != null && !_voices.contains(_selectedVoice)) {
         _selectedVoice = null;
@@ -1113,7 +1334,9 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
     }
 
     final prefs = await SharedPreferences.getInstance();
-    if (lang.isNotEmpty) await prefs.setString(ChatterboxPrefs.languageId, lang);
+    if (lang.isNotEmpty) {
+      await prefs.setString(ChatterboxPrefs.languageId, lang);
+    }
     if (cfg != null) await prefs.setDouble(ChatterboxPrefs.cfgWeight, cfg);
     if (exag != null) await prefs.setDouble(ChatterboxPrefs.exaggeration, exag);
     if (repetitionPenalty != null) {
@@ -1184,10 +1407,11 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                 border: OutlineInputBorder(),
               ),
               items: const [
+                DropdownMenuItem(value: 'v3', child: Text('V3 (multilingual)')),
                 DropdownMenuItem(
-                    value: 'v3', child: Text('V3 (multilingual)')),
-                DropdownMenuItem(
-                    value: 'turbo', child: Text('Turbo (English only)')),
+                  value: 'turbo',
+                  child: Text('Turbo (English only)'),
+                ),
               ],
               onChanged: (v) {
                 if (v != null) _setModel(v);
@@ -1256,7 +1480,8 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                           isDense: true,
                         ),
                         keyboardType: const TextInputType.numberWithOptions(
-                            decimal: true),
+                          decimal: true,
+                        ),
                         onSubmitted: (_) => _saveParams(),
                       ),
                     ),
@@ -1271,7 +1496,8 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                           isDense: true,
                         ),
                         keyboardType: const TextInputType.numberWithOptions(
-                            decimal: true),
+                          decimal: true,
+                        ),
                         onSubmitted: (_) => _saveParams(),
                       ),
                     ),
@@ -1294,7 +1520,8 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                           isDense: true,
                         ),
                         keyboardType: const TextInputType.numberWithOptions(
-                            decimal: true),
+                          decimal: true,
+                        ),
                         onSubmitted: (_) => _saveParams(),
                       ),
                     ),
@@ -1309,7 +1536,8 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                           isDense: true,
                         ),
                         keyboardType: const TextInputType.numberWithOptions(
-                            decimal: true),
+                          decimal: true,
+                        ),
                         onSubmitted: (_) => _saveParams(),
                       ),
                     ),
@@ -1328,7 +1556,8 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                           isDense: true,
                         ),
                         keyboardType: const TextInputType.numberWithOptions(
-                            decimal: true),
+                          decimal: true,
+                        ),
                         onSubmitted: (_) => _saveParams(),
                       ),
                     ),
@@ -1343,7 +1572,8 @@ class _ChatterboxPickerState extends State<_ChatterboxPicker> {
                           isDense: true,
                         ),
                         keyboardType: const TextInputType.numberWithOptions(
-                            decimal: true),
+                          decimal: true,
+                        ),
                         onSubmitted: (_) => _saveParams(),
                       ),
                     ),
@@ -1429,7 +1659,9 @@ class _TtsParamsCardState extends State<_TtsParamsCard> {
     if (!mounted) return;
     _temp.text = _fmt(prefs.getDouble(XttsPrefs.temperature));
     _lengthPenalty.text = _fmt(prefs.getDouble(XttsPrefs.lengthPenalty));
-    _repetitionPenalty.text = _fmt(prefs.getDouble(XttsPrefs.repetitionPenalty));
+    _repetitionPenalty.text = _fmt(
+      prefs.getDouble(XttsPrefs.repetitionPenalty),
+    );
     _topP.text = _fmt(prefs.getDouble(XttsPrefs.topP));
     _topK.text = prefs.getInt(XttsPrefs.topK)?.toString() ?? '';
     if (mounted) setState(() {});
@@ -1449,7 +1681,9 @@ class _TtsParamsCardState extends State<_TtsParamsCard> {
     final lp = d(_lengthPenalty.text);
     final rp = d(_repetitionPenalty.text);
     final tp = d(_topP.text);
-    final tk = _topK.text.trim().isEmpty ? null : int.tryParse(_topK.text.trim());
+    final tk = _topK.text.trim().isEmpty
+        ? null
+        : int.tryParse(_topK.text.trim());
 
     // Validate: non-empty but unparseable is an error.
     final bad = [
@@ -1502,7 +1736,10 @@ class _TtsParamsCardState extends State<_TtsParamsCard> {
           labelText: label,
           hintText: hint,
           border: const OutlineInputBorder(),
-          contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 10,
+            vertical: 8,
+          ),
           isDense: true,
         ),
         keyboardType: const TextInputType.numberWithOptions(decimal: true),

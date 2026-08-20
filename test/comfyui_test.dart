@@ -116,4 +116,61 @@ void main() {
       );
     }
   });
+
+  group('ComfyUi.requiresPlainHttpWarning', () {
+    test('HTTPS never requires acknowledgement', () {
+      expect(
+        ComfyUi.requiresPlainHttpWarning(Uri.parse('https://203.0.113.9:8188')),
+        isFalse,
+      );
+    });
+
+    test('exempts loopback, RFC1918, RFC4193, link-local, and CGNAT', () {
+      for (final host in [
+        '127.0.0.1',
+        'localhost',
+        '::1',
+        '10.1.2.3',
+        '172.16.0.1',
+        '172.31.255.255',
+        '192.168.1.50',
+        '169.254.1.1',
+        '100.64.0.1',
+        '100.127.255.255',
+        'fc00::1',
+        'fd12:3456:789a::1',
+        'fe80::1',
+      ]) {
+        expect(
+          ComfyUi.requiresPlainHttpWarning(_httpUri(host)),
+          isFalse,
+          reason: host,
+        );
+      }
+    });
+
+    test(
+      'requires acknowledgement for public addresses and unproven hostnames',
+      () {
+        for (final host in [
+          '203.0.113.9',
+          '8.8.8.8',
+          '172.15.0.1',
+          '172.32.0.1',
+          '2001:db8::1',
+          'hermes-machine.tailnet.ts.net',
+          'my-comfyui.example.com',
+        ]) {
+          expect(
+            ComfyUi.requiresPlainHttpWarning(_httpUri(host)),
+            isTrue,
+            reason: host,
+          );
+        }
+      },
+    );
+  });
 }
+
+Uri _httpUri(String host) =>
+    Uri.parse('http://${host.contains(':') ? '[$host]' : host}:8188');
