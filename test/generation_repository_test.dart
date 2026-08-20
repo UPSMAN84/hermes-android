@@ -669,6 +669,93 @@ void main() {
         expect(media.single.sourceMessageId, 'm2');
       },
     );
+
+    test(
+      'the same filename from two different endpoints stays two distinct assets',
+      () async {
+        final client = _ScriptedComfyClient();
+        final repository = repo(httpClient: client);
+
+        await repository.upsertChatToolOutputs(
+          endpoint: ComfyEndpoint.parse('http://host-a:8188'),
+          sessionId: 'session-1',
+          messages: [
+            {'id': 'm1', 'role': 'tool', 'content': 'rendered: /out/r.png'},
+          ],
+        );
+        await repository.upsertChatToolOutputs(
+          endpoint: ComfyEndpoint.parse('http://host-b:8188'),
+          sessionId: 'session-1',
+          messages: [
+            {'id': 'm2', 'role': 'tool', 'content': 'rendered: /out/r.png'},
+          ],
+        );
+
+        final media = await mediaStore.list();
+        expect(media, hasLength(2));
+        expect(media.map((a) => a.endpointSnapshot).toSet(), {
+          'http://host-a:8188',
+          'http://host-b:8188',
+        });
+      },
+    );
+
+    test(
+      'media indexed under a since-changed endpoint keeps its saved endpoint '
+      'snapshot rather than following the new configuration',
+      () async {
+        final client = _ScriptedComfyClient();
+        final repository = repo(httpClient: client);
+
+        await repository.upsertChatToolOutputs(
+          endpoint: ComfyEndpoint.parse('http://old-host:8188'),
+          sessionId: 'session-1',
+          messages: [
+            {'id': 'm1', 'role': 'tool', 'content': 'rendered: /out/r.png'},
+          ],
+        );
+
+        // The configured endpoint moves, but nothing re-indexes past media --
+        // a stale snapshot must go on pointing at the server it actually
+        // came from.
+        await repository.upsertChatToolOutputs(
+          endpoint: ComfyEndpoint.parse('http://new-host:8188'),
+          sessionId: 'session-1',
+          messages: const [],
+        );
+
+        final media = await mediaStore.list();
+        expect(media, hasLength(1));
+        expect(media.single.endpointSnapshot, 'http://old-host:8188');
+      },
+    );
+
+    test(
+      'removing media, even with clearCache, never sends a server delete '
+      'request -- it only touches the local record and the local disk cache',
+      () async {
+        final client = _ScriptedComfyClient();
+        final repository = repo(httpClient: client);
+        await repository.upsertChatToolOutputs(
+          endpoint: ComfyEndpoint.parse('http://host:8188'),
+          sessionId: 'session-1',
+          messages: [
+            {'id': 'm1', 'role': 'tool', 'content': 'rendered: /out/r.png'},
+          ],
+        );
+        final assetId = (await mediaStore.list()).single.id;
+
+        await repository.removeMedia(assetId, clearCache: true);
+
+        expect(client.requests, isEmpty);
+        expect(mediaCache.removed, [
+          ComfyEndpoint.parse(
+            'http://host:8188',
+          ).viewUri(ComfyOutputRef(filename: 'r.png')),
+        ]);
+        expect(await mediaStore.list(), isEmpty);
+      },
+    );
   });
 
   group('foreground lease balance', () {

@@ -11,8 +11,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
-import 'package:media_kit/media_kit.dart';
-import 'package:media_kit_video/media_kit_video.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
@@ -40,6 +38,7 @@ import '../utils/responsive.dart';
 import '../utils/reveal_row.dart';
 import '../utils/row_keys.dart';
 import '../widgets/cached_media_thumbnail.dart';
+import '../widgets/generated_media_view.dart';
 import 'call_screen.dart';
 import 'character_picker_screen.dart';
 import 'create_screen.dart';
@@ -99,6 +98,10 @@ class _ChatScreenState extends State<ChatScreen> {
       widget.mediaCache ?? MediaCacheService.appDefault;
   MediaExportService get _mediaExport =>
       widget.mediaExport ?? MediaExportService.appDefault;
+  // One coordinator per chat screen so at most one generated video plays at
+  // a time across the whole transcript.
+  final GeneratedVideoCoordinator _videoCoordinator =
+      DefaultGeneratedVideoCoordinator();
   Future<GenerationRepository> _resolveGenerationRepository() async {
     final injected = widget.generationRepository;
     if (injected != null) return injected;
@@ -360,6 +363,29 @@ class _ChatScreenState extends State<ChatScreen> {
     final card = widget.characterCard;
     if (picked != null && card != null) {
       unawaited(_saveCharacterGenerationContext(picked, card));
+    }
+  }
+
+  /// Indexes this transcript's tool-generated media into the global
+  /// repository so it shows up in the Media library without the user ever
+  /// opening Create for this session. Best-effort and silent when ComfyUI
+  /// isn't configured -- a Configure action belongs on the gallery screen
+  /// itself, not as a chat-load side effect.
+  Future<void> _backfillGeneratedMedia(
+    List<Map<String, dynamic>> messages,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final endpoint = await ComfyUiPrefs.loadConfiguredEndpoint(prefs);
+      if (endpoint == null) return;
+      final repository = await _resolveGenerationRepository();
+      await repository.upsertChatToolOutputs(
+        endpoint: endpoint,
+        sessionId: widget.session.id,
+        messages: messages,
+      );
+    } catch (_) {
+      // The transcript itself already rendered successfully.
     }
   }
 
@@ -961,6 +987,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _messages = messages;
         _loading = false;
       });
+      unawaited(_backfillGeneratedMedia(messages));
       final saved = _savedPositions[widget.session.id];
       if (saved != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -1927,18 +1954,40 @@ class _ChatScreenState extends State<ChatScreen> {
   /// message that produced it, which we then scroll to and flash — the
   /// gallery doubles as an index into the conversation, not just a lightbox.
   Future<void> _openGallery() async {
-    final source = await Navigator.push<Map<String, dynamic>>(
+    final repository = await _resolveGenerationRepository();
+    if (!mounted) return;
+    await Navigator.push(
       context,
       MaterialPageRoute(
         builder: (_) => MediaGalleryScreen(
-          messages: _messages,
-          comfyBaseUrl: _comfyBaseUrl,
+          repository: repository,
+          onOpenSourceMessage: _openSourceMessage,
           mediaCache: _mediaCache,
+          mediaExport: _mediaExport,
         ),
       ),
     );
-    if (source == null || !mounted) return;
-    await _jumpToMessage(source);
+  }
+
+  /// Finds the transcript row a global-media item was generated from (by
+  /// its own message id, not text/role matching -- a media asset's
+  /// sourceMessageId is only meaningful for THIS session's own messages)
+  /// and jumps to it. A no-op if that message isn't in the currently
+  /// loaded transcript (a different session, or one not yet fetched).
+  Future<void> _openSourceMessage(MediaAsset asset) async {
+    final messageId = asset.sourceMessageId;
+    if (messageId == null || asset.sourceSessionId != widget.session.id) {
+      return;
+    }
+    Map<String, dynamic>? match;
+    for (final msg in _messages) {
+      if (msg['id']?.toString() == messageId) {
+        match = msg;
+        break;
+      }
+    }
+    if (match == null) return;
+    await _jumpToMessage(match);
   }
 
   /// Opens Create for this session: the app-scoped repository resolves
@@ -2385,6 +2434,7 @@ class _ChatScreenState extends State<ChatScreen> {
             urls: item,
             mediaCache: _mediaCache,
             mediaExport: _mediaExport,
+            videoCoordinator: _videoCoordinator,
           );
         } else {
           final msg = item as Map<String, dynamic>;
@@ -3249,10 +3299,12 @@ class _MediaRow extends StatelessWidget {
   final List<String> urls;
   final MediaCachePort mediaCache;
   final MediaExportService mediaExport;
+  final GeneratedVideoCoordinator videoCoordinator;
   const _MediaRow({
     required this.urls,
     required this.mediaCache,
     required this.mediaExport,
+    required this.videoCoordinator,
   });
 
   @override
@@ -3265,78 +3317,21 @@ class _MediaRow extends StatelessWidget {
       // so keys here genuinely let a clip keep its opened Player when the
       // row's contents shift around it.
       children: urls.map((u) {
-        final filename = Uri.parse(u).queryParameters['filename'] ?? '';
-        return ComfyUi.isVideo(filename)
-            ? _VideoBubble(url: u, mediaExport: mediaExport, key: ValueKey(u))
-            : _ImageBubble(
-                url: u,
-                mediaCache: mediaCache,
-                mediaExport: mediaExport,
-                key: ValueKey(u),
-              );
+        final uri = Uri.parse(u);
+        final filename = uri.queryParameters['filename'] ?? '';
+        return GeneratedMediaView(
+          key: ValueKey(u),
+          id: u,
+          kind: ComfyUi.isVideo(filename)
+              ? ComfyMediaKind.video
+              : ComfyMediaKind.image,
+          uri: uri,
+          mediaCache: mediaCache,
+          mediaExport: mediaExport,
+          videoCoordinator: videoCoordinator,
+        );
       }).toList(),
     );
-  }
-}
-
-/// Share / save-to-gallery bottom sheet for a generated media bubble.
-/// Exports [url] remotely so sharing and saving use bounded downloads.
-Future<void> _showMediaActions(
-  BuildContext context,
-  String url, {
-  required bool isVideo,
-  required MediaExportService mediaExport,
-}) async {
-  if (!context.mounted) return;
-  final action = await showModalBottomSheet<String>(
-    context: context,
-    builder: (sheetContext) => SafeArea(
-      child: Wrap(
-        children: [
-          ListTile(
-            leading: const Icon(Icons.ios_share),
-            title: const Text('Share'),
-            onTap: () => Navigator.pop(sheetContext, 'share'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.save_alt),
-            title: const Text('Save to Photos'),
-            onTap: () => Navigator.pop(sheetContext, 'save'),
-          ),
-        ],
-      ),
-    ),
-  );
-  if (action == null || !context.mounted) return;
-
-  try {
-    final uri = Uri.parse(url);
-    Future<bool> confirm(MediaDownloadInfo info) =>
-        _confirmMediaDownload(context, info);
-
-    if (action == 'share') {
-      await mediaExport.shareRemote(uri, confirmAfterHeaders: confirm);
-      if (!context.mounted) return;
-      return;
-    }
-
-    final error = await mediaExport.saveRemote(
-      uri,
-      isVideo: isVideo,
-      confirmAfterHeaders: confirm,
-    );
-    if (!context.mounted) return;
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text(error ?? 'Saved to Photos')));
-  } on MediaDownloadDeclinedException {
-    return;
-  } catch (e) {
-    if (context.mounted) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Could not load media: $e')));
-    }
   }
 }
 
@@ -3365,516 +3360,4 @@ String? _sniffImageMime(Uint8List bytes) {
     return 'image/webp';
   }
   return null;
-}
-
-Future<bool> _confirmMediaDownload(
-  BuildContext context,
-  MediaDownloadInfo info,
-) async {
-  if (!context.mounted) return false;
-  final declaredBytes = info.declaredBytes;
-  final description = declaredBytes == null
-      ? 'The download size is unknown.'
-      : 'This download is ${(declaredBytes / (1024 * 1024)).toStringAsFixed(1)} MiB.';
-  final accepted = await showDialog<bool>(
-    context: context,
-    builder: (dialogContext) => AlertDialog(
-      title: const Text('Download media?'),
-      content: Text('$description Continue?'),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(dialogContext, false),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(dialogContext, true),
-          child: const Text('Download'),
-        ),
-      ],
-    ),
-  );
-  if (!context.mounted) return false;
-  return accepted ?? false;
-}
-
-/// Small overlay button for [_showMediaActions], shared by _ImageBubble and
-/// _VideoBubble so the two don't each style their own.
-class _MediaActionButton extends StatelessWidget {
-  final VoidCallback onPressed;
-  const _MediaActionButton({required this.onPressed});
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.black45,
-      shape: const CircleBorder(),
-      child: InkWell(
-        customBorder: const CircleBorder(),
-        onTap: onPressed,
-        child: const Padding(
-          padding: EdgeInsets.all(6),
-          child: Icon(Icons.more_vert, color: Colors.white, size: 18),
-        ),
-      ),
-    );
-  }
-}
-
-/// One generated image, resolved through [MediaCacheService] so a reopened
-/// chat reads it off disk instead of re-fetching it from the LAN gateway
-/// every time. Tappable to open full-screen with pinch-zoom.
-///
-/// This used to be a bare Image.network with no disk cache and no decode
-/// bound — every reopen re-downloaded the file, and a 1536² PNG decoded to
-/// ~9MB of bitmap, so a handful of them evicted Flutter's ImageCache and sent
-/// the whole transcript into repeated decode churn while scrolling.
-class _ImageBubble extends StatefulWidget {
-  final String url;
-  final MediaCachePort mediaCache;
-  final MediaExportService mediaExport;
-  const _ImageBubble({
-    required this.url,
-    required this.mediaCache,
-    required this.mediaExport,
-    super.key,
-  });
-
-  @override
-  State<_ImageBubble> createState() => _ImageBubbleState();
-}
-
-class _ImageBubbleState extends State<_ImageBubble> {
-  // Built once, not in build(): a fresh Future per rebuild makes FutureBuilder
-  // resubscribe and drop back to `waiting`, which flickers the image to a
-  // spinner on every streaming-token flush.
-  Future<File?>? _fileFuture;
-
-  @override
-  void initState() {
-    super.initState();
-    _resolve();
-  }
-
-  @override
-  void didUpdateWidget(_ImageBubble oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.url != widget.url ||
-        !identical(oldWidget.mediaCache, widget.mediaCache)) {
-      _resolve();
-    }
-  }
-
-  void _resolve() {
-    _fileFuture = widget.mediaCache.cache(Uri.parse(widget.url));
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final media = MediaQuery.of(context);
-    final maxW = media.size.width - 80;
-    // cacheWidth is in physical pixels, so scale by DPR — decoding at the
-    // logical width would look soft on any modern phone.
-    final decodeWidth = (maxW * media.devicePixelRatio).round();
-
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      constraints: BoxConstraints(maxWidth: maxW),
-      clipBehavior: Clip.antiAlias,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-      ),
-      child: FutureBuilder<File?>(
-        future: _fileFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const SizedBox(
-              height: 160,
-              child: Center(child: CircularProgressIndicator()),
-            );
-          }
-          final file = snapshot.data;
-          if (snapshot.hasError || file == null) {
-            return const SizedBox(
-              height: 80,
-              child: Center(
-                child: Text(
-                  'image unavailable',
-                  style: TextStyle(color: Colors.grey),
-                ),
-              ),
-            );
-          }
-          return Stack(
-            children: [
-              GestureDetector(
-                onTap: () => _openFull(context, file),
-                child: Image.file(
-                  file,
-                  fit: BoxFit.contain,
-                  cacheWidth: decodeWidth,
-                  errorBuilder: (context, _, _) => const SizedBox(
-                    height: 80,
-                    child: Center(
-                      child: Text(
-                        'image unavailable',
-                        style: TextStyle(color: Colors.grey),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              Positioned(
-                top: 4,
-                right: 4,
-                child: _MediaActionButton(
-                  onPressed: () => _showMediaActions(
-                    context,
-                    widget.url,
-                    isVideo: false,
-                    mediaExport: widget.mediaExport,
-                  ),
-                ),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
-  void _openFull(BuildContext context, File file) {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => Scaffold(
-          backgroundColor: Colors.black,
-          appBar: AppBar(backgroundColor: Colors.black),
-          body: SafeArea(
-            child: Center(child: InteractiveViewer(child: Image.file(file))),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// One generated video, streamed from ComfyUI's /view endpoint. Tap toggles
-/// play/pause; initialized paused so clips don't all autoplay at once.
-///
-/// Backed by media_kit (libmp/FFmpeg): it software-decodes codecs Android's
-/// hardware MediaCodec path rejects — HEVC/H.265, VP9, AV1, 10-bit
-/// (yuv420p10le), and mkv/webm containers — which the previous ExoPlayer-based
-/// video_player failed to initialize on, showing "video unavailable" for many
-/// ComfyUI/WAN clips.
-class _VideoBubble extends StatefulWidget {
-  final String url;
-  final MediaExportService mediaExport;
-  const _VideoBubble({required this.url, required this.mediaExport, super.key});
-
-  @override
-  State<_VideoBubble> createState() => _VideoBubbleState();
-}
-
-/// Loads media_kit's native backend on first use.
-///
-/// This used to run unconditionally in main(), putting the shared-object load
-/// in front of the first frame on every cold start — including the majority of
-/// launches that never open a chat with a video in it. MediaKit.ensureInitialized
-/// is itself idempotent; the flag just avoids the repeat call per bubble.
-bool _mediaKitReady = false;
-void ensureMediaKitInitialized() {
-  if (_mediaKitReady) return;
-  MediaKit.ensureInitialized();
-  _mediaKitReady = true;
-}
-
-/// media_kit hardcodes `cache-on-disk: yes` for every Player (see
-/// media_kit's native player real.dart) but never sets `cache-dir`, so on
-/// Android mpv has nowhere to put its demuxer cache file and logs
-///   lavf error: Failed to create file cache.
-/// on every open, silently falling back to memory-only buffering -- fine for
-/// short generated clips, but needlessly holds more in memory than intended
-/// for longer ones. getTemporaryDirectory() is async but the path is fixed
-/// for the life of the process, so fetch it once and reuse it.
-Future<String>? _mpvCacheDirFuture;
-Future<String> _mpvCacheDir() =>
-    _mpvCacheDirFuture ??= getTemporaryDirectory().then((d) => d.path);
-
-class _VideoBubbleState extends State<_VideoBubble> {
-  // Both are assigned in initState, in this order, BEFORE the first _openSource().
-  //
-  // media_kit starts every Player with `--vid=no` ("to prevent redundant video
-  // decoding"); attaching a VideoController is what flips it to `--vid=auto`.
-  // These were previously `late final` field initializers, so the controller
-  // was not constructed until build() first read it -- which only happens once
-  // _ready is true, i.e. AFTER _player.open() had already run. Every clip was
-  // therefore opened with video decoding switched off, and since generated
-  // ComfyUI/WAN clips carry no audio track either, mpv selected no tracks at
-  // all ("No video or audio streams selected"), leaving width/height null and
-  // the bubble permanently black behind its play button.
-  Player? _player;
-  VideoController? _videoController;
-  bool _ready = false;
-  bool _failed = false;
-  bool _playing = false;
-  double _aspect = 16 / 9;
-
-  final List<StreamSubscription<dynamic>> _subs = [];
-
-  /// Bumped on every [_openSource]. An open that resolves after a newer one
-  /// started must not flip this bubble to ready/failed for a clip that is no
-  /// longer the one being shown.
-  int _openEpoch = 0;
-
-  @override
-  void initState() {
-    super.initState();
-    try {
-      // Must happen before the first Player is constructed.
-      ensureMediaKitInitialized();
-      final player = Player();
-      _player = player;
-      // Attach the controller before _openSource() below: this is what sets
-      // `--vid=auto`, and Player.open() awaits an attached controller's
-      // initialization, so the media is opened with video decoding enabled.
-      _videoController = VideoController(player);
-    } catch (e) {
-      debugPrint('[media_kit] video initialization failed: $e');
-      _failed = true;
-      return;
-    }
-    final player = _player!;
-    // Surface real decode/open failures instead of silently spinning forever.
-    _subs.add(
-      player.stream.error.listen((e) {
-        debugPrint('[media_kit] video error for ${widget.url}: $e');
-        if (mounted) setState(() => _failed = true);
-      }),
-    );
-    _subs.add(
-      player.stream.playing.listen((p) {
-        if (mounted) setState(() => _playing = p);
-      }),
-    );
-    _subs.add(player.stream.width.listen((_) => _updateAspect()));
-    _subs.add(player.stream.height.listen((_) => _updateAspect()));
-    _openSource();
-  }
-
-  /// The transcript's row list is rebuilt from scratch on every refetch, and
-  /// rows shift whenever a tool group or media row is inserted between
-  /// bubbles. Because rows are unkeyed, Flutter matches by index and UPDATES
-  /// this element rather than recreating it — so without this the State kept
-  /// its already-opened Player and went on playing the previous clip under a
-  /// row that now points at a different URL.
-  @override
-  void didUpdateWidget(_VideoBubble oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.url != widget.url) _openSource();
-  }
-
-  Future<void> _openSource() async {
-    final player = _player;
-    if (player == null || _videoController == null) return;
-    final epoch = ++_openEpoch;
-    if (_ready || _failed) {
-      setState(() {
-        _ready = false;
-        _failed = false;
-        _playing = false;
-      });
-    }
-    try {
-      final platform = player.platform;
-      if (platform is NativePlayer) {
-        await platform.setProperty('cache-dir', await _mpvCacheDir());
-      }
-      if (!mounted || epoch != _openEpoch) return;
-      // Open paused so multiple clips in a transcript don't all autoplay.
-      await player.open(Media(widget.url), play: false);
-      if (!mounted || epoch != _openEpoch) return;
-      setState(() => _ready = true);
-    } catch (e) {
-      debugPrint('[media_kit] open failed for ${widget.url}: $e');
-      if (mounted && epoch == _openEpoch) setState(() => _failed = true);
-    }
-  }
-
-  void _updateAspect() {
-    final player = _player;
-    if (player == null) return;
-    final w = player.state.width;
-    final h = player.state.height;
-    if (w != null && h != null && w > 0 && h > 0) {
-      final next = w / h;
-      if (next != _aspect && mounted) setState(() => _aspect = next);
-    }
-  }
-
-  void _togglePlay() {
-    final player = _player;
-    if (player == null) return;
-    _playing ? player.pause() : player.play();
-  }
-
-  @override
-  void dispose() {
-    for (final s in _subs) {
-      s.cancel();
-    }
-    _player?.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final maxW = MediaQuery.of(context).size.width - 80;
-    final player = _player;
-    final videoController = _videoController;
-    Widget body;
-    if (_failed || player == null || videoController == null) {
-      body = const SizedBox(
-        height: 100,
-        child: Center(
-          child: Text(
-            'video unavailable',
-            style: TextStyle(color: Colors.grey),
-          ),
-        ),
-      );
-    } else if (!_ready) {
-      body = const SizedBox(
-        height: 160,
-        child: Center(child: CircularProgressIndicator()),
-      );
-    } else {
-      body = GestureDetector(
-        onTap: _togglePlay,
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            AspectRatio(
-              aspectRatio: _aspect,
-              child: Video(
-                controller: videoController,
-                controls: NoVideoControls,
-              ),
-            ),
-            if (!_playing)
-              Container(
-                decoration: const BoxDecoration(
-                  color: Colors.black54,
-                  shape: BoxShape.circle,
-                ),
-                padding: const EdgeInsets.all(12),
-                child: const Icon(
-                  Icons.play_arrow,
-                  color: Colors.white,
-                  size: 32,
-                ),
-              ),
-            // progress bar
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: _VideoProgressBar(player: player),
-            ),
-            Positioned(
-              top: 4,
-              right: 4,
-              child: _MediaActionButton(
-                onPressed: () => _showMediaActions(
-                  context,
-                  widget.url,
-                  isVideo: true,
-                  mediaExport: widget.mediaExport,
-                ),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      constraints: BoxConstraints(maxWidth: maxW),
-      clipBehavior: Clip.antiAlias,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        color: Colors.black,
-      ),
-      child: body,
-    );
-  }
-}
-
-/// Thin scrubbable progress bar for [_VideoBubble], mirroring the look of the
-/// old VideoProgressIndicator (played/buffered/background tint) since
-/// media_kit_video's default controls are replaced with [NoVideoControls].
-class _VideoProgressBar extends StatelessWidget {
-  final Player player;
-  const _VideoProgressBar({required this.player});
-
-  void _seekToFraction(BuildContext context, double dx, double width) {
-    final duration = player.state.duration;
-    if (duration == Duration.zero) return;
-    final fraction = (dx / width).clamp(0.0, 1.0);
-    player.seek(duration * fraction);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<Duration>(
-      stream: player.stream.position,
-      initialData: player.state.position,
-      builder: (context, positionSnap) {
-        return StreamBuilder<Duration>(
-          stream: player.stream.duration,
-          initialData: player.state.duration,
-          builder: (context, durationSnap) {
-            final position = positionSnap.data ?? Duration.zero;
-            final duration = durationSnap.data ?? Duration.zero;
-            final fraction = duration.inMilliseconds > 0
-                ? (position.inMilliseconds / duration.inMilliseconds).clamp(
-                    0.0,
-                    1.0,
-                  )
-                : 0.0;
-            return LayoutBuilder(
-              builder: (context, constraints) {
-                return GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTapDown: (d) => _seekToFraction(
-                    context,
-                    d.localPosition.dx,
-                    constraints.maxWidth,
-                  ),
-                  onHorizontalDragUpdate: (d) => _seekToFraction(
-                    context,
-                    d.localPosition.dx,
-                    constraints.maxWidth,
-                  ),
-                  child: SizedBox(
-                    height: 6,
-                    width: double.infinity,
-                    child: Stack(
-                      children: [
-                        Container(color: Colors.white24),
-                        FractionallySizedBox(
-                          widthFactor: fraction,
-                          child: Container(color: Colors.white),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            );
-          },
-        );
-      },
-    );
-  }
 }

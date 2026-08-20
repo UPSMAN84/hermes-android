@@ -179,8 +179,22 @@ class _FakeGenerationRepository implements GenerationRepository {
   @override
   Stream<List<GenerationJob>> watchJobs() => const Stream.empty();
 
+  List<MediaAsset> _latestMedia = const [];
+  final _mediaController = StreamController<List<MediaAsset>>.broadcast();
+
+  void emitMedia(List<MediaAsset> media) {
+    _latestMedia = media;
+    _mediaController.add(media);
+  }
+
+  // Replays the latest value to a new subscriber, matching how the real
+  // repository's replay subject behaves -- MediaGalleryScreen only
+  // subscribes once it's pumped, which is after a test's emitMedia() call.
   @override
-  Stream<List<MediaAsset>> watchMedia() => const Stream.empty();
+  Stream<List<MediaAsset>> watchMedia() async* {
+    yield _latestMedia;
+    yield* _mediaController.stream;
+  }
 
   @override
   Stream<CharacterGenerationContext?> watchCharacterContext(String sessionId) =>
@@ -236,12 +250,16 @@ class _FakeGenerationRepository implements GenerationRepository {
   @override
   Future<void> removeMedia(String assetId, {required bool clearCache}) async {}
 
+  final List<({ComfyEndpoint endpoint, String sessionId})> backfillCalls = [];
+
   @override
   Future<void> upsertChatToolOutputs({
     required ComfyEndpoint endpoint,
     required String sessionId,
     required List<JsonObject> messages,
-  }) async {}
+  }) async {
+    backfillCalls.add((endpoint: endpoint, sessionId: sessionId));
+  }
 
   @override
   Future<void> dispose() async {}
@@ -419,15 +437,35 @@ void main() {
   testWidgets('image gallery keeps using the chat injected media cache', (
     tester,
   ) async {
+    // The global Media library is repository-backed, not transcript-scanned
+    // -- seed the fake repository directly rather than relying on the tool
+    // message to surface there (that indexing is covered separately by the
+    // generated-media backfill tests).
     final cache = _RecordingMediaCache();
-    final gw = _FakeGateway(
-      messages: [_FakeGateway.msg('tool', r'rendered: C:\out\tool_0001.png')],
-    );
+    final repository = _FakeGenerationRepository();
+    repository.emitMedia([
+      MediaAsset(
+        id: 'asset-1',
+        kind: ComfyMediaKind.image,
+        endpointSnapshot: 'http://0.0.0.0:8188',
+        filename: 'tool_0001.png',
+        createdAt: DateTime.utc(2026, 8, 20),
+        updatedAt: DateTime.utc(2026, 8, 20),
+      ),
+    ]);
+    final gw = _FakeGateway();
     final expected = Uri.parse(
       'http://0.0.0.0:8188/view?filename=tool_0001.png&type=output',
     );
 
-    await tester.pumpWidget(_app(gw, _SilentTts(), mediaCache: cache));
+    await tester.pumpWidget(
+      _app(
+        gw,
+        _SilentTts(),
+        mediaCache: cache,
+        generationRepository: repository,
+      ),
+    );
     for (var i = 0; i < 5; i++) {
       await tester.pump(const Duration(milliseconds: 100));
     }
@@ -939,4 +977,69 @@ void main() {
       expect(gw.sendCount, 0);
     },
   );
+
+  group('generated-media backfill', () {
+    testWidgets(
+      'a fetched transcript is indexed into the media repository under the '
+      'configured endpoint',
+      (tester) async {
+        SharedPreferences.setMockInitialValues({
+          'server_sends_media_filename_c1': true,
+          'comfyui_base_url': 'http://comfy.example:8188',
+        });
+        final repository = _FakeGenerationRepository();
+        final gw = _FakeGateway(
+          messages: [
+            _FakeGateway.msg('user', 'draw me a cat'),
+            _FakeGateway.msg('tool', r'rendered: C:\out\TG_1.png'),
+          ],
+        );
+
+        await tester.pumpWidget(
+          _app(gw, _SilentTts(), generationRepository: repository),
+        );
+        // Bounded pumps, not pumpAndSettle: the rendered tool image sits on
+        // a CircularProgressIndicator whose cache fetch never resolves
+        // without a real ComfyUI server, and an indeterminate spinner never
+        // settles.
+        for (var i = 0; i < 5; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+
+        expect(repository.backfillCalls, hasLength(1));
+        expect(
+          repository.backfillCalls.single.endpoint.baseUri.toString(),
+          'http://comfy.example:8188',
+        );
+        expect(repository.backfillCalls.single.sessionId, 'sess-1');
+      },
+    );
+
+    testWidgets(
+      'backfill is skipped silently when no ComfyUI endpoint is configured',
+      (tester) async {
+        SharedPreferences.setMockInitialValues({
+          'server_sends_media_filename_c1': true,
+        });
+        final repository = _FakeGenerationRepository();
+        final gw = _FakeGateway(
+          messages: [
+            _FakeGateway.msg('user', 'draw me a cat'),
+            _FakeGateway.msg('tool', r'rendered: C:\out\TG_1.png'),
+          ],
+        );
+
+        await tester.pumpWidget(
+          _app(gw, _SilentTts(), generationRepository: repository),
+        );
+        for (var i = 0; i < 5; i++) {
+          await tester.pump(const Duration(milliseconds: 100));
+        }
+
+        expect(repository.backfillCalls, isEmpty);
+        // The transcript itself still rendered fine.
+        expect(find.text('draw me a cat'), findsOneWidget);
+      },
+    );
+  });
 }
