@@ -22,6 +22,7 @@ dependencies:
   path_provider: ^2.1.5
 
   # Data models
+  crypto: ^3.0.7
   uuid: ^4.5.1
 
   # Misc
@@ -30,10 +31,15 @@ dependencies:
   speech_to_text: ^7.4.0
 
   # Removed as unused (nothing in lib/ or test/ imported them):
-  #   flutter_riverpod, go_router, json_annotation, url_launcher, highlight.
+  #   flutter_riverpod, go_router, json_annotation, highlight.
   # State is plain StatefulWidget, navigation is bare Navigator/MaterialPageRoute,
   # models are hand-written fromJson, and flutter_markdown does its own
-  # highlighting.
+  # highlighting. (url_launcher was in that removed list too, but is back —
+  # ComfyUI settings' "Open ComfyUI" action needs it.)
+
+  # ComfyUI workflow JSON import/export and opening the server's own web UI.
+  file_picker: ^12.0.0
+  url_launcher: ^6.3.2
   #
   # google_fonts was also removed: the one face it supplied (Cinzel, for the
   # wordmark) is now bundled under assets/fonts, so there is no runtime font
@@ -67,6 +73,8 @@ dependencies:
 
 dev_dependencies:
   flutter_test:
+    sdk: flutter
+  integration_test:
     sdk: flutter
   flutter_lints: ^6.0.0
   build_runner: ^2.4.14

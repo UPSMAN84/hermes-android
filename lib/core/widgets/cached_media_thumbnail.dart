@@ -12,6 +12,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show mapEquals;
 import 'package:flutter/material.dart';
 
 import '../services/media_cache_service.dart';
@@ -20,6 +21,7 @@ class CachedMediaThumbnail extends StatefulWidget {
   final String url;
   final BoxFit fit;
   final double borderRadius;
+  final MediaCachePort? mediaCache;
 
   /// Auth for sources that need it (gateway character images sit behind the
   /// same Bearer token as the rest of the API; ComfyUI's /view does not).
@@ -38,6 +40,7 @@ class CachedMediaThumbnail extends StatefulWidget {
     required this.url,
     this.fit = BoxFit.cover,
     this.borderRadius = 0,
+    this.mediaCache,
     this.headers,
     this.decodeWidth,
     this.onTap,
@@ -54,7 +57,7 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
   // reset its snapshot to `waiting` — i.e. every visible image drops to a
   // spinner on each rebuild. The chat screen rebuilds every 120ms while a
   // reply streams (see _flushPendingTokens), so that flickered ~8x/second.
-  Future<File>? _fileFuture;
+  Future<File?>? _fileFuture;
 
   // Decoded once per source, NOT in build(): base64Decode of a ~1MB
   // attachment ran on every rebuild — 8x/second while a reply streams — and
@@ -72,8 +75,11 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
   @override
   void didUpdateWidget(CachedMediaThumbnail oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // Only re-resolve when the actual source changes.
-    if (oldWidget.url != widget.url) _resolve();
+    if (oldWidget.url != widget.url ||
+        !identical(oldWidget.mediaCache, widget.mediaCache) ||
+        !mapEquals(oldWidget.headers, widget.headers)) {
+      _resolve();
+    }
   }
 
   void _resolve() {
@@ -81,7 +87,10 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
     _dataBytes = isData ? _decodeDataUri(widget.url) : null;
     _fileFuture = isData
         ? null
-        : MediaCacheService.fileFor(widget.url, headers: widget.headers);
+        : (widget.mediaCache ?? MediaCacheService.appDefault).cache(
+            Uri.parse(widget.url),
+            headers: widget.headers ?? const {},
+          );
   }
 
   static Uint8List? _decodeDataUri(String url) {
@@ -132,7 +141,8 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
       return ClipRRect(
         borderRadius: BorderRadius.circular(widget.borderRadius),
         child: GestureDetector(
-          onTap: widget.onTap ??
+          onTap:
+              widget.onTap ??
               () => _openFullscreen(context, Image.memory(dataBytes)),
           child: Image.memory(
             dataBytes,
@@ -147,7 +157,7 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
 
     return ClipRRect(
       borderRadius: BorderRadius.circular(widget.borderRadius),
-      child: FutureBuilder<File>(
+      child: FutureBuilder<File?>(
         future: _fileFuture,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
@@ -164,7 +174,8 @@ class _CachedMediaThumbnailState extends State<CachedMediaThumbnail> {
             return _broken(context);
           }
           return GestureDetector(
-            onTap: widget.onTap ??
+            onTap:
+                widget.onTap ??
                 () => _openFullscreen(context, Image.file(file)),
             child: Image.file(
               file,

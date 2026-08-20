@@ -11,8 +11,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
-import 'package:media_kit/media_kit.dart';
-import 'package:media_kit_video/media_kit_video.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:speech_to_text/speech_recognition_error.dart';
@@ -21,11 +19,16 @@ import 'package:speech_to_text/speech_to_text.dart';
 import '../models/pending_chat_send.dart';
 import '../services/speech_recognition_coordinator.dart';
 
+import '../models/character_generation_context.dart';
+import '../models/comfy_workflow.dart';
+import '../models/media_asset.dart';
 import '../services/background_activity_service.dart';
 import '../services/character_voice_prefs.dart';
 import '../services/chatterbox_service.dart';
 import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
+import '../services/generation_repository.dart';
+import '../services/generation_repository_host.dart';
 import '../services/media_cache_service.dart';
 import '../services/media_export_service.dart';
 import '../services/reply_notification_service.dart';
@@ -35,8 +38,10 @@ import '../utils/responsive.dart';
 import '../utils/reveal_row.dart';
 import '../utils/row_keys.dart';
 import '../widgets/cached_media_thumbnail.dart';
+import '../widgets/generated_media_view.dart';
 import 'call_screen.dart';
 import 'character_picker_screen.dart';
+import 'create_screen.dart';
 import 'media_gallery_screen.dart';
 import 'session_list_screen.dart';
 import 'skills_screen.dart';
@@ -65,6 +70,10 @@ class ChatScreen extends StatefulWidget {
   /// already mockable (SharedPreferences).
   final http.Client? httpClient;
   final TtsProvider Function()? ttsOverride;
+  final MediaCachePort? mediaCache;
+  final MediaExportService? mediaExport;
+  final GenerationRepository? generationRepository;
+  final MediaDownloadPort? mediaDownload;
 
   const ChatScreen({
     required this.connection,
@@ -73,6 +82,10 @@ class ChatScreen extends StatefulWidget {
     this.characterCard,
     this.httpClient,
     this.ttsOverride,
+    this.mediaCache,
+    this.mediaExport,
+    this.generationRepository,
+    this.mediaDownload,
     super.key,
   });
 
@@ -81,6 +94,23 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
+  MediaCachePort get _mediaCache =>
+      widget.mediaCache ?? MediaCacheService.appDefault;
+  MediaExportService get _mediaExport =>
+      widget.mediaExport ?? MediaExportService.appDefault;
+  // One coordinator per chat screen so at most one generated video plays at
+  // a time across the whole transcript.
+  final GeneratedVideoCoordinator _videoCoordinator =
+      DefaultGeneratedVideoCoordinator();
+  Future<GenerationRepository> _resolveGenerationRepository() async {
+    final injected = widget.generationRepository;
+    if (injected != null) return injected;
+    return (await GenerationRepositoryHost.instance()).repository;
+  }
+
+  MediaDownloadPort get _mediaDownload =>
+      widget.mediaDownload ?? appMediaDownloadService;
+
   List<Map<String, dynamic>> _messages = [];
   final List<Map<String, dynamic>> _toolMessages = [];
   bool _loading = true;
@@ -117,7 +147,8 @@ class _ChatScreenState extends State<ChatScreen> {
       SpeechRecognitionCoordinator.instance;
   SpeechToText get _speechToText => _speechCoordinator.speech;
   late TtsProvider _xtts =
-      widget.ttsOverride?.call() ?? XttsService(fallbackHost: widget.connection.host);
+      widget.ttsOverride?.call() ??
+      XttsService(fallbackHost: widget.connection.host);
   bool _speechAvailable = false;
   bool _listening = false;
   bool _voiceReplyEnabled = true;
@@ -324,6 +355,85 @@ class _ChatScreenState extends State<ChatScreen> {
     // The persona turn has to go after the state is applied, because it sends
     // a message and the send path reads _characterImagePath.
     if (picked != null) await _sendCharacterSetup();
+
+    // Only on the moment a character card is actually loaded (not on every
+    // reopen of an existing character session, when widget.characterCard is
+    // null and the appearance text isn't available) -- a session that
+    // already has a saved context just keeps using it.
+    final card = widget.characterCard;
+    if (picked != null && card != null) {
+      unawaited(_saveCharacterGenerationContext(picked, card));
+    }
+  }
+
+  /// Indexes this transcript's tool-generated media into the global
+  /// repository so it shows up in the Media library without the user ever
+  /// opening Create for this session. Best-effort and silent when ComfyUI
+  /// isn't configured -- a Configure action belongs on the gallery screen
+  /// itself, not as a chat-load side effect.
+  Future<void> _backfillGeneratedMedia(
+    List<Map<String, dynamic>> messages,
+  ) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final endpoint = await ComfyUiPrefs.loadConfiguredEndpoint(prefs);
+      if (endpoint == null) return;
+      final repository = await _resolveGenerationRepository();
+      await repository.upsertChatToolOutputs(
+        endpoint: endpoint,
+        sessionId: widget.session.id,
+        messages: messages,
+      );
+    } catch (_) {
+      // The transcript itself already rendered successfully.
+    }
+  }
+
+  /// Best-effort: a Create-tab context prefill is a convenience, not a
+  /// requirement, so any failure here (repository unavailable, avatar
+  /// download failing) must leave the character chat itself unaffected.
+  Future<void> _saveCharacterGenerationContext(
+    CharacterSummary picked,
+    CharacterCard card,
+  ) async {
+    try {
+      final repository = await _resolveGenerationRepository();
+      final now = DateTime.now();
+      final generationContext = CharacterGenerationContext.fromCard(
+        sessionId: widget.session.id,
+        card: card,
+        now: now,
+      );
+      File? referenceImage;
+      try {
+        final tempDir = await getTemporaryDirectory();
+        final destination = File(
+          '${tempDir.path}${Platform.pathSeparator}'
+          'character-avatar-${now.microsecondsSinceEpoch}',
+        );
+        await _mediaDownload.download(
+          Uri.parse(_client.characterImageUrl(picked.primaryImage)),
+          destination: destination,
+          maxBytes: 10 * 1024 * 1024,
+          headers: _client.authHeaders,
+        );
+        referenceImage = destination;
+      } catch (_) {
+        // The context still saves without an avatar.
+      }
+      await repository.saveCharacterContext(
+        generationContext,
+        referenceImage: referenceImage,
+      );
+      // Synchronous: CharacterGenerationContextStore.save() already copied
+      // the bytes it needs; this temp file is a single one-off cleanup, not
+      // a hot path.
+      if (referenceImage != null && referenceImage.existsSync()) {
+        try {
+          referenceImage.deleteSync();
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   // ── Character background ────────────────────────────────────────────
@@ -680,6 +790,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       onComplete?.call();
     }
+
     try {
       await _xtts.speak(
         spokenText,
@@ -692,7 +803,10 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('TTS failed: $e', style: const TextStyle(color: Colors.black87)),
+          content: Text(
+            'TTS failed: $e',
+            style: const TextStyle(color: Colors.black87),
+          ),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 4),
         ),
@@ -785,7 +899,10 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _speakingMessage = null);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Voice playback failed: $e', style: const TextStyle(color: Colors.black87)),
+          content: Text(
+            'Voice playback failed: $e',
+            style: const TextStyle(color: Colors.black87),
+          ),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 3),
         ),
@@ -839,7 +956,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final follow = !_showScrollToBottom;
     setState(() {
       if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
-        _messages.last['content'] = (_messages.last['content'] as String) + chunk;
+        _messages.last['content'] =
+            (_messages.last['content'] as String) + chunk;
       }
     });
     if (follow) {
@@ -869,6 +987,7 @@ class _ChatScreenState extends State<ChatScreen> {
         _messages = messages;
         _loading = false;
       });
+      unawaited(_backfillGeneratedMedia(messages));
       final saved = _savedPositions[widget.session.id];
       if (saved != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -909,7 +1028,10 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_messages.isNotEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Refresh failed: $errStr', style: const TextStyle(color: Colors.black87)),
+            content: Text(
+              'Refresh failed: $errStr',
+              style: const TextStyle(color: Colors.black87),
+            ),
             backgroundColor: Colors.orange,
             duration: const Duration(seconds: 6),
           ),
@@ -1035,7 +1157,8 @@ class _ChatScreenState extends State<ChatScreen> {
       final role = (msg['role'] as String?) ?? '';
       if (role != 'tool') continue;
 
-      final name = (msg['name'] as String?) ??
+      final name =
+          (msg['name'] as String?) ??
           (msg['tool_name'] as String?) ??
           (msg['toolCallName'] as String?) ??
           '';
@@ -1140,9 +1263,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (selected == null || !mounted) return;
     final prompt = 'Use the "$selected" skill: ';
     _textController.text = prompt;
-    _textController.selection = TextSelection.collapsed(
-      offset: prompt.length,
-    );
+    _textController.selection = TextSelection.collapsed(offset: prompt.length);
   }
 
   Future<void> _cmdSwitchModel() async {
@@ -1154,9 +1275,9 @@ class _ChatScreenState extends State<ChatScreen> {
       options = await dashboard.getModelOptions();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not load models: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not load models: $e')));
       return;
     }
     if (!mounted) return;
@@ -1196,13 +1317,15 @@ class _ChatScreenState extends State<ChatScreen> {
       await dashboard.setModel('main', provider, model);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Model set to $model — applies to new sessions')),
+        SnackBar(
+          content: Text('Model set to $model — applies to new sessions'),
+        ),
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not set model: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not set model: $e')));
     }
   }
 
@@ -1242,7 +1365,8 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     if (_sending || _streaming) return;
 
-    if (textOverride == null && _slashCommands.containsKey(text.toLowerCase())) {
+    if (textOverride == null &&
+        _slashCommands.containsKey(text.toLowerCase())) {
       _textController.text = '';
       await _handleSlashCommand(text.toLowerCase());
       return;
@@ -1305,114 +1429,119 @@ class _ChatScreenState extends State<ChatScreen> {
     _streamCancelToken = StreamCancelToken();
     try {
       await _gateway.sendMessageStreaming(
-      message: text,
-      sessionId: widget.session.id,
-      imageDataUrls: pendingSend.imageDataUrls,
-      cancelToken: _streamCancelToken,
-      onToken: (token) {
-        if (!mounted) return;
-        _pendingTokens.write(token);
-        _tokenFlushTimer ??= Timer(
-          _flushDelayFor(_streamingContentLength),
-          _flushPendingTokens,
-        );
-      },
-      onToolProgress: (progress) {
-        if (!mounted) return;
-        _upsertToolProgress(progress);
-      },
-      onDone: () async {
-        // Server-side history is about to replace _messages wholesale — drop
-        // any buffered tokens instead of letting a stray delayed flush write
-        // them onto the freshly fetched list.
-        _tokenFlushTimer?.cancel();
-        _tokenFlushTimer = null;
-        _pendingTokens.clear();
-        _streamCancelToken = null;
-        if (!mounted) return;
-        // Refresh messages to get the final server-side state
-        try {
-          final messages = await _client.getMessages(widget.session.id);
+        message: text,
+        sessionId: widget.session.id,
+        imageDataUrls: pendingSend.imageDataUrls,
+        cancelToken: _streamCancelToken,
+        onToken: (token) {
           if (!mounted) return;
-          _extractToolMessages(messages);
-          final settled = _mediaUrlsIn(messages);
-          setState(() {
-            _messages = messages;
-            _streaming = false;
-            _sending = false;
-            _showScrollToBottom = false;
-            // Drop only the URLs the refetched transcript actually carries, so
-            // nothing renders twice. Anything whose tool-result row hasn't
-            // been persisted yet stays put rather than blinking out and
-            // reappearing a poll later — that flash is what _pollForLateMedia
-            // used to paper over.
-            _liveMediaUrls.removeWhere(settled.contains);
-          });
-          // The image tool's result row may land just after this refetch;
-          // poll briefly so a freshly generated image doesn't require leaving
-          // and reopening the chat to appear.
-          _pollForLateMedia();
-          // The foreground service (started unconditionally above, not only
-          // when actually backgrounded) keeps the notification "Waiting for a
-          // reply…" up throughout, then just dismisses it on completion --
-          // nothing tells the user it's actually done if they weren't looking
-          // at the screen. Only worth a notification if they in fact weren't.
-          if (WidgetsBinding.instance.lifecycleState !=
-              AppLifecycleState.resumed) {
-            final lastAssistant = messages.reversed.firstWhere(
-              (m) => m['role'] == 'assistant',
-              orElse: () => const <String, dynamic>{},
-            );
-            final replyText =
-                parseMessageContent(lastAssistant['content']).text.trim();
-            if (replyText.isNotEmpty) {
-              ReplyNotificationService.showReplyReady(
-                widget.session.id,
-                title: 'Hermes replied',
-                preview: replyText.length > 200
-                    ? '${replyText.substring(0, 200)}…'
-                    : replyText,
+          _pendingTokens.write(token);
+          _tokenFlushTimer ??= Timer(
+            _flushDelayFor(_streamingContentLength),
+            _flushPendingTokens,
+          );
+        },
+        onToolProgress: (progress) {
+          if (!mounted) return;
+          _upsertToolProgress(progress);
+        },
+        onDone: () async {
+          // Server-side history is about to replace _messages wholesale — drop
+          // any buffered tokens instead of letting a stray delayed flush write
+          // them onto the freshly fetched list.
+          _tokenFlushTimer?.cancel();
+          _tokenFlushTimer = null;
+          _pendingTokens.clear();
+          _streamCancelToken = null;
+          if (!mounted) return;
+          // Refresh messages to get the final server-side state
+          try {
+            final messages = await _client.getMessages(widget.session.id);
+            if (!mounted) return;
+            _extractToolMessages(messages);
+            final settled = _mediaUrlsIn(messages);
+            setState(() {
+              _messages = messages;
+              _streaming = false;
+              _sending = false;
+              _showScrollToBottom = false;
+              // Drop only the URLs the refetched transcript actually carries, so
+              // nothing renders twice. Anything whose tool-result row hasn't
+              // been persisted yet stays put rather than blinking out and
+              // reappearing a poll later — that flash is what _pollForLateMedia
+              // used to paper over.
+              _liveMediaUrls.removeWhere(settled.contains);
+            });
+            // The image tool's result row may land just after this refetch;
+            // poll briefly so a freshly generated image doesn't require leaving
+            // and reopening the chat to appear.
+            _pollForLateMedia();
+            // The foreground service (started unconditionally above, not only
+            // when actually backgrounded) keeps the notification "Waiting for a
+            // reply…" up throughout, then just dismisses it on completion --
+            // nothing tells the user it's actually done if they weren't looking
+            // at the screen. Only worth a notification if they in fact weren't.
+            if (WidgetsBinding.instance.lifecycleState !=
+                AppLifecycleState.resumed) {
+              final lastAssistant = messages.reversed.firstWhere(
+                (m) => m['role'] == 'assistant',
+                orElse: () => const <String, dynamic>{},
               );
+              final replyText = parseMessageContent(
+                lastAssistant['content'],
+              ).text.trim();
+              if (replyText.isNotEmpty) {
+                ReplyNotificationService.showReplyReady(
+                  widget.session.id,
+                  title: 'Hermes replied',
+                  preview: replyText.length > 200
+                      ? '${replyText.substring(0, 200)}…'
+                      : replyText,
+                );
+              }
             }
-          }
-          if (_awaitingVoiceReply) {
-            _awaitingVoiceReply = false;
-            final assistant = messages.reversed.firstWhere(
-              (message) => message['role'] == 'assistant',
-              orElse: () => const <String, dynamic>{},
-            );
-            final assistantText = assistant['content']?.toString();
-            if (assistantText != null) {
-              await _speakAssistantText(
-                assistantText,
-                message: assistant.isEmpty ? null : assistant,
-                onComplete: _autoContinueEnabled ? _scheduleAutoContinue : null,
+            if (_awaitingVoiceReply) {
+              _awaitingVoiceReply = false;
+              final assistant = messages.reversed.firstWhere(
+                (message) => message['role'] == 'assistant',
+                orElse: () => const <String, dynamic>{},
               );
+              final assistantText = assistant['content']?.toString();
+              if (assistantText != null) {
+                await _speakAssistantText(
+                  assistantText,
+                  message: assistant.isEmpty ? null : assistant,
+                  onComplete: _autoContinueEnabled
+                      ? _scheduleAutoContinue
+                      : null,
+                );
+              } else if (_autoContinueEnabled) {
+                _scheduleAutoContinue();
+              }
             } else if (_autoContinueEnabled) {
+              // Voice reply is off, so there's no playback-finished signal to
+              // wait on — just pace on a fixed delay instead.
               _scheduleAutoContinue();
             }
-          } else if (_autoContinueEnabled) {
-            // Voice reply is off, so there's no playback-finished signal to
-            // wait on — just pace on a fixed delay instead.
-            _scheduleAutoContinue();
+            WidgetsBinding.instance.addPostFrameCallback(
+              (_) => _scrollToBottom(),
+            );
+          } catch (e) {
+            if (!mounted) return;
+            setState(() {
+              _streaming = false;
+              _sending = false;
+            });
           }
-          WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
-        } catch (e) {
+        },
+        onError: (error) async {
+          _tokenFlushTimer?.cancel();
+          _tokenFlushTimer = null;
+          _pendingTokens.clear();
+          _streamCancelToken = null;
           if (!mounted) return;
-          setState(() {
-            _streaming = false;
-            _sending = false;
-          });
-        }
-      },
-      onError: (error) async {
-        _tokenFlushTimer?.cancel();
-        _tokenFlushTimer = null;
-        _pendingTokens.clear();
-        _streamCancelToken = null;
-        if (!mounted) return;
-        await _handleSendError(pendingSend, error, baselineMessageCount);
-      },
+          await _handleSendError(pendingSend, error, baselineMessageCount);
+        },
       );
     } finally {
       // Always stop once the send completes — success, error, or cancel —
@@ -1552,7 +1681,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Send failed: $e', style: const TextStyle(color: Colors.black87)),
+          content: Text(
+            'Send failed: $e',
+            style: const TextStyle(color: Colors.black87),
+          ),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 6),
         ),
@@ -1580,9 +1712,7 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       final idx = toolCallId.isEmpty
           ? -1
-          : _toolMessages.indexWhere(
-              (m) => m['toolCallId'] == toolCallId,
-            );
+          : _toolMessages.indexWhere((m) => m['toolCallId'] == toolCallId);
       final payload = {
         'role': 'tool_progress',
         'content': content,
@@ -1599,8 +1729,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
 
-    if (done &&
-        (tool == 'image_generate' || tool == 'video_generate')) {
+    if (done && (tool == 'image_generate' || tool == 'video_generate')) {
       // Newer servers emit hermes.tool.progress with the rendered filename
       // directly in the SSE payload — render off that and skip polling.
       final filename = progress['filename']?.toString();
@@ -1626,110 +1755,123 @@ class _ChatScreenState extends State<ChatScreen> {
       appBar: _searching
           ? _buildSearchAppBar()
           : AppBar(
-        title: Text(
-          _characterName ?? widget.session.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.search),
-            tooltip: 'Search this chat',
-            onPressed: _toggleSearch,
-          ),
-          IconButton(
-            icon: const Icon(Icons.history),
-            tooltip: 'All chats',
-            onPressed: _openSessionList,
-          ),
-          IconButton(
-            icon: const Icon(Icons.face_retouching_natural),
-            tooltip: 'Characters',
-            onPressed: _streaming ? null : _pickCharacter,
-          ),
-          IconButton(
-            icon: const Icon(Icons.add_comment_outlined),
-            tooltip: 'New chat',
-            onPressed: _streaming ? null : _startNewChat,
-          ),
-          PopupMenuButton<String>(
-            tooltip: 'More',
-            onSelected: (value) {
-              switch (value) {
-                case 'auto_continue':
-                  _toggleAutoContinue();
-                  break;
-                case 'gallery':
-                  _openGallery();
-                  break;
-                case 'call':
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => CallScreen(
-                        connection: widget.connection,
-                        session: widget.session,
+              title: Text(
+                _characterName ?? widget.session.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.search),
+                  tooltip: 'Search this chat',
+                  onPressed: _toggleSearch,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.history),
+                  tooltip: 'All chats',
+                  onPressed: _openSessionList,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.face_retouching_natural),
+                  tooltip: 'Characters',
+                  onPressed: _streaming ? null : _pickCharacter,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.add_comment_outlined),
+                  tooltip: 'New chat',
+                  onPressed: _streaming ? null : _startNewChat,
+                ),
+                PopupMenuButton<String>(
+                  tooltip: 'More',
+                  onSelected: (value) {
+                    switch (value) {
+                      case 'auto_continue':
+                        _toggleAutoContinue();
+                        break;
+                      case 'create_media':
+                        _openCreate();
+                        break;
+                      case 'gallery':
+                        _openGallery();
+                        break;
+                      case 'call':
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => CallScreen(
+                              connection: widget.connection,
+                              session: widget.session,
+                            ),
+                          ),
+                        );
+                        break;
+                    }
+                  },
+                  itemBuilder: (context) => [
+                    PopupMenuItem(
+                      value: 'auto_continue',
+                      child: ListTile(
+                        leading: Icon(
+                          _autoContinueEnabled ? Icons.repeat_on : Icons.repeat,
+                          color: _autoContinueEnabled
+                              ? Theme.of(context).colorScheme.primary
+                              : null,
+                        ),
+                        title: Text(
+                          _autoContinueEnabled
+                              ? 'Auto-continue on'
+                              : 'Auto-continue',
+                        ),
+                        contentPadding: EdgeInsets.zero,
                       ),
                     ),
-                  );
-                  break;
-              }
-            },
-            itemBuilder: (context) => [
-              PopupMenuItem(
-                value: 'auto_continue',
-                child: ListTile(
-                  leading: Icon(
-                    _autoContinueEnabled ? Icons.repeat_on : Icons.repeat,
-                    color: _autoContinueEnabled
-                        ? Theme.of(context).colorScheme.primary
-                        : null,
+                    const PopupMenuItem(
+                      value: 'create_media',
+                      child: ListTile(
+                        leading: Icon(Icons.auto_fix_high),
+                        title: Text('Create media'),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    ),
+                    const PopupMenuItem(
+                      value: 'gallery',
+                      child: ListTile(
+                        leading: Icon(Icons.photo_library_outlined),
+                        title: Text('Media'),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    ),
+                    const PopupMenuItem(
+                      value: 'call',
+                      child: ListTile(
+                        leading: Icon(Icons.call),
+                        title: Text('Phone call mode'),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    ),
+                  ],
+                ),
+                if (_streaming)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: TextButton.icon(
+                      onPressed: _stopStreaming,
+                      icon: const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      label: const Text('Stop', style: TextStyle(fontSize: 13)),
+                    ),
+                  )
+                else
+                  IconButton(
+                    icon: const Icon(Icons.refresh),
+                    onPressed: _loading ? null : _fetchMessages,
+                    tooltip: 'Refresh',
                   ),
-                  title: Text(
-                    _autoContinueEnabled ? 'Auto-continue on' : 'Auto-continue',
-                  ),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'gallery',
-                child: ListTile(
-                  leading: Icon(Icons.photo_library_outlined),
-                  title: Text('Image gallery'),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'call',
-                child: ListTile(
-                  leading: Icon(Icons.call),
-                  title: Text('Phone call mode'),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-            ],
-          ),
-          if (_streaming)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: TextButton.icon(
-                onPressed: _stopStreaming,
-                icon: const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-                label: const Text('Stop', style: TextStyle(fontSize: 13)),
-              ),
-            )
-          else
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              onPressed: _loading ? null : _fetchMessages,
-              tooltip: 'Refresh',
+              ],
             ),
-        ],
-      ),
       body: Stack(
         children: [
           if (_characterImagePath != null) _buildCharacterBackdrop(),
@@ -1760,6 +1902,7 @@ class _ChatScreenState extends State<ChatScreen> {
             children: [
               CachedMediaThumbnail(
                 url: _client.characterImageUrl(_characterImagePath!),
+                mediaCache: _mediaCache,
                 headers: _client.authHeaders,
                 fit: BoxFit.cover,
                 // Decode near screen width, not the card's native resolution —
@@ -1780,30 +1923,30 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildChatColumn() {
     return Center(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth: Responsive.isTablet(context) ? 800 : double.infinity,
-          ),
-          child: Column(
-            children: [
-              Expanded(
-                child: Stack(
-                  children: [
-                    _buildBody(),
-                    Positioned(
-                      right: 16,
-                      bottom: 12,
-                      child: _buildScrollToBottomButton(),
-                    ),
-                  ],
-                ),
-              ),
-              if (_speakingMessage != null) _buildSpeakingJumpBar(),
-              if (_showingSlashSuggestions) _buildSlashSuggestions(),
-              _buildInputBar(),
-            ],
-          ),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: Responsive.isTablet(context) ? 800 : double.infinity,
         ),
+        child: Column(
+          children: [
+            Expanded(
+              child: Stack(
+                children: [
+                  _buildBody(),
+                  Positioned(
+                    right: 16,
+                    bottom: 12,
+                    child: _buildScrollToBottomButton(),
+                  ),
+                ],
+              ),
+            ),
+            if (_speakingMessage != null) _buildSpeakingJumpBar(),
+            if (_showingSlashSuggestions) _buildSlashSuggestions(),
+            _buildInputBar(),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1811,17 +1954,121 @@ class _ChatScreenState extends State<ChatScreen> {
   /// message that produced it, which we then scroll to and flash — the
   /// gallery doubles as an index into the conversation, not just a lightbox.
   Future<void> _openGallery() async {
-    final source = await Navigator.push<Map<String, dynamic>>(
+    final repository = await _resolveGenerationRepository();
+    if (!mounted) return;
+    await Navigator.push(
       context,
       MaterialPageRoute(
         builder: (_) => MediaGalleryScreen(
-          messages: _messages,
-          comfyBaseUrl: _comfyBaseUrl,
+          repository: repository,
+          onOpenSourceMessage: _openSourceMessage,
+          mediaCache: _mediaCache,
+          mediaExport: _mediaExport,
         ),
       ),
     );
-    if (source == null || !mounted) return;
-    await _jumpToMessage(source);
+  }
+
+  /// Finds the transcript row a global-media item was generated from (by
+  /// its own message id, not text/role matching -- a media asset's
+  /// sourceMessageId is only meaningful for THIS session's own messages)
+  /// and jumps to it. A no-op if that message isn't in the currently
+  /// loaded transcript (a different session, or one not yet fetched).
+  Future<void> _openSourceMessage(MediaAsset asset) async {
+    final messageId = asset.sourceMessageId;
+    if (messageId == null || asset.sourceSessionId != widget.session.id) {
+      return;
+    }
+    Map<String, dynamic>? match;
+    for (final msg in _messages) {
+      if (msg['id']?.toString() == messageId) {
+        match = msg;
+        break;
+      }
+    }
+    if (match == null) return;
+    await _jumpToMessage(match);
+  }
+
+  /// Opens Create for this session: the app-scoped repository resolves
+  /// asynchronously (never constructed or disposed by this screen), then
+  /// this session's saved character context (null for an ordinary session,
+  /// which must leave the form editable and unblocked, not stuck loading).
+  Future<void> _openCreate({int initialTab = 0}) async {
+    final repository = await _resolveGenerationRepository();
+    if (!mounted) return;
+    final generationContext = await repository.getCharacterContext(
+      widget.session.id,
+    );
+    if (!mounted) return;
+    final result = await Navigator.push<CreateScreenResult>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CreateScreen(
+          connection: widget.connection,
+          initialTab: initialTab,
+          initialContext: generationContext,
+          repository: repository,
+        ),
+      ),
+    );
+    if (result is DiscussGeneratedImage) {
+      await _handleDiscussImage(result.asset);
+    }
+  }
+
+  /// Downloads a generated image and prepares it exactly like a
+  /// gallery-picked image (same multimodal attachment state, same preview
+  /// strip) without sending anything -- the user still has to hit send.
+  Future<void> _handleDiscussImage(MediaAsset asset) async {
+    final endpoint = ComfyEndpoint.parse(asset.endpointSnapshot);
+    final uri = endpoint.viewUri(asset.outputRef);
+    final tempDir = await getTemporaryDirectory();
+    final destination = File(
+      '${tempDir.path}${Platform.pathSeparator}'
+      'discuss-${DateTime.now().microsecondsSinceEpoch}',
+    );
+    try {
+      await _mediaDownload.download(
+        uri,
+        destination: destination,
+        maxBytes: 25 * 1024 * 1024,
+        confirmAfterHeaders: (info) async {
+          final type = info.contentType?.toLowerCase();
+          return type == null || type.startsWith('image/');
+        },
+      );
+      // Synchronous: the file is already bounded to 25 MiB and this is a
+      // single one-off read, not a hot path.
+      final bytes = destination.readAsBytesSync();
+      final mime = _sniffImageMime(bytes) ?? asset.contentType;
+      if (mime == null || !mime.startsWith('image/')) {
+        throw const FormatException(
+          'Downloaded file is not a recognizable image',
+        );
+      }
+      // Encoded on the main isolate deliberately, unlike _pickImage's
+      // Isolate.run(): this is a one-off, user-triggered action on an
+      // already-bounded (25 MiB) file, not a per-frame hot path.
+      final dataUrl = buildImageDataUrl(bytes, mime);
+      if (!mounted) return;
+      setState(() {
+        _pickedImageBytes = bytes;
+        _pickedImageMimeType = mime;
+        _pickedImageDataUrl = dataUrl;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not load image: $error')));
+    } finally {
+      if (destination.existsSync()) {
+        try {
+          destination.deleteSync();
+        } catch (_) {}
+      }
+    }
   }
 
   /// App bar replacement while searching: query field plus hit counter and
@@ -1911,9 +2158,9 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildSpeakingJumpBar() {
     final speaking = _speakingMessage;
     if (speaking == null) return const SizedBox.shrink();
-    final preview = parseMessageContent(speaking['content']).text
-        .replaceAll(RegExp(r'\s+'), ' ')
-        .trim();
+    final preview = parseMessageContent(
+      speaking['content'],
+    ).text.replaceAll(RegExp(r'\s+'), ' ').trim();
     return Material(
       color: Theme.of(context).colorScheme.surfaceContainerHighest,
       child: InkWell(
@@ -1984,75 +2231,77 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             if (_pickedImageBytes != null) _buildImagePreviewStrip(),
             Row(
-          children: [
-            IconButton(
-              icon: const Icon(Icons.image_outlined),
-              tooltip: 'Attach photo',
-              onPressed: (!_loading && !_streaming && !_sending)
-                  ? _pickImage
-                  : null,
-            ),
-            Expanded(
-              child: TextField(
-                controller: _textController,
-                decoration: InputDecoration(
-                  hintText: 'Type a message…',
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
-                  ),
-                  isDense: true,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.image_outlined),
+                  tooltip: 'Attach photo',
+                  onPressed: (!_loading && !_streaming && !_sending)
+                      ? _pickImage
+                      : null,
                 ),
-                minLines: 1,
-                maxLines: 4,
-                textCapitalization: TextCapitalization.sentences,
-                keyboardType: TextInputType.multiline,
-                textInputAction: TextInputAction.send,
-                enabled: !_loading && !_streaming,
-                onSubmitted: (_) => _sendMessage(),
-              ),
-            ),
-            const SizedBox(width: 8),
-            IconButton.filledTonal(
-              icon: Icon(_listening ? Icons.mic_off : Icons.mic),
-              color: _listening ? Theme.of(context).colorScheme.error : null,
-              onPressed: (!_loading && !_streaming && !_sending)
-                  ? _toggleVoiceInput
-                  : null,
-              tooltip: _listening ? 'Stop listening' : 'Speak to Hermes',
-            ),
-            IconButton(
-              icon: Icon(
-                _voiceReplyEnabled ? Icons.volume_up : Icons.volume_off,
-              ),
-              onPressed: () {
-                setState(() => _voiceReplyEnabled = !_voiceReplyEnabled);
-                if (!_voiceReplyEnabled) {
-                  _xtts.stop();
-                }
-              },
-              tooltip: _voiceReplyEnabled
-                  ? 'Spoken replies on'
-                  : 'Spoken replies off',
-            ),
-            const SizedBox(width: 4),
-            CircleAvatar(
-              child: _streaming
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : IconButton(
-                      icon: const Icon(Icons.send, size: 20),
-                      onPressed: _sendMessage,
-                      tooltip: 'Send',
+                Expanded(
+                  child: TextField(
+                    controller: _textController,
+                    decoration: InputDecoration(
+                      hintText: 'Type a message…',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(24),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      isDense: true,
                     ),
-            ),
-          ],
+                    minLines: 1,
+                    maxLines: 4,
+                    textCapitalization: TextCapitalization.sentences,
+                    keyboardType: TextInputType.multiline,
+                    textInputAction: TextInputAction.send,
+                    enabled: !_loading && !_streaming,
+                    onSubmitted: (_) => _sendMessage(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
+                  icon: Icon(_listening ? Icons.mic_off : Icons.mic),
+                  color: _listening
+                      ? Theme.of(context).colorScheme.error
+                      : null,
+                  onPressed: (!_loading && !_streaming && !_sending)
+                      ? _toggleVoiceInput
+                      : null,
+                  tooltip: _listening ? 'Stop listening' : 'Speak to Hermes',
+                ),
+                IconButton(
+                  icon: Icon(
+                    _voiceReplyEnabled ? Icons.volume_up : Icons.volume_off,
+                  ),
+                  onPressed: () {
+                    setState(() => _voiceReplyEnabled = !_voiceReplyEnabled);
+                    if (!_voiceReplyEnabled) {
+                      _xtts.stop();
+                    }
+                  },
+                  tooltip: _voiceReplyEnabled
+                      ? 'Spoken replies on'
+                      : 'Spoken replies off',
+                ),
+                const SizedBox(width: 4),
+                CircleAvatar(
+                  child: _streaming
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : IconButton(
+                          icon: const Icon(Icons.send, size: 20),
+                          onPressed: _sendMessage,
+                          tooltip: 'Send',
+                        ),
+                ),
+              ],
             ),
           ],
         ),
@@ -2181,7 +2430,12 @@ class _ChatScreenState extends State<ChatScreen> {
           child = _ToolProgressCard(items: item, verbose: _verboseMode);
         } else if (item is List<String>) {
           // Generated media (images/videos) extracted from tool results.
-          child = _MediaRow(urls: item);
+          child = _MediaRow(
+            urls: item,
+            mediaCache: _mediaCache,
+            mediaExport: _mediaExport,
+            videoCoordinator: _videoCoordinator,
+          );
         } else {
           final msg = item as Map<String, dynamic>;
           final role = (msg['role'] as String?) ?? 'assistant';
@@ -2191,6 +2445,7 @@ class _ChatScreenState extends State<ChatScreen> {
           child = _MessageBubble(
             content: parsed.text,
             imageUrls: parsed.imageUrls,
+            mediaCache: _mediaCache,
             isUser: isUser,
             verbose: _verboseMode,
             metadata: msg,
@@ -2325,8 +2580,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void _stepSearch(int delta) {
     if (_searchHits.isEmpty) return;
     setState(() {
-      _searchCursor =
-          (_searchCursor + delta) % _searchHits.length;
+      _searchCursor = (_searchCursor + delta) % _searchHits.length;
       if (_searchCursor < 0) _searchCursor += _searchHits.length;
     });
     _revealSearchHit();
@@ -2377,7 +2631,8 @@ class _ChatScreenState extends State<ChatScreen> {
     int liveMediaCount,
     String comfyBaseUrl,
     bool lastMessageEmpty,
-  })? _displayCacheKey;
+  })?
+  _displayCacheKey;
 
   /// Bumped by [_invalidateDisplayList] whenever _messages, _toolMessages,
   /// _liveMediaUrls or _comfyBaseUrl are mutated in a way the row list depends
@@ -2636,8 +2891,9 @@ class _EditMessageDialog extends StatefulWidget {
 }
 
 class _EditMessageDialogState extends State<_EditMessageDialog> {
-  late final TextEditingController _controller =
-      TextEditingController(text: widget.initialText);
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initialText,
+  );
 
   @override
   void dispose() {
@@ -2675,6 +2931,7 @@ class _EditMessageDialogState extends State<_EditMessageDialog> {
 class _MessageBubble extends StatelessWidget {
   final String content;
   final List<String> imageUrls;
+  final MediaCachePort mediaCache;
   final bool isUser;
   final bool verbose;
   final Map<String, dynamic> metadata;
@@ -2703,6 +2960,7 @@ class _MessageBubble extends StatelessWidget {
   const _MessageBubble({
     required this.content,
     this.imageUrls = const [],
+    required this.mediaCache,
     required this.isUser,
     this.verbose = false,
     this.metadata = const {},
@@ -2741,8 +2999,9 @@ class _MessageBubble extends StatelessWidget {
     final assistantBubbleColor = rp
         ? const Color(0xFF141414).withValues(alpha: 0.82)
         : (isDark ? const Color(0xFF2A2A2A) : const Color(0xFFEAEAEA));
-    final assistantTextColor =
-        rp ? _rpDialogue : (isDark ? Colors.white : Colors.black87);
+    final assistantTextColor = rp
+        ? _rpDialogue
+        : (isDark ? Colors.white : Colors.black87);
     // White text on this gold measures ~2.1:1 contrast — well under WCAG AA's
     // 4.5:1 minimum for normal text. Dark text on the same gold comfortably
     // clears it, so every isUser text color below uses this instead of white.
@@ -2821,7 +3080,11 @@ class _MessageBubble extends StatelessWidget {
                       (url) => SizedBox(
                         width: 140,
                         height: 140,
-                        child: CachedMediaThumbnail(url: url, borderRadius: 12),
+                        child: CachedMediaThumbnail(
+                          url: url,
+                          mediaCache: mediaCache,
+                          borderRadius: 12,
+                        ),
                       ),
                     )
                     .toList(),
@@ -2831,84 +3094,93 @@ class _MessageBubble extends StatelessWidget {
           if (content.isNotEmpty)
             MarkdownBody(
               data: content,
-            styleSheet: MarkdownStyleSheet(
-              p: (isUser
-                  ? theme.textTheme.bodyMedium?.copyWith(color: userTextColor)
-                  : theme.textTheme.bodyMedium?.copyWith(
-                      color: assistantTextColor,
-                      shadows: rp ? _rpDialogueHalo : null,
-                    )),
-              code: TextStyle(
-                backgroundColor: Colors.black.withValues(alpha: 0.12),
-                fontFamily: 'monospace',
-                color: isUser ? userTextColor : null,
-              ),
-              a: TextStyle(
-                color: isUser ? Colors.blue[900] : theme.colorScheme.primary,
-              ),
-              h1: isUser
-                  ? theme.textTheme.headlineSmall?.copyWith(color: userTextColor)
-                  : theme.textTheme.headlineSmall,
-              h2: isUser
-                  ? theme.textTheme.titleLarge?.copyWith(color: userTextColor)
-                  : theme.textTheme.titleLarge,
-              h3: isUser
-                  ? theme.textTheme.titleMedium?.copyWith(color: userTextColor)
-                  : theme.textTheme.titleMedium,
-              blockquote: TextStyle(
-                color: isUser ? userTextColor.withValues(alpha: 0.7) : Colors.grey,
-                fontStyle: FontStyle.italic,
-              ),
-              blockquoteDecoration: BoxDecoration(
-                border: Border(
-                  left: BorderSide(
-                    color: isUser
-                        ? userTextColor.withValues(alpha: 0.4)
-                        : theme.colorScheme.primary,
-                    width: 3,
+              styleSheet: MarkdownStyleSheet(
+                p: (isUser
+                    ? theme.textTheme.bodyMedium?.copyWith(color: userTextColor)
+                    : theme.textTheme.bodyMedium?.copyWith(
+                        color: assistantTextColor,
+                        shadows: rp ? _rpDialogueHalo : null,
+                      )),
+                code: TextStyle(
+                  backgroundColor: Colors.black.withValues(alpha: 0.12),
+                  fontFamily: 'monospace',
+                  color: isUser ? userTextColor : null,
+                ),
+                a: TextStyle(
+                  color: isUser ? Colors.blue[900] : theme.colorScheme.primary,
+                ),
+                h1: isUser
+                    ? theme.textTheme.headlineSmall?.copyWith(
+                        color: userTextColor,
+                      )
+                    : theme.textTheme.headlineSmall,
+                h2: isUser
+                    ? theme.textTheme.titleLarge?.copyWith(color: userTextColor)
+                    : theme.textTheme.titleLarge,
+                h3: isUser
+                    ? theme.textTheme.titleMedium?.copyWith(
+                        color: userTextColor,
+                      )
+                    : theme.textTheme.titleMedium,
+                blockquote: TextStyle(
+                  color: isUser
+                      ? userTextColor.withValues(alpha: 0.7)
+                      : Colors.grey,
+                  fontStyle: FontStyle.italic,
+                ),
+                blockquoteDecoration: BoxDecoration(
+                  border: Border(
+                    left: BorderSide(
+                      color: isUser
+                          ? userTextColor.withValues(alpha: 0.4)
+                          : theme.colorScheme.primary,
+                      width: 3,
+                    ),
                   ),
                 ),
+                // *asterisks* — narration and actions. The markdown renderer
+                // surfaces them as emphasis, which is what makes roleplay
+                // styling possible without a custom parser.
+                em: isUser
+                    ? theme.textTheme.bodyMedium?.copyWith(
+                        fontStyle: FontStyle.italic,
+                        color: userTextColor,
+                      )
+                    : theme.textTheme.bodyMedium?.copyWith(
+                        fontStyle: rp ? FontStyle.normal : FontStyle.italic,
+                        fontWeight: rp ? FontWeight.bold : null,
+                        color: rp ? _rpNarration : null,
+                      ),
+                strong: isUser
+                    ? theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: userTextColor,
+                      )
+                    : theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: rp ? _rpNarration : null,
+                      ),
               ),
-              // *asterisks* — narration and actions. The markdown renderer
-              // surfaces them as emphasis, which is what makes roleplay
-              // styling possible without a custom parser.
-              em: isUser
-                  ? theme.textTheme.bodyMedium?.copyWith(
-                      fontStyle: FontStyle.italic,
-                      color: userTextColor,
-                    )
-                  : theme.textTheme.bodyMedium?.copyWith(
-                      fontStyle: rp ? FontStyle.normal : FontStyle.italic,
-                      fontWeight: rp ? FontWeight.bold : null,
-                      color: rp ? _rpNarration : null,
-                    ),
-              strong: isUser
-                  ? theme.textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
-                      color: userTextColor,
-                    )
-                  : theme.textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
-                      color: rp ? _rpNarration : null,
-                    ),
             ),
-          ),
           // Per-message actions: TTS replay + regenerate (assistant only),
           // edit & resend (user only).
           if (onReplay != null || onRegenerate != null || onEdit != null)
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Align(
-                alignment:
-                    isUser ? Alignment.centerRight : Alignment.centerLeft,
+                alignment: isUser
+                    ? Alignment.centerRight
+                    : Alignment.centerLeft,
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     if (!isUser && onReplay != null)
                       IconButton(
                         padding: EdgeInsets.zero,
-                        constraints:
-                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        constraints: const BoxConstraints(
+                          minWidth: 28,
+                          minHeight: 28,
+                        ),
                         icon: Icon(
                           isSpeaking
                               ? Icons.stop_rounded
@@ -2921,8 +3193,10 @@ class _MessageBubble extends StatelessWidget {
                     if (!isUser && onRegenerate != null)
                       IconButton(
                         padding: EdgeInsets.zero,
-                        constraints:
-                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        constraints: const BoxConstraints(
+                          minWidth: 28,
+                          minHeight: 28,
+                        ),
                         icon: const Icon(Icons.refresh_rounded),
                         tooltip: 'Ask again (sends as a new message)',
                         color: isDark ? Colors.white54 : Colors.black45,
@@ -2931,8 +3205,10 @@ class _MessageBubble extends StatelessWidget {
                     if (isUser && onEdit != null)
                       IconButton(
                         padding: EdgeInsets.zero,
-                        constraints:
-                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        constraints: const BoxConstraints(
+                          minWidth: 28,
+                          minHeight: 28,
+                        ),
                         icon: const Icon(Icons.edit_outlined, size: 18),
                         tooltip: 'Edit & resend as a new message',
                         color: userTextColor.withValues(alpha: 0.6),
@@ -2956,15 +3232,11 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
-
 class _ToolProgressCard extends StatelessWidget {
   final List<Map<String, dynamic>> items;
   final bool verbose;
 
-  const _ToolProgressCard({
-    required this.items,
-    this.verbose = false,
-  });
+  const _ToolProgressCard({required this.items, this.verbose = false});
 
   @override
   Widget build(BuildContext context) {
@@ -2980,7 +3252,9 @@ class _ToolProgressCard extends StatelessWidget {
 
     final emojis = items.map((item) {
       final content = (item['content'] as String?) ?? '';
-      return content.isNotEmpty ? content.substring(0, content.length < 2 ? content.length : 2) : '\uD83D\uDD27';
+      return content.isNotEmpty
+          ? content.substring(0, content.length < 2 ? content.length : 2)
+          : '\uD83D\uDD27';
     }).toList();
 
     return Container(
@@ -3000,20 +3274,14 @@ class _ToolProgressCard extends StatelessWidget {
             style: const TextStyle(fontSize: 13),
           ),
           const SizedBox(width: 6),
-          Text(
-            emojis.join(' '),
-            style: const TextStyle(fontSize: 13),
-          ),
+          Text(emojis.join(' '), style: const TextStyle(fontSize: 13)),
           if (active)
             Padding(
               padding: const EdgeInsets.only(left: 8),
               child: SizedBox(
                 width: 12,
                 height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 1.5,
-                  color: fg,
-                ),
+                child: CircularProgressIndicator(strokeWidth: 1.5, color: fg),
               ),
             ),
         ],
@@ -3029,7 +3297,15 @@ class _ToolProgressCard extends StatelessWidget {
 /// A column of generated media (images and/or videos) from tool results.
 class _MediaRow extends StatelessWidget {
   final List<String> urls;
-  const _MediaRow({required this.urls});
+  final MediaCachePort mediaCache;
+  final MediaExportService mediaExport;
+  final GeneratedVideoCoordinator videoCoordinator;
+  const _MediaRow({
+    required this.urls,
+    required this.mediaCache,
+    required this.mediaExport,
+    required this.videoCoordinator,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -3041,520 +3317,47 @@ class _MediaRow extends StatelessWidget {
       // so keys here genuinely let a clip keep its opened Player when the
       // row's contents shift around it.
       children: urls.map((u) {
-        final filename = Uri.parse(u).queryParameters['filename'] ?? '';
-        return ComfyUi.isVideo(filename)
-            ? _VideoBubble(url: u, key: ValueKey(u))
-            : _ImageBubble(url: u, key: ValueKey(u));
+        final uri = Uri.parse(u);
+        final filename = uri.queryParameters['filename'] ?? '';
+        return GeneratedMediaView(
+          key: ValueKey(u),
+          id: u,
+          kind: ComfyUi.isVideo(filename)
+              ? ComfyMediaKind.video
+              : ComfyMediaKind.image,
+          uri: uri,
+          mediaCache: mediaCache,
+          mediaExport: mediaExport,
+          videoCoordinator: videoCoordinator,
+        );
       }).toList(),
     );
   }
 }
 
-/// Share / save-to-gallery bottom sheet for a generated media bubble.
-/// Re-resolves [url] through MediaCacheService rather than threading a
-/// [File] through bubble state -- cheap once cached, and keeps both
-/// _ImageBubble and _VideoBubble from needing extra fields just for this.
-Future<void> _showMediaActions(
-  BuildContext context,
-  String url, {
-  required bool isVideo,
-}) async {
-  final action = await showModalBottomSheet<String>(
-    context: context,
-    builder: (sheetContext) => SafeArea(
-      child: Wrap(
-        children: [
-          ListTile(
-            leading: const Icon(Icons.ios_share),
-            title: const Text('Share'),
-            onTap: () => Navigator.pop(sheetContext, 'share'),
-          ),
-          ListTile(
-            leading: const Icon(Icons.save_alt),
-            title: const Text('Save to Photos'),
-            onTap: () => Navigator.pop(sheetContext, 'save'),
-          ),
-        ],
-      ),
-    ),
-  );
-  if (action == null || !context.mounted) return;
-
-  final File file;
-  try {
-    file = await MediaCacheService.fileFor(url);
-  } catch (e) {
-    if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not load media: $e')),
-      );
+/// Verifies a downloaded file is actually an image by its magic bytes,
+/// rather than trusting the server's declared content-type alone -- the
+/// discuss-in-chat path feeds this straight into the same multimodal
+/// attachment path a user-picked image uses.
+String? _sniffImageMime(Uint8List bytes) {
+  bool startsWith(List<int> signature) {
+    if (bytes.length < signature.length) return false;
+    for (var i = 0; i < signature.length; i++) {
+      if (bytes[i] != signature[i]) return false;
     }
-    return;
-  }
-  if (!context.mounted) return;
-
-  if (action == 'share') {
-    await MediaExportService.share(file);
-    return;
-  }
-  final error = await MediaExportService.saveToGallery(file, isVideo: isVideo);
-  if (context.mounted) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(error ?? 'Saved to Photos')),
-    );
-  }
-}
-
-/// Small overlay button for [_showMediaActions], shared by _ImageBubble and
-/// _VideoBubble so the two don't each style their own.
-class _MediaActionButton extends StatelessWidget {
-  final VoidCallback onPressed;
-  const _MediaActionButton({required this.onPressed});
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.black45,
-      shape: const CircleBorder(),
-      child: InkWell(
-        customBorder: const CircleBorder(),
-        onTap: onPressed,
-        child: const Padding(
-          padding: EdgeInsets.all(6),
-          child: Icon(Icons.more_vert, color: Colors.white, size: 18),
-        ),
-      ),
-    );
-  }
-}
-
-/// One generated image, resolved through [MediaCacheService] so a reopened
-/// chat reads it off disk instead of re-fetching it from the LAN gateway
-/// every time. Tappable to open full-screen with pinch-zoom.
-///
-/// This used to be a bare Image.network with no disk cache and no decode
-/// bound — every reopen re-downloaded the file, and a 1536² PNG decoded to
-/// ~9MB of bitmap, so a handful of them evicted Flutter's ImageCache and sent
-/// the whole transcript into repeated decode churn while scrolling.
-class _ImageBubble extends StatefulWidget {
-  final String url;
-  const _ImageBubble({required this.url, super.key});
-
-  @override
-  State<_ImageBubble> createState() => _ImageBubbleState();
-}
-
-class _ImageBubbleState extends State<_ImageBubble> {
-  // Built once, not in build(): a fresh Future per rebuild makes FutureBuilder
-  // resubscribe and drop back to `waiting`, which flickers the image to a
-  // spinner on every streaming-token flush.
-  Future<File>? _fileFuture;
-
-  @override
-  void initState() {
-    super.initState();
-    _resolve();
+    return true;
   }
 
-  @override
-  void didUpdateWidget(_ImageBubble oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.url != widget.url) _resolve();
+  if (startsWith(const [0x89, 0x50, 0x4e, 0x47])) return 'image/png';
+  if (startsWith(const [0xff, 0xd8, 0xff])) return 'image/jpeg';
+  if (startsWith(const [0x47, 0x49, 0x46, 0x38])) return 'image/gif';
+  if (bytes.length > 11 &&
+      startsWith(const [0x52, 0x49, 0x46, 0x46]) &&
+      bytes[8] == 0x57 &&
+      bytes[9] == 0x45 &&
+      bytes[10] == 0x42 &&
+      bytes[11] == 0x50) {
+    return 'image/webp';
   }
-
-  void _resolve() {
-    _fileFuture = MediaCacheService.fileFor(widget.url);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final media = MediaQuery.of(context);
-    final maxW = media.size.width - 80;
-    // cacheWidth is in physical pixels, so scale by DPR — decoding at the
-    // logical width would look soft on any modern phone.
-    final decodeWidth = (maxW * media.devicePixelRatio).round();
-
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      constraints: BoxConstraints(maxWidth: maxW),
-      clipBehavior: Clip.antiAlias,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-      ),
-      child: FutureBuilder<File>(
-        future: _fileFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const SizedBox(
-              height: 160,
-              child: Center(child: CircularProgressIndicator()),
-            );
-          }
-          final file = snapshot.data;
-          if (snapshot.hasError || file == null) {
-            return const SizedBox(
-              height: 80,
-              child: Center(
-                child: Text(
-                  'image unavailable',
-                  style: TextStyle(color: Colors.grey),
-                ),
-              ),
-            );
-          }
-          return Stack(
-            children: [
-              GestureDetector(
-                onTap: () => _openFull(context, file),
-                child: Image.file(
-                  file,
-                  fit: BoxFit.contain,
-                  cacheWidth: decodeWidth,
-                  errorBuilder: (context, _, _) => const SizedBox(
-                    height: 80,
-                    child: Center(
-                      child: Text(
-                        'image unavailable',
-                        style: TextStyle(color: Colors.grey),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              Positioned(
-                top: 4,
-                right: 4,
-                child: _MediaActionButton(
-                  onPressed: () =>
-                      _showMediaActions(context, widget.url, isVideo: false),
-                ),
-              ),
-            ],
-          );
-        },
-      ),
-    );
-  }
-
-  void _openFull(BuildContext context, File file) {
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => Scaffold(
-          backgroundColor: Colors.black,
-          appBar: AppBar(backgroundColor: Colors.black),
-          body: SafeArea(
-            child: Center(
-              child: InteractiveViewer(child: Image.file(file)),
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-/// One generated video, streamed from ComfyUI's /view endpoint. Tap toggles
-/// play/pause; initialized paused so clips don't all autoplay at once.
-///
-/// Backed by media_kit (libmp/FFmpeg): it software-decodes codecs Android's
-/// hardware MediaCodec path rejects — HEVC/H.265, VP9, AV1, 10-bit
-/// (yuv420p10le), and mkv/webm containers — which the previous ExoPlayer-based
-/// video_player failed to initialize on, showing "video unavailable" for many
-/// ComfyUI/WAN clips.
-class _VideoBubble extends StatefulWidget {
-  final String url;
-  const _VideoBubble({required this.url, super.key});
-
-  @override
-  State<_VideoBubble> createState() => _VideoBubbleState();
-}
-
-/// Loads media_kit's native backend on first use.
-///
-/// This used to run unconditionally in main(), putting the shared-object load
-/// in front of the first frame on every cold start — including the majority of
-/// launches that never open a chat with a video in it. MediaKit.ensureInitialized
-/// is itself idempotent; the flag just avoids the repeat call per bubble.
-bool _mediaKitReady = false;
-void ensureMediaKitInitialized() {
-  if (_mediaKitReady) return;
-  MediaKit.ensureInitialized();
-  _mediaKitReady = true;
-}
-
-/// media_kit hardcodes `cache-on-disk: yes` for every Player (see
-/// media_kit's native player real.dart) but never sets `cache-dir`, so on
-/// Android mpv has nowhere to put its demuxer cache file and logs
-///   lavf error: Failed to create file cache.
-/// on every open, silently falling back to memory-only buffering -- fine for
-/// short generated clips, but needlessly holds more in memory than intended
-/// for longer ones. getTemporaryDirectory() is async but the path is fixed
-/// for the life of the process, so fetch it once and reuse it.
-Future<String>? _mpvCacheDirFuture;
-Future<String> _mpvCacheDir() =>
-    _mpvCacheDirFuture ??= getTemporaryDirectory().then((d) => d.path);
-
-class _VideoBubbleState extends State<_VideoBubble> {
-  // Both are assigned in initState, in this order, BEFORE the first _openSource().
-  //
-  // media_kit starts every Player with `--vid=no` ("to prevent redundant video
-  // decoding"); attaching a VideoController is what flips it to `--vid=auto`.
-  // These were previously `late final` field initializers, so the controller
-  // was not constructed until build() first read it -- which only happens once
-  // _ready is true, i.e. AFTER _player.open() had already run. Every clip was
-  // therefore opened with video decoding switched off, and since generated
-  // ComfyUI/WAN clips carry no audio track either, mpv selected no tracks at
-  // all ("No video or audio streams selected"), leaving width/height null and
-  // the bubble permanently black behind its play button.
-  late final Player _player;
-  late final VideoController _videoController;
-  bool _ready = false;
-  bool _failed = false;
-  bool _playing = false;
-  double _aspect = 16 / 9;
-
-  final List<StreamSubscription<dynamic>> _subs = [];
-
-  /// Bumped on every [_openSource]. An open that resolves after a newer one
-  /// started must not flip this bubble to ready/failed for a clip that is no
-  /// longer the one being shown.
-  int _openEpoch = 0;
-
-  @override
-  void initState() {
-    super.initState();
-    // Must happen before the first Player is constructed.
-    ensureMediaKitInitialized();
-    _player = Player();
-    // Attach the controller before _openSource() below: this is what sets
-    // `--vid=auto`, and Player.open() awaits an attached controller's
-    // initialization, so the media is opened with video decoding enabled.
-    _videoController = VideoController(_player);
-    // Surface real decode/open failures instead of silently spinning forever.
-    _subs.add(_player.stream.error.listen((e) {
-      debugPrint('[media_kit] video error for ${widget.url}: $e');
-      if (mounted) setState(() => _failed = true);
-    }));
-    _subs.add(_player.stream.playing.listen((p) {
-      if (mounted) setState(() => _playing = p);
-    }));
-    _subs.add(_player.stream.width.listen((_) => _updateAspect()));
-    _subs.add(_player.stream.height.listen((_) => _updateAspect()));
-    _openSource();
-  }
-
-  /// The transcript's row list is rebuilt from scratch on every refetch, and
-  /// rows shift whenever a tool group or media row is inserted between
-  /// bubbles. Because rows are unkeyed, Flutter matches by index and UPDATES
-  /// this element rather than recreating it — so without this the State kept
-  /// its already-opened Player and went on playing the previous clip under a
-  /// row that now points at a different URL.
-  @override
-  void didUpdateWidget(_VideoBubble oldWidget) {
-    super.didUpdateWidget(oldWidget);
-    if (oldWidget.url != widget.url) _openSource();
-  }
-
-  Future<void> _openSource() async {
-    final epoch = ++_openEpoch;
-    if (_ready || _failed) {
-      setState(() {
-        _ready = false;
-        _failed = false;
-        _playing = false;
-      });
-    }
-    try {
-      // Resolve through the disk cache first so a re-opened chat plays from
-      // a local file instead of re-fetching the same clip from the LAN
-      // gateway every time. A cache-fetch failure (offline, file gone)
-      // falls back to the direct URL — media_kit can still stream it live.
-      String source = widget.url;
-      try {
-        final file = await MediaCacheService.fileFor(widget.url);
-        source = file.path;
-      } catch (e) {
-        debugPrint('[media_kit] cache fetch failed for ${widget.url}: $e');
-      }
-      if (!mounted || epoch != _openEpoch) return;
-      final platform = _player.platform;
-      if (platform is NativePlayer) {
-        await platform.setProperty('cache-dir', await _mpvCacheDir());
-      }
-      if (!mounted || epoch != _openEpoch) return;
-      // Open paused so multiple clips in a transcript don't all autoplay.
-      await _player.open(Media(source), play: false);
-      if (!mounted || epoch != _openEpoch) return;
-      setState(() => _ready = true);
-    } catch (e) {
-      debugPrint('[media_kit] open failed for ${widget.url}: $e');
-      if (mounted && epoch == _openEpoch) setState(() => _failed = true);
-    }
-  }
-
-  void _updateAspect() {
-    final w = _player.state.width;
-    final h = _player.state.height;
-    if (w != null && h != null && w > 0 && h > 0) {
-      final next = w / h;
-      if (next != _aspect && mounted) setState(() => _aspect = next);
-    }
-  }
-
-  void _togglePlay() {
-    _playing ? _player.pause() : _player.play();
-  }
-
-  @override
-  void dispose() {
-    for (final s in _subs) {
-      s.cancel();
-    }
-    _player.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final maxW = MediaQuery.of(context).size.width - 80;
-    Widget body;
-    if (_failed) {
-      body = const SizedBox(
-        height: 100,
-        child: Center(
-          child: Text('video unavailable', style: TextStyle(color: Colors.grey)),
-        ),
-      );
-    } else if (!_ready) {
-      body = const SizedBox(
-        height: 160,
-        child: Center(child: CircularProgressIndicator()),
-      );
-    } else {
-      body = GestureDetector(
-        onTap: _togglePlay,
-        child: Stack(
-          alignment: Alignment.center,
-          children: [
-            AspectRatio(
-              aspectRatio: _aspect,
-              child: Video(
-                controller: _videoController,
-                controls: NoVideoControls,
-              ),
-            ),
-            if (!_playing)
-              Container(
-                decoration: const BoxDecoration(
-                  color: Colors.black54,
-                  shape: BoxShape.circle,
-                ),
-                padding: const EdgeInsets.all(12),
-                child: const Icon(
-                  Icons.play_arrow,
-                  color: Colors.white,
-                  size: 32,
-                ),
-              ),
-            // progress bar
-            Positioned(
-              left: 0,
-              right: 0,
-              bottom: 0,
-              child: _VideoProgressBar(player: _player),
-            ),
-            Positioned(
-              top: 4,
-              right: 4,
-              child: _MediaActionButton(
-                onPressed: () =>
-                    _showMediaActions(context, widget.url, isVideo: true),
-              ),
-            ),
-          ],
-        ),
-      );
-    }
-
-    return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-      constraints: BoxConstraints(maxWidth: maxW),
-      clipBehavior: Clip.antiAlias,
-      decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(18),
-        color: Colors.black,
-      ),
-      child: body,
-    );
-  }
-}
-
-/// Thin scrubbable progress bar for [_VideoBubble], mirroring the look of the
-/// old VideoProgressIndicator (played/buffered/background tint) since
-/// media_kit_video's default controls are replaced with [NoVideoControls].
-class _VideoProgressBar extends StatelessWidget {
-  final Player player;
-  const _VideoProgressBar({required this.player});
-
-  void _seekToFraction(BuildContext context, double dx, double width) {
-    final duration = player.state.duration;
-    if (duration == Duration.zero) return;
-    final fraction = (dx / width).clamp(0.0, 1.0);
-    player.seek(duration * fraction);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return StreamBuilder<Duration>(
-      stream: player.stream.position,
-      initialData: player.state.position,
-      builder: (context, positionSnap) {
-        return StreamBuilder<Duration>(
-          stream: player.stream.duration,
-          initialData: player.state.duration,
-          builder: (context, durationSnap) {
-            final position = positionSnap.data ?? Duration.zero;
-            final duration = durationSnap.data ?? Duration.zero;
-            final fraction = duration.inMilliseconds > 0
-                ? (position.inMilliseconds / duration.inMilliseconds).clamp(
-                    0.0,
-                    1.0,
-                  )
-                : 0.0;
-            return LayoutBuilder(
-              builder: (context, constraints) {
-                return GestureDetector(
-                  behavior: HitTestBehavior.opaque,
-                  onTapDown: (d) => _seekToFraction(
-                    context,
-                    d.localPosition.dx,
-                    constraints.maxWidth,
-                  ),
-                  onHorizontalDragUpdate: (d) => _seekToFraction(
-                    context,
-                    d.localPosition.dx,
-                    constraints.maxWidth,
-                  ),
-                  child: SizedBox(
-                    height: 6,
-                    width: double.infinity,
-                    child: Stack(
-                      children: [
-                        Container(color: Colors.white24),
-                        FractionallySizedBox(
-                          widthFactor: fraction,
-                          child: Container(color: Colors.white),
-                        ),
-                      ],
-                    ),
-                  ),
-                );
-              },
-            );
-          },
-        );
-      },
-    );
-  }
+  return null;
 }

@@ -12,8 +12,8 @@ void main() async {
   // media_kit's native backend (libmp/FFmpeg) is NOT initialized here any
   // more: loading those shared objects is a chunk of work in front of the
   // first frame, and most launches never open a chat containing a video. It
-  // is initialized lazily instead, on the first _VideoBubble — see
-  // ensureMediaKitInitialized() in chat_screen.dart.
+  // is initialized lazily instead, on the first generated video view — see
+  // ensureMediaKitInitialized() in generated_media_view.dart.
   // Foreground service used by phone-call-mode (to keep the voice loop alive
   // when backgrounded / screen locks) and by chat sends (to keep the SSE
   // stream alive while waiting on a reply, without needing the app in the
@@ -156,10 +156,7 @@ class HermesHeader extends StatelessWidget {
         children: [
           Text(
             'HERMES',
-            style: hermesWordmark(
-              fontSize: 28,
-              color: const Color(0xFFD4AF37),
-            ),
+            style: hermesWordmark(fontSize: 28, color: const Color(0xFFD4AF37)),
           ),
           if (subtitle != null) ...[
             const SizedBox(height: 4),
@@ -241,7 +238,9 @@ class _HomeScreenState extends State<HomeScreen> {
       );
       try {
         final sessions = await client.getSessions();
-        final session = sessions.where((s) => s.id == lastSessionId).firstOrNull;
+        final session = sessions
+            .where((s) => s.id == lastSessionId)
+            .firstOrNull;
         if (session != null) {
           if (!mounted) return;
           Navigator.push(
@@ -703,10 +702,7 @@ class _HomeScreenState extends State<HomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          'HERMES',
-          style: hermesWordmark(fontSize: 22),
-        ),
+        title: Text('HERMES', style: hermesWordmark(fontSize: 22)),
         centerTitle: true,
       ),
       body: _connections.isEmpty

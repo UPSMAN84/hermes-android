@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import '../services/connection_manager.dart';
 import '../utils/brand.dart';
 import 'chat_screen.dart';
+import 'create_screen.dart';
 import 'settings_screen.dart';
 import 'memory_screen.dart';
 import 'cron_screen.dart';
@@ -186,10 +187,7 @@ class _SessionListScreenState extends State<SessionListScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text(
-          'HERMES',
-          style: hermesWordmark(fontSize: 22),
-        ),
+        title: Text('HERMES', style: hermesWordmark(fontSize: 22)),
         centerTitle: true,
         actions: [
           if (!_healthOk)
@@ -242,6 +240,12 @@ class _SessionListScreenState extends State<SessionListScreen> {
                   ),
                 ],
               ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.auto_fix_high),
+              title: const Text('Create'),
+              onTap: () =>
+                  _openScreen(CreateScreen(connection: widget.connection)),
             ),
             ListTile(
               leading: const Icon(Icons.memory),
@@ -472,8 +476,9 @@ class _RenameSessionDialog extends StatefulWidget {
 }
 
 class _RenameSessionDialogState extends State<_RenameSessionDialog> {
-  late final TextEditingController _controller =
-      TextEditingController(text: widget.initialTitle);
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initialTitle,
+  );
 
   @override
   void dispose() {

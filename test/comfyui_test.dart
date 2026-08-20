@@ -1,5 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hermes_android/core/models/comfy_workflow.dart';
 import 'package:hermes_android/core/services/comfyui.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   group('ComfyUi.viewUrl', () {
@@ -17,4 +19,158 @@ void main() {
       );
     });
   });
+
+  test('preserves proxy path and encodes output query', () {
+    final endpoint = ComfyEndpoint.parse('https://host.example/comfy');
+    final uri = endpoint.viewUri(
+      ComfyOutputRef(
+        filename: 'clip 01.mp4',
+        subfolder: 'jobs/a',
+        type: 'output',
+      ),
+    );
+
+    expect(uri.path, '/comfy/view');
+    expect(uri.queryParameters, {
+      'filename': 'clip 01.mp4',
+      'subfolder': 'jobs/a',
+      'type': 'output',
+    });
+  });
+
+  test('rejects unsafe base components', () {
+    for (final raw in [
+      'https://user@host/comfy',
+      'https://host/comfy?token=x',
+      'https://host/comfy#fragment',
+    ]) {
+      expect(() => ComfyEndpoint.parse(raw), throwsFormatException);
+    }
+  });
+
+  test('uses matching websocket scheme and proxy path', () {
+    final endpoint = ComfyEndpoint.parse('https://host.example/comfy');
+
+    expect(
+      endpoint.websocketUri('client id').toString(),
+      'wss://host.example/comfy/ws?clientId=client+id',
+    );
+  });
+
+  test('rejects unsafe output references', () {
+    expect(
+      () => ComfyOutputRef(filename: '../clip.mp4'),
+      throwsFormatException,
+    );
+    expect(
+      () => ComfyOutputRef(filename: 'clip.mp4', subfolder: 'jobs/../a'),
+      throwsFormatException,
+    );
+    expect(
+      () => ComfyOutputRef(filename: 'clip.mp4', type: 'custom'),
+      throwsFormatException,
+    );
+  });
+
+  test('rejects rooted and drive-qualified output subfolders', () {
+    for (final subfolder in ['/etc', '\\Windows', 'C:\\Windows']) {
+      expect(
+        () => ComfyOutputRef(filename: 'clip.mp4', subfolder: subfolder),
+        throwsFormatException,
+      );
+    }
+  });
+
+  test('migrates only missing and wildcard placeholder values', () async {
+    SharedPreferences.setMockInitialValues({});
+    expect(
+      await ComfyUiPrefs.loadConfiguredEndpoint(
+        await SharedPreferences.getInstance(),
+      ),
+      isNull,
+    );
+
+    for (final raw in ['http://0.0.0.0:8188', 'http://0.0.0.0:8188/']) {
+      SharedPreferences.setMockInitialValues({ComfyUiPrefs.baseUrl: raw});
+      expect(
+        await ComfyUiPrefs.loadConfiguredEndpoint(
+          await SharedPreferences.getInstance(),
+        ),
+        isNull,
+      );
+    }
+
+    for (final raw in [
+      'https://host/comfy',
+      'http://127.0.0.1:8188',
+      'http://localhost:8188',
+      'http://0.0.0.0:8189',
+      'http://0.0.0.0:8188/comfy',
+    ]) {
+      SharedPreferences.setMockInitialValues({ComfyUiPrefs.baseUrl: raw});
+      expect(
+        (await ComfyUiPrefs.loadConfiguredEndpoint(
+          await SharedPreferences.getInstance(),
+        ))!.baseUri.toString(),
+        raw,
+      );
+    }
+  });
+
+  group('ComfyUi.requiresPlainHttpWarning', () {
+    test('HTTPS never requires acknowledgement', () {
+      expect(
+        ComfyUi.requiresPlainHttpWarning(Uri.parse('https://203.0.113.9:8188')),
+        isFalse,
+      );
+    });
+
+    test('exempts loopback, RFC1918, RFC4193, link-local, and CGNAT', () {
+      for (final host in [
+        '127.0.0.1',
+        'localhost',
+        '::1',
+        '10.1.2.3',
+        '172.16.0.1',
+        '172.31.255.255',
+        '192.168.1.50',
+        '169.254.1.1',
+        '100.64.0.1',
+        '100.127.255.255',
+        'fc00::1',
+        'fd12:3456:789a::1',
+        'fe80::1',
+      ]) {
+        expect(
+          ComfyUi.requiresPlainHttpWarning(_httpUri(host)),
+          isFalse,
+          reason: host,
+        );
+      }
+    });
+
+    test(
+      'requires acknowledgement for public addresses and unproven hostnames',
+      () {
+        for (final host in [
+          '203.0.113.9',
+          '8.8.8.8',
+          '172.15.0.1',
+          '172.32.0.1',
+          '2001:db8::1',
+          'hermes-machine.tailnet.ts.net',
+          'my-comfyui.example.com',
+        ]) {
+          expect(
+            ComfyUi.requiresPlainHttpWarning(_httpUri(host)),
+            isTrue,
+            reason: host,
+          );
+        }
+      },
+    );
+  });
 }
+
+Uri _httpUri(String host) =>
+    Uri.parse('http://${host.contains(':') ? '[$host]' : host}:8188');
