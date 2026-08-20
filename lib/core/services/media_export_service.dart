@@ -15,11 +15,16 @@ class MediaExportService {
     Directory? root,
     Future<Directory> Function()? rootProvider,
     MediaDownloadPort? downloadService,
+    bool ownsDownloadService = false,
     Future<void> Function(File)? shareFile,
     Future<String?> Function(File, {required bool isVideo})? saveFile,
     this.maxDownloadBytes = defaultMaxDownloadBytes,
   }) : _rootProvider = _resolveRootProvider(root, rootProvider),
        _downloadService = downloadService ?? appMediaDownloadService,
+       _ownedLegacyCleanup = _resolveOwnedLegacyCleanup(
+         downloadService ?? appMediaDownloadService,
+         ownsDownloadService: ownsDownloadService,
+       ),
        _shareFile = shareFile ?? share,
        _saveFile = saveFile ?? saveToGallery;
 
@@ -35,6 +40,7 @@ class MediaExportService {
 
   final Future<Directory> Function() _rootProvider;
   final MediaDownloadPort _downloadService;
+  final MediaDownloadCleanupPort? _ownedLegacyCleanup;
   final Future<void> Function(File) _shareFile;
   final Future<String?> Function(File, {required bool isVideo}) _saveFile;
   final int maxDownloadBytes;
@@ -176,7 +182,10 @@ class MediaExportService {
     }
   }
 
-  Future<void> drainCleanup() => _downloadCleanupScope.drainCleanup();
+  Future<void> drainCleanup() async {
+    await _downloadCleanupScope.drainCleanup();
+    await _ownedLegacyCleanup?.drainCleanup();
+  }
 
   Future<void> close() {
     final active = _closeFuture;
@@ -197,8 +206,11 @@ class MediaExportService {
     }
 
     for (var pass = 0; pass < 3; pass++) {
-      await _downloadCleanupScope.drainCleanup();
-      if (!_downloadCleanupScope.hasPendingCleanup) return;
+      await drainCleanup();
+      if (!_downloadCleanupScope.hasPendingCleanup &&
+          !(_ownedLegacyCleanup?.hasPendingCleanup ?? false)) {
+        return;
+      }
       if (pass < 2) await Future<void>.delayed(Duration.zero);
     }
     throw StateError(
@@ -263,5 +275,25 @@ class MediaExportService {
     }
     if (root != null) return () async => root;
     return rootProvider ?? getTemporaryDirectory;
+  }
+
+  static MediaDownloadCleanupPort? _resolveOwnedLegacyCleanup(
+    MediaDownloadPort downloadService, {
+    required bool ownsDownloadService,
+  }) {
+    if (downloadService is MediaDownloadOwnershipPort) return null;
+    if (downloadService is! MediaDownloadCleanupPort) return null;
+    final cleanup = downloadService as MediaDownloadCleanupPort;
+    if (!ownsDownloadService) {
+      throw ArgumentError.value(
+        downloadService,
+        'downloadService',
+        'Legacy MediaDownloadCleanupPort cleanup is service-global. '
+            'Pass ownsDownloadService: true only when this MediaExportService '
+            'exclusively owns the downloader, or implement '
+            'MediaDownloadOwnershipPort.',
+      );
+    }
+    return cleanup;
   }
 }

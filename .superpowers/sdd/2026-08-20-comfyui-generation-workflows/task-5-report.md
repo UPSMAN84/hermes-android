@@ -211,3 +211,43 @@ Deterministic fixtures cover non-2xx, declared-over, missing/lying length, conte
 - Repository-only verification; no live gateway/device or real multi-GiB transfer.
 - The two full-suite skips are capability-gated symlink tests on Windows privilege error 1314.
 - Missing libmpv remains a graceful Windows test log.
+
+# Review round 5 (2026-08-20)
+
+## RED/GREEN
+
+- RED 1 focused media failed to compile because owned legacy cleanup had no explicit `ownsDownloadService` lifecycle contract.
+- RED 2 targeted confinement ran through a real Windows directory junction and failed because the injected `<root>/escape/outside.png` was promoted into the cache instead of being rejected.
+- GREEN targeted symlink/junction escape: 1/1 passed and outside bytes remained unchanged.
+- GREEN focused media: 38/38 passed, with the pre-existing root-alias symlink capability skip.
+- GREEN combined cache/gallery/chat: 65/65 passed, with the same capability skip.
+- Final full Flutter test: 280 passed, 2 capability skips.
+- Final full Flutter analyzer: no issues.
+
+## Confinement and lifecycle
+
+- Existing produced/staging paths and their nearest existing ancestors resolve against the canonical real cache root before confinement.
+- Promotion re-resolves source and destination inside the root mutation coordinator before equality or rename.
+- A rejected injected symlink-parent path is never promoted or deleted; only a final link at the cache-owned staging entry may be unlinked without following its target.
+- Ownership-aware downloaders retain per-export cleanup scopes.
+- A legacy `MediaDownloadPort + MediaDownloadCleanupPort` is accepted only with explicit exclusive ownership; close waits for active export failure, then drains that service-local legacy cleanup.
+- Cleanup-global legacy downloaders without explicit ownership fail construction with a clear compatibility error instead of silently leaking.
+
+## Tests
+
+- Added a real symlink/junction-parent escape regression using an injected returned file; the outside file remains byte-for-byte unchanged.
+- Added active-export legacy cleanup coverage proving `close` drains a late registered partial.
+- Added construction rejection coverage for unsupported shared legacy cleanup.
+
+## Files
+
+- `lib/core/services/media_cache_service.dart`
+- `lib/core/services/media_export_service.dart`
+- `test/media_cache_service_test.dart`
+- `.superpowers/sdd/2026-08-20-comfyui-generation-workflows/task-5-report.md`
+
+## Concerns
+
+- Repository-only verification; no live gateway/device or real multi-GiB transfer.
+- Full-suite skips remain capability-gated symlink tests for the older media-root alias and workflow-store cases.
+- Missing `libmpv` remains a graceful Windows test log.

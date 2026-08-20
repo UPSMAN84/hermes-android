@@ -96,6 +96,7 @@ final class _ResolvedMediaCacheRoot {
   Future<File> confine(File file) async {
     final normalizedPath = _normalizedAbsolutePath(file.path);
     final lexicalIdentity = _pathIdentity(normalizedPath);
+    _requireConfinedIdentity(lexicalIdentity);
     final type = await FileSystemEntity.type(
       normalizedPath,
       followLinks: false,
@@ -106,16 +107,56 @@ final class _ResolvedMediaCacheRoot {
         normalizedPath,
       );
     }
-    if (_isConfinedIdentity(lexicalIdentity)) return File(normalizedPath);
-    if (type == FileSystemEntityType.notFound) {
-      _requireConfinedIdentity(lexicalIdentity);
-    }
-
-    final resolvedPath = _normalizedAbsolutePath(
-      await File(normalizedPath).resolveSymbolicLinks(),
-    );
+    final resolvedPath = await _resolveThroughExistingAncestor(normalizedPath);
     _requireConfinedIdentity(_pathIdentity(resolvedPath));
     return File(resolvedPath);
+  }
+
+  Future<String> _resolveThroughExistingAncestor(String path) async {
+    var current = path;
+    final missingSegments = <String>[];
+    while (true) {
+      final type = await FileSystemEntity.type(current, followLinks: false);
+      if (type != FileSystemEntityType.notFound) {
+        final resolved = switch (type) {
+          FileSystemEntityType.file => await File(
+            current,
+          ).resolveSymbolicLinks(),
+          FileSystemEntityType.directory => await Directory(
+            current,
+          ).resolveSymbolicLinks(),
+          FileSystemEntityType.link => await Link(
+            current,
+          ).resolveSymbolicLinks(),
+          _ => throw FileSystemException(
+            'Unsupported media cache path entity.',
+            current,
+          ),
+        };
+        var result = _normalizedAbsolutePath(resolved);
+        for (final segment in missingSegments.reversed) {
+          result = _normalizedAbsolutePath(
+            '$result${Platform.pathSeparator}$segment',
+          );
+        }
+        return result;
+      }
+
+      final parent = Directory(current).parent.path;
+      if (_pathIdentity(parent) == _pathIdentity(current)) {
+        throw FileSystemException(
+          'Media cache path has no resolvable ancestor.',
+          path,
+        );
+      }
+      var segmentOffset = parent.length;
+      while (segmentOffset < current.length &&
+          (current[segmentOffset] == '/' || current[segmentOffset] == r'\')) {
+        segmentOffset++;
+      }
+      missingSegments.add(current.substring(segmentOffset));
+      current = parent;
+    }
   }
 
   bool _isConfinedIdentity(String candidate) =>
@@ -661,7 +702,7 @@ final class MediaCacheService implements MediaCachePort {
       return await _promoteToCanonical(
         confinedProduced,
         destination,
-        coordinator,
+        cacheRoot,
       );
     } catch (_) {
       if (staleIsComplete && await _isComplete(destination)) {
@@ -670,19 +711,16 @@ final class MediaCacheService implements MediaCachePort {
       rethrow;
     } finally {
       coordinator._unregisterTemporary(staging.path);
-      final temporaryPaths = <String>{
-        staging.path,
-        if (confinedProduced != null &&
-            confinedProduced.path != destination.path)
-          confinedProduced.path,
-      };
-      for (final path in temporaryPaths) {
-        try {
-          final temporary = File(path);
-          if (await temporary.exists()) {
-            await _fileOperations.delete(temporary);
-          }
-        } catch (_) {}
+      await _deleteTemporary(cacheRoot, staging, ownsLinkEntry: true);
+      if (confinedProduced != null &&
+          _pathIdentity(confinedProduced.path) !=
+              _pathIdentity(destination.path) &&
+          _pathIdentity(confinedProduced.path) != _pathIdentity(staging.path)) {
+        await _deleteTemporary(
+          cacheRoot,
+          confinedProduced,
+          ownsLinkEntry: false,
+        );
       }
       _scheduleMaintenance();
     }
@@ -701,31 +739,39 @@ final class MediaCacheService implements MediaCachePort {
   Future<File> _promoteToCanonical(
     File source,
     File destination,
-    MediaCacheMutationCoordinator coordinator,
+    _ResolvedMediaCacheRoot root,
   ) {
-    if (source.path == destination.path) return Future<File>.value(destination);
-
-    return coordinator._run(() async {
+    return root.coordinator._run(() async {
+      final confinedSource = await root.confine(source);
+      final confinedDestination = await root.confine(destination);
+      if (_pathIdentity(confinedSource.path) ==
+          _pathIdentity(confinedDestination.path)) {
+        return confinedDestination;
+      }
       File? old;
-      if (await destination.exists()) {
-        old = DefaultMediaDownloadService._uniqueSibling(destination, 'old');
-        await _fileOperations.rename(destination, old.path);
-        coordinator._markChanged(destination.path);
+      if (await confinedDestination.exists()) {
+        old = DefaultMediaDownloadService._uniqueSibling(
+          confinedDestination,
+          'old',
+        );
+        await root.confine(old);
+        await _fileOperations.rename(confinedDestination, old.path);
+        root.coordinator._markChanged(confinedDestination.path);
       }
 
       try {
-        await _fileOperations.rename(source, destination.path);
-        coordinator._markChanged(destination.path);
+        await _fileOperations.rename(confinedSource, confinedDestination.path);
+        root.coordinator._markChanged(confinedDestination.path);
       } catch (_) {
         if (old != null && await old.exists()) {
-          if (await destination.exists()) {
+          if (await confinedDestination.exists()) {
             try {
-              await _fileOperations.delete(destination);
-              coordinator._markChanged(destination.path);
+              await _fileOperations.delete(confinedDestination);
+              root.coordinator._markChanged(confinedDestination.path);
             } catch (_) {}
           }
-          await _fileOperations.rename(old, destination.path);
-          coordinator._markChanged(destination.path);
+          await _fileOperations.rename(old, confinedDestination.path);
+          root.coordinator._markChanged(confinedDestination.path);
         }
         rethrow;
       }
@@ -735,8 +781,42 @@ final class MediaCacheService implements MediaCachePort {
           await _fileOperations.delete(old);
         } catch (_) {}
       }
-      return destination;
+      return confinedDestination;
     });
+  }
+
+  Future<void> _deleteTemporary(
+    _ResolvedMediaCacheRoot root,
+    File temporary, {
+    required bool ownsLinkEntry,
+  }) async {
+    try {
+      final normalizedPath = _normalizedAbsolutePath(temporary.path);
+      final type = await FileSystemEntity.type(
+        normalizedPath,
+        followLinks: false,
+      );
+      if (type == FileSystemEntityType.notFound) return;
+      if (type == FileSystemEntityType.link) {
+        if (ownsLinkEntry) {
+          root._requireConfinedIdentity(_pathIdentity(normalizedPath));
+          await Link(normalizedPath).delete();
+        }
+        return;
+      }
+      if (type != FileSystemEntityType.file) return;
+
+      final confined = await root.confine(File(normalizedPath));
+      final confinedType = await FileSystemEntity.type(
+        confined.path,
+        followLinks: false,
+      );
+      if (confinedType == FileSystemEntityType.file) {
+        await _fileOperations.delete(confined);
+      } else if (confinedType == FileSystemEntityType.link && ownsLinkEntry) {
+        await Link(confined.path).delete();
+      }
+    } catch (_) {}
   }
 
   @override

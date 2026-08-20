@@ -437,6 +437,72 @@ void main() {
     );
 
     test(
+      'rejects an injected file through an in-root symlink without touching outside bytes',
+      () async {
+        final root = Directory(
+          '${temp.path}${Platform.pathSeparator}symlink-confined-cache',
+        );
+        final outside = Directory(
+          '${temp.path}${Platform.pathSeparator}symlink-outside',
+        );
+        await Future.wait([root.create(), outside.create()]);
+        final outsideFile = File(
+          '${outside.path}${Platform.pathSeparator}outside.png',
+        );
+        await outsideFile.writeAsBytes([7, 8, 9]);
+        final link = Link('${root.path}${Platform.pathSeparator}escape');
+        try {
+          try {
+            await link.create(outside.path);
+          } on FileSystemException catch (error) {
+            if (!Platform.isWindows) {
+              markTestSkipped('Symlink creation unavailable: $error');
+              return;
+            }
+            final junction = await Process.run('cmd.exe', [
+              '/c',
+              'mklink',
+              '/J',
+              link.path,
+              outside.path,
+            ]);
+            if (junction.exitCode != 0) {
+              markTestSkipped(
+                'Symlink/junction creation unavailable: $error; '
+                '${junction.stderr}',
+              );
+              return;
+            }
+          }
+
+          final returnedThroughLink = File(
+            '${link.path}${Platform.pathSeparator}outside.png',
+          );
+          final cache = MediaCacheService(
+            root: root,
+            downloadService: _EscapingDownloadService(returnedThroughLink),
+          );
+
+          try {
+            await expectLater(
+              cache.cache(
+                Uri.parse('http://host/view?filename=symlink-escape.png'),
+              ),
+              throwsA(isA<FileSystemException>()),
+            );
+          } finally {
+            await cache.close();
+          }
+
+          expect(await outsideFile.readAsBytes(), [7, 8, 9]);
+          expect(await returnedThroughLink.exists(), isTrue);
+        } finally {
+          if (await link.exists()) await link.delete();
+        }
+      },
+    );
+
+    test(
       'known generated videos remain remote and are not auto-cached',
       () async {
         final client = _FixtureClient((_) => _response(chunks: [Uint8List(1)]));
@@ -1058,6 +1124,66 @@ void main() {
       },
     );
 
+    test(
+      'owned legacy downloader cleanup is drained after its active export',
+      () async {
+        final started = Completer<File>();
+        final release = Completer<void>();
+        final downloader = _LegacyCleanupDownloadService(
+          started: started,
+          release: release.future,
+        );
+        final service = MediaExportService(
+          root: temp,
+          downloadService: downloader,
+          ownsDownloadService: true,
+          shareFile: (_) async {},
+        );
+        final export = service.shareRemote(
+          Uri.parse('http://host/view?filename=legacy-broken.png'),
+          confirmAfterHeaders: (_) async => true,
+        );
+        final partial = await started.future;
+        final exportExpectation = expectLater(
+          export,
+          throwsA(isA<StateError>()),
+        );
+        final close = service.close();
+
+        release.complete();
+        await exportExpectation;
+        await close;
+
+        expect(await partial.exists(), isFalse);
+        expect(downloader.drainCount, 1);
+      },
+    );
+
+    test(
+      'rejects cleanup-global legacy downloaders without explicit ownership',
+      () {
+        final downloader = _LegacyCleanupDownloadService(
+          started: Completer<File>(),
+          release: Completer<void>().future,
+        );
+
+        expect(
+          () => MediaExportService(
+            root: temp,
+            downloadService: downloader,
+            shareFile: (_) async {},
+          ),
+          throwsA(
+            isA<ArgumentError>().having(
+              (error) => error.message,
+              'message',
+              contains('ownsDownloadService'),
+            ),
+          ),
+        );
+      },
+    );
+
     test('close rejects exports started after shutdown begins', () async {
       final release = Completer<void>();
       final firstUri = Uri.parse('http://host/view?filename=first.png');
@@ -1448,6 +1574,56 @@ final class _EscapingDownloadService implements MediaDownloadPort {
     Map<String, String> headers = const {},
     Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
   }) async => file;
+}
+
+final class _LegacyCleanupDownloadService
+    implements MediaDownloadPort, MediaDownloadCleanupPort {
+  _LegacyCleanupDownloadService({required this.started, required this.release});
+
+  final Completer<File> started;
+  final Future<void> release;
+  final Set<File> _pending = {};
+  int drainCount = 0;
+
+  @override
+  bool get hasPendingCleanup => _pending.isNotEmpty;
+
+  @override
+  Future<File> download(
+    Uri uri, {
+    required File destination,
+    required int maxBytes,
+    Map<String, String> headers = const {},
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) async {
+    final confirm = confirmAfterHeaders;
+    if (confirm != null &&
+        !await confirm(
+          const MediaDownloadInfo(
+            statusCode: 200,
+            contentType: 'image/png',
+            declaredBytes: 2,
+          ),
+        )) {
+      throw const MediaDownloadDeclinedException();
+    }
+    final partial = File('${destination.path}.legacy.part');
+    await partial.parent.create(recursive: true);
+    await partial.writeAsBytes([1, 2]);
+    started.complete(partial);
+    await release;
+    _pending.add(partial);
+    throw StateError('legacy stream failed');
+  }
+
+  @override
+  Future<void> drainCleanup() async {
+    drainCount++;
+    for (final partial in _pending.toList(growable: false)) {
+      if (await partial.exists()) await partial.delete();
+      _pending.remove(partial);
+    }
+  }
 }
 
 final class _FaultInjectingFileOperations implements MediaFileOperations {
