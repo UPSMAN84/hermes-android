@@ -162,6 +162,85 @@ void main() {
 
       expect(transport.closeCalls, 1);
     });
+
+    test(
+      'cancellation does not wait for a pending connector and closes a late transport once',
+      () async {
+        final connector = _PendingConnector();
+        final subscription = ComfyUiSocket(connector: connector)
+            .watchExecution(
+              ComfyEndpoint.parse('http://host:8188'),
+              clientId: clientId,
+              promptId: promptId,
+            )
+            .listen((_) {});
+        await connector.called;
+
+        final cancellation = subscription.cancel();
+        final firstCompletion = await Future.any([
+          cancellation.then((_) => 'cancelled'),
+          Future<void>.delayed(Duration.zero).then((_) => 'connector pending'),
+        ]);
+        final lateTransport = _FakeSocketTransport();
+        connector.complete(lateTransport);
+        await cancellation;
+        await lateTransport.closed;
+
+        expect(firstCompletion, 'cancelled');
+        expect(lateTransport.closeCalls, 1);
+      },
+    );
+
+    test(
+      'listener cancellation swallows upstream cancel errors and closes transport',
+      () async {
+        final transport = _FakeSocketTransport(
+          onCancel: () => Future<void>.error(StateError('cancel failed')),
+        );
+        final connector = _FakeConnector([transport]);
+        final subscription = ComfyUiSocket(connector: connector)
+            .watchExecution(
+              ComfyEndpoint.parse('http://host:8188'),
+              clientId: clientId,
+              promptId: promptId,
+            )
+            .listen((_) {});
+        await transport.listened;
+
+        await expectLater(subscription.cancel(), completes);
+        await transport.closed;
+
+        expect(transport.closeCalls, 1);
+      },
+    );
+
+    test(
+      'terminal stream closes when upstream cancellation reports an error',
+      () async {
+        final transport = _FakeSocketTransport(
+          onCancel: () => Future<void>.error(StateError('cancel failed')),
+        );
+        final connector = _FakeConnector([transport]);
+        final events = ComfyUiSocket(connector: connector)
+            .watchExecution(
+              ComfyEndpoint.parse('http://host:8188'),
+              clientId: clientId,
+              promptId: promptId,
+            )
+            .toList();
+        await transport.listened;
+
+        transport.messagesController.add(
+          _frame('execution_success', {'prompt_id': promptId}),
+        );
+        final completed = await events.timeout(const Duration(seconds: 1));
+        await transport.closed;
+
+        expect(completed, hasLength(1));
+        expect(completed.single, isA<ComfySucceeded>());
+        expect(transport.closeCalls, 1);
+      },
+    );
   });
 
   group('ComfyUiSocket decoding', () {
@@ -438,9 +517,23 @@ final class _SocketHarness {
 }
 
 final class _FakeSocketTransport implements ComfySocketTransport {
-  final StreamController<Object?> messagesController =
-      StreamController<Object?>();
+  _FakeSocketTransport({FutureOr<void> Function()? onCancel}) {
+    messagesController = StreamController<Object?>(
+      onListen: () {
+        if (!_listened.isCompleted) _listened.complete();
+      },
+      onCancel: onCancel,
+    );
+  }
+
+  late final StreamController<Object?> messagesController;
+  final Completer<void> _listened = Completer<void>();
+  final Completer<void> _closed = Completer<void>();
   int closeCalls = 0;
+
+  Future<void> get listened => _listened.future;
+
+  Future<void> get closed => _closed.future;
 
   @override
   Stream<Object?> get messages => messagesController.stream;
@@ -448,6 +541,25 @@ final class _FakeSocketTransport implements ComfySocketTransport {
   @override
   Future<void> close() async {
     closeCalls++;
+    if (!_closed.isCompleted) _closed.complete();
+  }
+}
+
+final class _PendingConnector implements ComfySocketConnector {
+  final Completer<void> _called = Completer<void>();
+  final Completer<ComfySocketTransport> _connection =
+      Completer<ComfySocketTransport>();
+
+  Future<void> get called => _called.future;
+
+  void complete(ComfySocketTransport transport) {
+    _connection.complete(transport);
+  }
+
+  @override
+  Future<ComfySocketTransport> connect(Uri uri) {
+    if (!_called.isCompleted) _called.complete();
+    return _connection.future;
   }
 }
 

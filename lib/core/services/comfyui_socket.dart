@@ -171,7 +171,6 @@ final class _ComfyExecutionWatch {
   final int maxTextBytes;
 
   late final StreamController<ComfyExecutionEvent> _controller;
-  Future<ComfySocketTransport>? _connection;
   ComfySocketTransport? _transport;
   StreamSubscription<Object?>? _messages;
   Future<void>? _transportClose;
@@ -184,7 +183,6 @@ final class _ComfyExecutionWatch {
   void _onListen() {
     try {
       final connection = connector.connect(uri);
-      _connection = connection;
       unawaited(_attach(connection));
     } catch (error) {
       unawaited(
@@ -209,8 +207,11 @@ final class _ComfyExecutionWatch {
       _messages = messages;
       if (_paused) messages.pause();
       if (_finished || _cancelled) {
-        await messages.cancel();
-        await _closeTransport();
+        try {
+          await _cancelMessages();
+        } finally {
+          await _closeTransport();
+        }
       }
     } catch (error) {
       if (!_finished && !_cancelled) {
@@ -260,26 +261,32 @@ final class _ComfyExecutionWatch {
   Future<void> _onCancel() async {
     _cancelled = true;
     _finished = true;
-    await _messages?.cancel();
-    final connection = _connection;
-    if (_transport == null && connection != null) {
-      try {
-        _transport = await connection;
-      } catch (_) {
-        return;
-      }
+    try {
+      await _cancelMessages();
+    } finally {
+      await _closeTransport();
     }
-    await _closeTransport();
   }
 
   Future<void> _finish({ComfySocketLost? lost}) async {
     if (_finished) return;
     _finished = true;
     if (lost != null && !_cancelled) _controller.add(lost);
-    await _messages?.cancel();
-    await _closeTransport();
-    if (!_cancelled && !_controller.isClosed) {
-      await _controller.close();
+    try {
+      await _cancelMessages();
+    } finally {
+      await _closeTransport();
+      if (!_cancelled && !_controller.isClosed) {
+        await _controller.close();
+      }
+    }
+  }
+
+  Future<void> _cancelMessages() async {
+    try {
+      await _messages?.cancel();
+    } catch (_) {
+      // Upstream cancellation is cleanup-only, like transport close.
     }
   }
 
