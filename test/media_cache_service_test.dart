@@ -408,6 +408,35 @@ void main() {
     );
 
     test(
+      'rejects an injected file outside the normalized cache root',
+      () async {
+        final root = Directory(
+          '${temp.path}${Platform.pathSeparator}confined-cache',
+        );
+        final outside = File(
+          '${temp.path}${Platform.pathSeparator}outside.png',
+        );
+        await outside.writeAsBytes([7, 8, 9]);
+        final cache = MediaCacheService(
+          root: root,
+          downloadService: _EscapingDownloadService(outside),
+        );
+
+        try {
+          await expectLater(
+            cache.cache(Uri.parse('http://host/view?filename=outside.png')),
+            throwsA(isA<FileSystemException>()),
+          );
+        } finally {
+          await cache.close();
+        }
+
+        expect(await outside.readAsBytes(), [7, 8, 9]);
+        expect(_files(root), isEmpty);
+      },
+    );
+
+    test(
       'known generated videos remain remote and are not auto-cached',
       () async {
         final client = _FixtureClient((_) => _response(chunks: [Uint8List(1)]));
@@ -712,6 +741,60 @@ void main() {
     );
 
     test(
+      'dot-dot trailing and case root aliases protect active staging',
+      () async {
+        final root = Directory(
+          '${temp.path}${Platform.pathSeparator}alias-cache',
+        );
+        await root.create();
+        final nested = Directory('${root.path}${Platform.pathSeparator}nested');
+        await nested.create();
+
+        await _expectAliasRootProtectsActiveStaging(
+          root: root,
+          alias: Directory(
+            '${nested.path}${Platform.pathSeparator}..'
+            '${Platform.pathSeparator}',
+          ),
+          uri: Uri.parse('http://host/view?filename=dot-alias.png'),
+        );
+
+        if (Platform.isWindows || Platform.isMacOS) {
+          final caseAlias = Directory(root.path.toUpperCase());
+          if (await caseAlias.exists()) {
+            await _expectAliasRootProtectsActiveStaging(
+              root: root,
+              alias: caseAlias,
+              uri: Uri.parse('http://host/view?filename=case-alias.png'),
+            );
+          }
+        }
+      },
+    );
+
+    test('symlink root alias protects active staging', () async {
+      final root = Directory('${temp.path}${Platform.pathSeparator}real-cache');
+      await root.create();
+      final link = Link('${temp.path}${Platform.pathSeparator}cache-link');
+      try {
+        try {
+          await link.create(root.path);
+        } on FileSystemException catch (error) {
+          markTestSkipped('Symlink creation unavailable: $error');
+          return;
+        }
+
+        await _expectAliasRootProtectsActiveStaging(
+          root: root,
+          alias: Directory(link.path),
+          uri: Uri.parse('http://host/view?filename=link-alias.png'),
+        );
+      } finally {
+        if (await link.exists()) await link.delete();
+      }
+    });
+
+    test(
       'repeated complete cache hits do not schedule maintenance scans',
       () async {
         final operations = _FaultInjectingFileOperations();
@@ -893,6 +976,85 @@ void main() {
           2,
         );
         expect(_partFiles(temp), isEmpty);
+      },
+    );
+
+    test(
+      'shared downloader close drains only the owning export service',
+      () async {
+        final exportRoot = Directory(
+          '${temp.path}${Platform.pathSeparator}export-owner',
+        );
+        final otherRoot = Directory(
+          '${temp.path}${Platform.pathSeparator}other-owner',
+        );
+        final releaseExport = Completer<void>();
+        final exportUri = Uri.parse(
+          'http://host/view?filename=export-broken.png',
+        );
+        final failedDeletes = <String>{};
+        final operations = _FaultInjectingFileOperations(
+          failDelete: (file) =>
+              file.path.endsWith('.part') && failedDeletes.add(file.path),
+        );
+        final client = _FixtureClient(
+          (request) => http.StreamedResponse(
+            (() async* {
+              if (request.url == exportUri) await releaseExport.future;
+              yield [1, 2];
+              throw StateError('stream failed');
+            })(),
+            200,
+          ),
+        );
+        final downloader = DefaultMediaDownloadService(
+          httpClient: client,
+          fileOperations: operations,
+        );
+        final exportService = MediaExportService(
+          root: exportRoot,
+          downloadService: downloader,
+          shareFile: (_) async {},
+        );
+        final otherService = MediaExportService(
+          root: otherRoot,
+          downloadService: downloader,
+          shareFile: (_) async {},
+        );
+
+        await expectLater(
+          otherService.shareRemote(
+            Uri.parse('http://host/view?filename=other-broken.png'),
+            confirmAfterHeaders: (_) async => true,
+          ),
+          throwsA(isA<StateError>()),
+        );
+        final otherPart = _partFiles(otherRoot).single;
+        final export = exportService.shareRemote(
+          exportUri,
+          confirmAfterHeaders: (_) async => true,
+        );
+        await _waitUntil(() => client.sendCount == 2);
+        final exportExpectation = expectLater(
+          export,
+          throwsA(isA<StateError>()),
+        );
+        final closeExport = exportService.close();
+
+        releaseExport.complete();
+        await exportExpectation;
+        await closeExport;
+        final exportPartsAfterClose = _partFiles(exportRoot);
+        final otherPartSurvived = await otherPart.exists();
+        final otherDeleteAttemptsBeforeOwnClose = operations.deleteAttempts
+            .where((path) => path == otherPart.path)
+            .length;
+        await otherService.close();
+
+        expect(exportPartsAfterClose, isEmpty);
+        expect(otherPartSurvived, isTrue);
+        expect(otherDeleteAttemptsBeforeOwnClose, 1);
+        expect(_partFiles(otherRoot), isEmpty);
       },
     );
 
@@ -1251,6 +1413,43 @@ final class _InjectedDownloadService implements MediaDownloadPort {
   }
 }
 
+final class _PausedDownloadService implements MediaDownloadPort {
+  _PausedDownloadService({required this.staged, required this.release});
+
+  final Completer<File> staged;
+  final Future<void> release;
+
+  @override
+  Future<File> download(
+    Uri uri, {
+    required File destination,
+    required int maxBytes,
+    Map<String, String> headers = const {},
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) async {
+    await destination.parent.create(recursive: true);
+    await destination.writeAsBytes([1, 2, 3, 4]);
+    staged.complete(destination);
+    await release;
+    return destination;
+  }
+}
+
+final class _EscapingDownloadService implements MediaDownloadPort {
+  const _EscapingDownloadService(this.file);
+
+  final File file;
+
+  @override
+  Future<File> download(
+    Uri uri, {
+    required File destination,
+    required int maxBytes,
+    Map<String, String> headers = const {},
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) async => file;
+}
+
 final class _FaultInjectingFileOperations implements MediaFileOperations {
   _FaultInjectingFileOperations({
     this.failDelete,
@@ -1360,4 +1559,52 @@ Future<void> _waitUntil(bool Function() condition) async {
     await Future<void>.delayed(const Duration(milliseconds: 1));
   }
   fail('Condition was not reached');
+}
+
+Future<void> _expectAliasRootProtectsActiveStaging({
+  required Directory root,
+  required Directory alias,
+  required Uri uri,
+}) async {
+  final staged = Completer<File>();
+  final release = Completer<void>();
+  final cache = MediaCacheService(
+    root: root,
+    httpClient: _FixtureClient(
+      (_) => _response(
+        chunks: [
+          Uint8List.fromList([9]),
+        ],
+      ),
+    ),
+  );
+  final aliasCache = MediaCacheService(
+    root: alias,
+    downloadService: _PausedDownloadService(
+      staged: staged,
+      release: release.future,
+    ),
+  );
+  final operation = aliasCache.cache(uri);
+  final stagedFile = await staged.future;
+  Object? operationError;
+  File? result;
+  var survivedMaintenance = false;
+
+  try {
+    await cache.drainMaintenance();
+    survivedMaintenance = await stagedFile.exists();
+  } finally {
+    release.complete();
+    try {
+      result = await operation;
+    } catch (error) {
+      operationError = error;
+    }
+    await Future.wait([cache.close(), aliasCache.close()]);
+  }
+
+  expect(survivedMaintenance, isTrue);
+  expect(operationError, isNull);
+  expect(await result!.readAsBytes(), [1, 2, 3, 4]);
 }

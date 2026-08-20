@@ -169,3 +169,45 @@ Deterministic fixtures cover non-2xx, declared-over, missing/lying length, conte
 - Repository-only verification; no live gateway/device or real multi-GiB transfer.
 - Missing libmpv remains a graceful Windows test log.
 - Full suite retained the expected Windows symlink privilege skip.
+
+# Review round 4 (2026-08-20)
+
+## RED/GREEN
+
+- RED 1 focused media: 20 passed before the deterministic dot-dot/trailing root-alias overlap failed because maintenance deleted another cache instance's live staging file. The symlink variant capability-skipped on Windows privilege error 1314.
+- GREEN 1 focused media: 33/33 passed, with the symlink capability skip.
+- RED 2 focused media: 25 passed before the shared-downloader overlap failed because closing export service A drained export service B's pending partial.
+- RED/GREEN confinement mutation: disabling produced-file confinement made the targeted outside-root adoption test fail; restoring confinement passed 1/1.
+- Final focused media: 35/35 passed, with one symlink capability skip.
+- Combined cache/gallery/chat: 62/62 passed, with one symlink capability skip.
+- Touched Dart analyzer: three files, no issues.
+- Final full Flutter test: 277 passed, 2 skipped because Windows could not create symlinks.
+
+## Concurrency interleavings
+
+- Every cache root is created, resolved through filesystem aliases, normalized, and case-folded on Windows/macOS before the weak coordinator registry is consulted.
+- App-default and injected-root cache instances now acquire their coordinator from that registry; the cache-owned default downloader is created only after root resolution and receives the registered coordinator.
+- Canonical, staging, nested partial, rollback, generation, and maintenance identities normalize consistently. Produced files are root-confined before promotion.
+- Dot-dot/trailing and case aliases share one coordinator. The deterministic paused download stays registered while maintenance lists the same physical root through another spelling.
+- Each cache/export service passes its own additive cleanup scope to ownership-aware downloaders. Legacy MediaDownloadPort implementations and callers keep the unchanged download signature.
+- Export close still closes admission synchronously and awaits its stable active set, but drains only its own failed partial/destination cleanup. Another service sharing the downloader keeps its pending partial until its own close.
+
+## Tests
+
+- Added dot-dot/trailing and case alias overlap coverage.
+- Added capability-gated real-symlink alias overlap coverage.
+- Added outside-root injected-download rejection and preservation coverage.
+- Added two-export-service shared-downloader overlap coverage proving the late export partial is removed and the other owner's partial is not drained early.
+
+## Files
+
+- lib/core/services/media_cache_service.dart
+- lib/core/services/media_export_service.dart
+- test/media_cache_service_test.dart
+- .superpowers/sdd/2026-08-20-comfyui-generation-workflows/task-5-report.md
+
+## Concerns
+
+- Repository-only verification; no live gateway/device or real multi-GiB transfer.
+- The two full-suite skips are capability-gated symlink tests on Windows privilege error 1314.
+- Missing libmpv remains a graceful Windows test log.

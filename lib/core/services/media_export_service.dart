@@ -38,6 +38,8 @@ class MediaExportService {
   final Future<void> Function(File) _shareFile;
   final Future<String?> Function(File, {required bool isVideo}) _saveFile;
   final int maxDownloadBytes;
+  final MediaDownloadCleanupScope _downloadCleanupScope =
+      MediaDownloadCleanupScope();
   final Set<Future<dynamic>> _activeExports = Set<Future<dynamic>>.identity();
   bool _closing = false;
   Future<void>? _closeFuture;
@@ -117,7 +119,8 @@ class MediaExportService {
   }) async {
     final destination = await _destinationFor(uri);
     try {
-      final downloaded = await _downloadService.download(
+      final downloaded = await _downloadCleanupScope.download(
+        _downloadService,
         uri,
         destination: destination,
         maxBytes: maxDownloadBytes,
@@ -126,7 +129,7 @@ class MediaExportService {
       );
       await _shareFile(downloaded);
     } finally {
-      await _deleteIfPresent(destination);
+      await _downloadCleanupScope.deleteOrSchedule(destination);
     }
   }
 
@@ -159,7 +162,8 @@ class MediaExportService {
   }) async {
     final destination = await _destinationFor(uri);
     try {
-      final downloaded = await _downloadService.download(
+      final downloaded = await _downloadCleanupScope.download(
+        _downloadService,
         uri,
         destination: destination,
         maxBytes: maxDownloadBytes,
@@ -168,18 +172,11 @@ class MediaExportService {
       );
       return await _saveFile(downloaded, isVideo: isVideo);
     } finally {
-      await _deleteIfPresent(destination);
+      await _downloadCleanupScope.deleteOrSchedule(destination);
     }
   }
 
-  Future<void> drainCleanup() {
-    final downloadService = _downloadService;
-    if (downloadService is MediaDownloadCleanupPort) {
-      final cleanupService = downloadService as MediaDownloadCleanupPort;
-      return cleanupService.drainCleanup();
-    }
-    return Future<void>.value();
-  }
+  Future<void> drainCleanup() => _downloadCleanupScope.drainCleanup();
 
   Future<void> close() {
     final active = _closeFuture;
@@ -199,12 +196,9 @@ class MediaExportService {
       );
     }
 
-    final downloadService = _downloadService;
-    if (downloadService is! MediaDownloadCleanupPort) return;
-    final cleanupService = downloadService as MediaDownloadCleanupPort;
     for (var pass = 0; pass < 3; pass++) {
-      await cleanupService.drainCleanup();
-      if (!cleanupService.hasPendingCleanup) return;
+      await _downloadCleanupScope.drainCleanup();
+      if (!_downloadCleanupScope.hasPendingCleanup) return;
       if (pass < 2) await Future<void>.delayed(Duration.zero);
     }
     throw StateError(
@@ -258,10 +252,6 @@ class MediaExportService {
       return 'media';
     }
     return sanitized;
-  }
-
-  static Future<void> _deleteIfPresent(File file) async {
-    if (await file.exists()) await file.delete();
   }
 
   static Future<Directory> Function() _resolveRootProvider(
