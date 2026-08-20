@@ -79,6 +79,10 @@ dev_dependencies:
   flutter_lints: ^6.0.0
   build_runner: ^2.4.14
   json_serializable: ^6.9.4
+  # Faking ImagePickerPlatform.instance in chat_screen_test.dart -- transitive
+  # via image_picker already, declared directly per depend_on_referenced_packages.
+  image_picker_platform_interface: ^2.11.1
+  plugin_platform_interface: ^2.1.8
 
 flutter:
   uses-material-design: true

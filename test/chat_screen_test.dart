@@ -21,6 +21,8 @@ import 'package:hermes_android/core/services/connection_manager.dart';
 import 'package:hermes_android/core/services/generation_repository.dart';
 import 'package:hermes_android/core/services/media_cache_service.dart';
 import 'package:hermes_android/core/services/tts_provider.dart';
+import 'package:image_picker_platform_interface/image_picker_platform_interface.dart';
+import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// A TTS backend that does nothing and touches no platform channel.
@@ -344,6 +346,29 @@ class _FakeClient extends http.BaseClient {
       request: request,
     );
   }
+}
+
+/// Scriptable [ImagePickerPlatform] fake -- the real plugin talks to a
+/// platform channel `ImagePicker()` always delegates to, so this is the
+/// supported way to test picker behavior without a device.
+class _FakeImagePickerPlatform extends ImagePickerPlatform
+    with MockPlatformInterfaceMixin {
+  XFile? nextPick;
+  Object? pickError;
+  LostDataResponse lostData = LostDataResponse.empty();
+
+  @override
+  Future<XFile?> getImageFromSource({
+    required ImageSource source,
+    ImagePickerOptions options = const ImagePickerOptions(),
+  }) async {
+    final error = pickError;
+    if (error != null) throw error;
+    return nextPick;
+  }
+
+  @override
+  Future<LostDataResponse> getLostData() async => lostData;
 }
 
 SavedConnection _conn() => SavedConnection(
@@ -1041,5 +1066,95 @@ void main() {
         expect(find.text('draw me a cat'), findsOneWidget);
       },
     );
+  });
+
+  group('image attach', () {
+    // 1x1 transparent PNG -- Image.memory actually decodes the picked-image
+    // preview, so a bare magic-byte prefix isn't enough here.
+    final pngBytes = base64Decode(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk'
+      '+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+    );
+
+    late ImagePickerPlatform originalPlatform;
+
+    setUp(() {
+      originalPlatform = ImagePickerPlatform.instance;
+    });
+
+    tearDown(() {
+      ImagePickerPlatform.instance = originalPlatform;
+    });
+
+    testWidgets('picking a photo attaches it to the compose bar', (
+      tester,
+    ) async {
+      ImagePickerPlatform.instance = _FakeImagePickerPlatform()
+        ..nextPick = XFile.fromData(
+          pngBytes,
+          mimeType: 'image/png',
+          name: 'photo.png',
+        );
+
+      await tester.pumpWidget(_app(_FakeGateway(), _SilentTts()));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('Attach photo'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Photo attached'), findsOneWidget);
+    });
+
+    testWidgets(
+      'a picker exception shows an error instead of silently doing nothing',
+      (tester) async {
+        ImagePickerPlatform.instance = _FakeImagePickerPlatform()
+          ..pickError = Exception('boom');
+
+        await tester.pumpWidget(_app(_FakeGateway(), _SilentTts()));
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.byTooltip('Attach photo'));
+        await tester.pump();
+        await tester.pump();
+
+        expect(find.textContaining('Could not attach photo'), findsOneWidget);
+      },
+    );
+
+    testWidgets(
+      'a photo pick lost to Android reclaiming the process is recovered on '
+      'the next launch',
+      (tester) async {
+        ImagePickerPlatform.instance = _FakeImagePickerPlatform()
+          ..lostData = LostDataResponse(
+            file: XFile.fromData(
+              pngBytes,
+              mimeType: 'image/png',
+              name: 'lost.png',
+            ),
+            type: RetrieveType.image,
+          );
+
+        await tester.pumpWidget(_app(_FakeGateway(), _SilentTts()));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Photo attached'), findsOneWidget);
+      },
+    );
+
+    testWidgets('a lost-pick exception surfaces an error on the next launch', (
+      tester,
+    ) async {
+      ImagePickerPlatform.instance = _FakeImagePickerPlatform()
+        ..lostData = LostDataResponse(
+          exception: PlatformException(code: 'photo_access_denied'),
+        );
+
+      await tester.pumpWidget(_app(_FakeGateway(), _SilentTts()));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Could not attach photo'), findsOneWidget);
+    });
   });
 }

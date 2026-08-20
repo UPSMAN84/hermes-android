@@ -3,7 +3,6 @@
 // GET /api/sessions/{id}/messages.
 import 'dart:async';
 import 'dart:io';
-import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
 
@@ -307,6 +306,12 @@ class _ChatScreenState extends State<ChatScreen> {
     _initTtsProvider();
     _scrollController.addListener(_onScroll);
     _textController.addListener(_onTextChanged);
+    // The photo picker runs as a separate Activity; on a low-memory device
+    // Android can reclaim this app's process while it's in the foreground,
+    // which silently drops the in-flight pickImage() result -- the picker
+    // then just never returns anything and the attach button looks like it
+    // did nothing. Recovering it here is the documented image_picker fix.
+    unawaited(_recoverLostImagePick());
   }
 
   /// Reads every SharedPreferences-derived setting the screen opens with and
@@ -2047,9 +2052,10 @@ class _ChatScreenState extends State<ChatScreen> {
           'Downloaded file is not a recognizable image',
         );
       }
-      // Encoded on the main isolate deliberately, unlike _pickImage's
-      // Isolate.run(): this is a one-off, user-triggered action on an
-      // already-bounded (25 MiB) file, not a per-frame hot path.
+      // Encoded on the main isolate deliberately: a one-off, user-triggered
+      // action on an already-bounded (25 MiB) file, not a per-frame hot
+      // path -- see _applyPickedImageFile for the same trade-off and why
+      // Isolate.run() specifically doesn't work from an instance method.
       final dataUrl = buildImageDataUrl(bytes, mime);
       if (!mounted) return;
       setState(() {
@@ -2341,12 +2347,49 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   Future<void> _pickImage() async {
-    final file = await _imagePicker.pickImage(
-      source: ImageSource.gallery,
-      maxWidth: 2000,
-      imageQuality: 85,
-    );
-    if (file == null || !mounted) return;
+    try {
+      final file = await _imagePicker.pickImage(
+        source: ImageSource.gallery,
+        maxWidth: 2000,
+        imageQuality: 85,
+      );
+      if (file == null || !mounted) return;
+      await _applyPickedImageFile(file);
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not attach photo: $error')));
+    }
+  }
+
+  /// Recovers a photo pick that Android silently dropped because it
+  /// reclaimed this app's process while the system picker Activity was in
+  /// the foreground -- the in-flight [ImagePicker.pickImage] future never
+  /// resolves in that case; the file is only reachable through this call.
+  /// Documented image_picker behavior, not specific to this app.
+  Future<void> _recoverLostImagePick() async {
+    try {
+      final response = await _imagePicker.retrieveLostData();
+      if (response.isEmpty) return;
+      final file = response.file;
+      if (file == null) {
+        final exception = response.exception;
+        if (exception != null && mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Could not attach photo: $exception')),
+          );
+        }
+        return;
+      }
+      if (!mounted) return;
+      await _applyPickedImageFile(file);
+    } catch (_) {
+      // Best-effort recovery only -- a normal pick still works without it.
+    }
+  }
+
+  Future<void> _applyPickedImageFile(XFile file) async {
     final bytes = await file.readAsBytes();
     if (!mounted) return;
     // The platform picker usually already knows the real MIME type; only
@@ -2360,9 +2403,14 @@ class _ChatScreenState extends State<ChatScreen> {
             'gif' => 'image/gif',
             _ => 'image/jpeg',
           };
-    // Encode here, on the async pick path, not in _sendMessage — see
-    // buildImageDataUrl.
-    final dataUrl = await Isolate.run(() => buildImageDataUrl(bytes, mime));
+    // Encoded directly, not via Isolate.run(): a closure defined inside this
+    // instance method drags in _ChatScreenState's whole captured-variable
+    // context (traced to _speechCoordinator's internal Future), which
+    // Isolate.run() rejects outright as unsendable. This is a one-off,
+    // user-triggered, already-bounded (2000px/q85 picker output) encode --
+    // not a hot path -- so the main-isolate cost is the same trade-off
+    // already made deliberately in _handleDiscussImage above.
+    final dataUrl = buildImageDataUrl(bytes, mime);
     if (!mounted) return;
     setState(() {
       _pickedImageBytes = bytes;
