@@ -532,7 +532,7 @@ final class _DurableTransactionRecovery {
     if (decoded is! Map) {
       throw const FormatException('Transaction journal must be an object');
     }
-    return _RecoveredTransactionJournal.fromJson(
+    return _RecoveredTransactionJournal.decode(
       root: root,
       file: file,
       json: decoded.map((key, value) => MapEntry(key.toString(), value)),
@@ -607,11 +607,11 @@ final class _RecoveredTransactionJournal {
     required this.entries,
   });
 
-  factory _RecoveredTransactionJournal.fromJson({
+  static Future<_RecoveredTransactionJournal> decode({
     required Directory root,
     required File file,
     required Map<String, Object?> json,
-  }) {
+  }) async {
     if (json['schemaVersion'] != 1) {
       throw const FormatException('Unsupported transaction journal schema');
     }
@@ -627,51 +627,50 @@ final class _RecoveredTransactionJournal {
     if (rawEntries is! List || rawEntries.isEmpty) {
       throw const FormatException('Transaction journal entries are required');
     }
-    final entries = rawEntries
-        .map((raw) {
-          if (raw is! Map) {
-            throw const FormatException('Invalid transaction journal entry');
-          }
-          final entry = raw.map(
-            (key, value) => MapEntry(key.toString(), value),
-          );
-          final hadOriginal = entry['hadOriginal'];
-          if (hadOriginal is! bool) {
-            throw const FormatException('Invalid transaction backup state');
-          }
-          final target = _resolveStoragePath(root, entry['target']);
-          final temporary = _resolveOptionalStoragePath(
-            root,
-            entry['temporary'],
-          );
-          final backup = _resolveOptionalStoragePath(root, entry['backup']);
-          if (hadOriginal && backup == null) {
-            throw const FormatException('Missing transaction backup mapping');
-          }
-          if (temporary != null &&
-              !_isTransactionSibling(
-                target,
-                temporary,
-                suffix: '.transaction-temp',
-              )) {
-            throw const FormatException('Unsafe transaction temp mapping');
-          }
-          if (backup != null &&
-              !_isTransactionSibling(
-                target,
-                backup,
-                suffix: '.transaction-backup',
-              )) {
-            throw const FormatException('Unsafe transaction backup mapping');
-          }
-          return _RecoveredTransactionEntry(
-            target: target,
-            temporary: temporary,
-            backup: backup,
-            hadOriginal: hadOriginal,
-          );
-        })
-        .toList(growable: false);
+    final entries = <_RecoveredTransactionEntry>[];
+    for (final raw in rawEntries) {
+      if (raw is! Map) {
+        throw const FormatException('Invalid transaction journal entry');
+      }
+      final entry = raw.map((key, value) => MapEntry(key.toString(), value));
+      final hadOriginal = entry['hadOriginal'];
+      if (hadOriginal is! bool) {
+        throw const FormatException('Invalid transaction backup state');
+      }
+      final target = await _resolveStoragePath(root, entry['target']);
+      final temporary = await _resolveOptionalStoragePath(
+        root,
+        entry['temporary'],
+      );
+      final backup = await _resolveOptionalStoragePath(root, entry['backup']);
+      if (hadOriginal && backup == null) {
+        throw const FormatException('Missing transaction backup mapping');
+      }
+      if (temporary != null &&
+          !_isTransactionSibling(
+            target,
+            temporary,
+            suffix: '.transaction-temp',
+          )) {
+        throw const FormatException('Unsafe transaction temp mapping');
+      }
+      if (backup != null &&
+          !_isTransactionSibling(
+            target,
+            backup,
+            suffix: '.transaction-backup',
+          )) {
+        throw const FormatException('Unsafe transaction backup mapping');
+      }
+      entries.add(
+        _RecoveredTransactionEntry(
+          target: target,
+          temporary: temporary,
+          backup: backup,
+          hadOriginal: hadOriginal,
+        ),
+      );
+    }
     return _RecoveredTransactionJournal(file: file, entries: entries);
   }
 
@@ -696,8 +695,12 @@ final class _RecoveredTransactionEntry {
 String _relativeStoragePath(Directory root, File file) {
   final rootPath = root.absolute.path;
   final filePath = file.absolute.path;
-  final comparableRoot = Platform.isWindows ? rootPath.toLowerCase() : rootPath;
-  final comparableFile = Platform.isWindows ? filePath.toLowerCase() : filePath;
+  final comparableRoot = _caseInsensitivePaths
+      ? rootPath.toLowerCase()
+      : rootPath;
+  final comparableFile = _caseInsensitivePaths
+      ? filePath.toLowerCase()
+      : filePath;
   final prefix = '$comparableRoot${Platform.pathSeparator}';
   if (!comparableFile.startsWith(prefix)) {
     throw const FormatException('Transaction path escapes storage root');
@@ -707,12 +710,12 @@ String _relativeStoragePath(Directory root, File file) {
       .replaceAll(Platform.pathSeparator, '/');
 }
 
-File? _resolveOptionalStoragePath(Directory root, Object? raw) {
+Future<File?> _resolveOptionalStoragePath(Directory root, Object? raw) async {
   if (raw == null) return null;
   return _resolveStoragePath(root, raw);
 }
 
-File _resolveStoragePath(Directory root, Object? raw) {
+Future<File> _resolveStoragePath(Directory root, Object? raw) async {
   if (raw is! String ||
       raw.isEmpty ||
       raw.startsWith('/') ||
@@ -724,15 +727,54 @@ File _resolveStoragePath(Directory root, Object? raw) {
   if (parts.any((part) => part.isEmpty || part == '.' || part == '..')) {
     throw const FormatException('Unsafe transaction path');
   }
-  if (parts.first == '.transactions') {
+  final controlSegment = _caseInsensitivePaths
+      ? parts.first.toLowerCase()
+      : parts.first;
+  if (controlSegment == '.transactions') {
     throw const FormatException('Transaction journal cannot target itself');
   }
   final file = File(
     [root.absolute.path, ...parts].join(Platform.pathSeparator),
   );
   _relativeStoragePath(root, file);
+  final resolvedRoot = await root.resolveSymbolicLinks();
+  final resolvedParent = await _resolveExistingAncestors(file.parent);
+  final resolvedFile = File(
+    _join(resolvedParent, _fileName(file)),
+  ).absolute.path;
+  final comparableRoot = _caseInsensitivePaths
+      ? resolvedRoot.toLowerCase()
+      : resolvedRoot;
+  final comparableFile = _caseInsensitivePaths
+      ? resolvedFile.toLowerCase()
+      : resolvedFile;
+  if (!comparableFile.startsWith('$comparableRoot${Platform.pathSeparator}')) {
+    throw const FormatException('Transaction path escapes storage root');
+  }
   return file;
 }
+
+Future<String> _resolveExistingAncestors(Directory directory) async {
+  var current = directory.absolute;
+  final unresolvedSegments = <String>[];
+  while (!await current.exists()) {
+    final parent = current.parent.absolute;
+    if (_samePath(parent.path, current.path)) {
+      throw const FormatException('Transaction path has no existing ancestor');
+    }
+    unresolvedSegments.insert(0, _fileName(File(current.path)));
+    current = parent;
+  }
+  var resolved = await current.resolveSymbolicLinks();
+  for (final segment in unresolvedSegments) {
+    resolved = _join(resolved, segment);
+  }
+  return Directory(resolved).absolute.path;
+}
+
+bool _samePath(String left, String right) => _caseInsensitivePaths
+    ? left.toLowerCase() == right.toLowerCase()
+    : left == right;
 
 bool _isTransactionSibling(
   File target,
@@ -741,13 +783,28 @@ bool _isTransactionSibling(
 }) {
   final targetParent = target.parent.absolute.path;
   final candidateParent = candidate.parent.absolute.path;
-  final sameParent = Platform.isWindows
-      ? targetParent.toLowerCase() == candidateParent.toLowerCase()
-      : targetParent == candidateParent;
+  final comparableTargetParent = _caseInsensitivePaths
+      ? targetParent.toLowerCase()
+      : targetParent;
+  final comparableCandidateParent = _caseInsensitivePaths
+      ? candidateParent.toLowerCase()
+      : candidateParent;
+  final targetName = _caseInsensitivePaths
+      ? _fileName(target).toLowerCase()
+      : _fileName(target);
+  final candidateName = _caseInsensitivePaths
+      ? _fileName(candidate).toLowerCase()
+      : _fileName(candidate);
+  final comparableSuffix = _caseInsensitivePaths
+      ? suffix.toLowerCase()
+      : suffix;
+  final sameParent = comparableTargetParent == comparableCandidateParent;
   return sameParent &&
-      _fileName(candidate).startsWith('${_fileName(target)}.') &&
-      _fileName(candidate).endsWith(suffix);
+      candidateName.startsWith('$targetName.') &&
+      candidateName.endsWith(comparableSuffix);
 }
+
+bool get _caseInsensitivePaths => Platform.isWindows || Platform.isMacOS;
 
 Future<void> replaceFileAtomically({
   required File temp,
@@ -782,6 +839,7 @@ final class ComfyStorageIndex {
   ComfyStorageIndex({
     required this.root,
     this.maxRecordBytes = 5 * 1024 * 1024,
+    this.maxReferenceImageBytes = 25 * 1024 * 1024,
     AtomicStoreFileSystem? fileSystem,
   }) : _indexFile = File(_join(root.path, 'index.json')),
        _mutexFile = File(_join(root.path, '.index-serialization')) {
@@ -801,9 +859,17 @@ final class ComfyStorageIndex {
 
   final Directory root;
   final int maxRecordBytes;
+  int maxReferenceImageBytes;
   final File _indexFile;
   final File _mutexFile;
   late final AtomicJsonStore _atomic;
+
+  void configureReferenceImageLimit(int maxBytes) {
+    if (maxBytes <= 0) {
+      throw ArgumentError.value(maxBytes, 'maxBytes', 'Must be positive');
+    }
+    maxReferenceImageBytes = maxBytes;
+  }
 
   Future<ComfyIndexSnapshot> read() =>
       _atomic.withRecordLock(_mutexFile, _readOrRebuildUnlocked);
@@ -866,6 +932,32 @@ final class ComfyStorageIndex {
         throw StateError('Record mutation did not stage the index');
       }
       return result;
+    });
+  }
+
+  Future<T> migrateRecordIfNeeded<T>({
+    required String collection,
+    required String id,
+    required Future<T> Function(
+      Future<void> Function(AtomicFileTransaction transaction) stageIndex,
+    )
+    migration,
+  }) async {
+    _validateCollection(collection);
+    validateRecordId(id);
+    return _atomic.withRecordLock(_mutexFile, () async {
+      final current = await _readOrRebuildUnlocked();
+      var indexStaged = false;
+      Future<void> stageIndex(AtomicFileTransaction transaction) async {
+        if (indexStaged) throw StateError('Index already staged');
+        await transaction.writeJson(
+          _indexFile,
+          current.withAdded(collection, id).toJson(),
+        );
+        indexStaged = true;
+      }
+
+      return migration(stageIndex);
     });
   }
 
@@ -986,12 +1078,17 @@ final class ComfyStorageIndex {
 
   Future<String> _decodeContext(File file, String id) async {
     return _atomic.withRecordTransaction(file, (transaction) async {
+      final json = await transaction.readJson(file);
       final context = await decodeStoredCharacterContext(
-        json: await transaction.readJson(file),
+        json: json,
         id: id,
         root: root,
         transaction: transaction,
-        maxReferenceImageBytes: 25 * 1024 * 1024,
+        maxReferenceImageBytes: maxReferenceImageBytes,
+        migrateMissingHash: (hash) => transaction.writeJson(file, {
+          ...json,
+          referenceImageSha256Key: hash,
+        }),
       );
       return context.sessionId;
     });
@@ -1114,6 +1211,7 @@ Future<CharacterGenerationContext> decodeStoredCharacterContext({
   required Directory root,
   required AtomicFileTransaction transaction,
   required int maxReferenceImageBytes,
+  Future<void> Function(String hash)? migrateMissingHash,
 }) async {
   final context = CharacterGenerationContext.fromJson(json);
   final reference = context.referenceImagePath;
@@ -1132,15 +1230,28 @@ Future<CharacterGenerationContext> decodeStoredCharacterContext({
   if (!_sameAbsolutePath(File(reference), expected)) {
     throw const FormatException('Unsafe character reference image path');
   }
-  if (storedHash is! String ||
-      !RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(storedHash)) {
+  final String? normalizedStoredHash;
+  if (storedHash == null) {
+    normalizedStoredHash = null;
+  } else if (storedHash is String &&
+      RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(storedHash)) {
+    normalizedStoredHash = storedHash.toLowerCase();
+  } else {
     throw StoredRecordCorruption('Character reference image hash is missing');
   }
   final actualHash = await transaction.sha256File(
     expected,
     maxBytes: maxReferenceImageBytes,
   );
-  if (actualHash != storedHash.toLowerCase()) {
+  if (normalizedStoredHash == null) {
+    final migrate = migrateMissingHash;
+    if (migrate == null) {
+      throw StoredRecordCorruption('Character reference image hash is missing');
+    }
+    await migrate(actualHash);
+    return context;
+  }
+  if (actualHash != normalizedStoredHash) {
     throw StoredRecordCorruption('Character reference image hash mismatch');
   }
   return context;

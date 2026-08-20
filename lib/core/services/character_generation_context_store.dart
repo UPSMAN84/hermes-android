@@ -9,16 +9,22 @@ final class CharacterGenerationContextStore
     required this.root,
     ComfyStorageIndex? index,
     this.maxRecordBytes = 5 * 1024 * 1024,
-    this.maxReferenceImageBytes = 25 * 1024 * 1024,
+    int? maxReferenceImageBytes,
     AtomicStoreFileSystem? fileSystem,
   }) {
+    this.maxReferenceImageBytes =
+        maxReferenceImageBytes ??
+        index?.maxReferenceImageBytes ??
+        25 * 1024 * 1024;
     storageIndex =
         index ??
         ComfyStorageIndex(
           root: root,
           maxRecordBytes: maxRecordBytes,
+          maxReferenceImageBytes: this.maxReferenceImageBytes,
           fileSystem: fileSystem,
         );
+    storageIndex.configureReferenceImageLimit(this.maxReferenceImageBytes);
     _atomic = AtomicJsonStore(
       root: root,
       index: storageIndex,
@@ -29,7 +35,7 @@ final class CharacterGenerationContextStore
 
   final Directory root;
   final int maxRecordBytes;
-  final int maxReferenceImageBytes;
+  late final int maxReferenceImageBytes;
   late final ComfyStorageIndex storageIndex;
   late final AtomicJsonStore _atomic;
 
@@ -53,19 +59,35 @@ final class CharacterGenerationContextStore
     final record = _record(id);
     if (!await record.exists()) return null;
     try {
-      return await _atomic.withRecordTransaction(record, (transaction) async {
-        final value = await decodeStoredCharacterContext(
-          json: await transaction.readJson(record),
-          id: id,
-          root: root,
-          transaction: transaction,
-          maxReferenceImageBytes: maxReferenceImageBytes,
-        );
-        if (value.sessionId != id) {
-          throw const FormatException('Record ID does not match its filename');
-        }
-        return value;
-      });
+      return await storageIndex
+          .migrateRecordIfNeeded<CharacterGenerationContext>(
+            collection: ComfyStorageIndex.contexts,
+            id: id,
+            migration: (stageIndex) =>
+                _atomic.withRecordTransaction(record, (transaction) async {
+                  final json = await transaction.readJson(record);
+                  final value = await decodeStoredCharacterContext(
+                    json: json,
+                    id: id,
+                    root: root,
+                    transaction: transaction,
+                    maxReferenceImageBytes: maxReferenceImageBytes,
+                    migrateMissingHash: (hash) async {
+                      await transaction.writeJson(record, {
+                        ...json,
+                        referenceImageSha256Key: hash,
+                      });
+                      await stageIndex(transaction);
+                    },
+                  );
+                  if (value.sessionId != id) {
+                    throw const FormatException(
+                      'Record ID does not match its filename',
+                    );
+                  }
+                  return value;
+                }),
+          );
     } on Object catch (error) {
       if (isMissingFileError(error) && !await record.exists()) return null;
       if (!isCorruptRecordError(error)) rethrow;

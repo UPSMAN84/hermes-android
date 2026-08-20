@@ -97,6 +97,92 @@ void main() {
       await target.writeAsBytes(List.filled(65, 1));
       await expectLater(atomic.readBytes(target), throwsFormatException);
     });
+
+    test(
+      'rejects recovery targets whose symlinked parent escapes the root',
+      () async {
+        final external = await Directory.systemTemp.createTemp(
+          'hermes-comfy-outside-',
+        );
+        final link = Link(_join(temp.path, 'linked-outside'));
+        try {
+          try {
+            await link.create(external.path);
+          } on FileSystemException catch (error) {
+            markTestSkipped('Symlink creation unavailable: $error');
+            return;
+          }
+          final victim = File(_join(external.path, 'victim.json'));
+          await victim.writeAsString('outside', flush: true);
+          await _writeRecoveryJournal(
+            temp,
+            id: 'symlink-escape',
+            entries: [
+              {
+                'target': 'linked-outside/victim.json',
+                'temporary': null,
+                'backup': null,
+                'hadOriginal': false,
+              },
+            ],
+          );
+
+          await expectLater(
+            ComfyStorageIndex(root: temp).read(),
+            throwsFormatException,
+          );
+          expect(await victim.readAsString(), 'outside');
+        } finally {
+          if (await link.exists()) await link.delete();
+          if (await external.exists()) await external.delete(recursive: true);
+        }
+      },
+    );
+
+    test(
+      'rejects case-variant transaction control-directory targets',
+      () async {
+        if (!Platform.isWindows && !Platform.isMacOS) {
+          markTestSkipped('Case-sensitive platform');
+          return;
+        }
+        await _writeRecoveryJournal(
+          temp,
+          id: 'control-case',
+          entries: [
+            {
+              'target': '.TrAnSaCtIoNs/victim.json',
+              'temporary': null,
+              'backup': null,
+              'hadOriginal': false,
+            },
+          ],
+        );
+
+        await expectLater(
+          ComfyStorageIndex(root: temp).read(),
+          throwsFormatException,
+        );
+      },
+    );
+
+    test('recovers confined journal targets with a missing parent', () async {
+      await _writeRecoveryJournal(
+        temp,
+        id: 'missing-parent',
+        entries: [
+          {
+            'target': 'not-created/victim.json',
+            'temporary': null,
+            'backup': null,
+            'hadOriginal': false,
+          },
+        ],
+      );
+
+      expect((await ComfyStorageIndex(root: temp).read()).workflowIds, isEmpty);
+      expect(_transactionArtifacts(temp), isEmpty);
+    });
   });
 
   group('unified index and workflows', () {
@@ -723,6 +809,104 @@ void main() {
     });
 
     test(
+      'atomically migrates a legacy image hash and remains readable',
+      () async {
+        final source = File(_join(temp.path, 'legacy-hash-source.png'));
+        await source.writeAsBytes([1, 3, 3, 7]);
+        final original = await CharacterGenerationContextStore(
+          root: temp,
+        ).save(context(id: 'legacy-hash'), referenceImage: source);
+        final record = File(
+          _join(temp.path, 'character-contexts', '${original.sessionId}.json'),
+        );
+        final legacy = _readJsonFile(record)..remove(referenceImageSha256Key);
+        await record.writeAsString(jsonEncode(legacy), flush: true);
+
+        var reconstructed = CharacterGenerationContextStore(root: temp);
+        expect(
+          (await reconstructed.get(original.sessionId))!.toJson(),
+          original.toJson(),
+        );
+        expect(
+          _readJsonFile(record)[referenceImageSha256Key],
+          sha256.convert([1, 3, 3, 7]).toString(),
+        );
+        expect(
+          (await reconstructed.storageIndex.read()).contextIds,
+          contains(original.sessionId),
+        );
+        final migratedBytes = await record.readAsBytes();
+
+        reconstructed = CharacterGenerationContextStore(root: temp);
+        expect(await reconstructed.get(original.sessionId), isNotNull);
+        expect(await record.readAsBytes(), migratedBytes);
+        expect(_quarantinedFiles(temp), isEmpty);
+      },
+    );
+
+    test('legacy missing and oversized images still quarantine', () async {
+      final source = File(_join(temp.path, 'legacy-invalid-source.png'));
+      await source.writeAsBytes([1, 2, 3, 4]);
+      final seed = CharacterGenerationContextStore(root: temp);
+      final missing = await seed.save(
+        context(id: 'legacy-missing'),
+        referenceImage: source,
+      );
+      final oversized = await seed.save(
+        context(id: 'legacy-oversized'),
+        referenceImage: source,
+      );
+      for (final value in [missing, oversized]) {
+        final record = File(
+          _join(temp.path, 'character-contexts', '${value.sessionId}.json'),
+        );
+        final legacy = _readJsonFile(record)..remove(referenceImageSha256Key);
+        await record.writeAsString(jsonEncode(legacy), flush: true);
+      }
+      await File(missing.referenceImagePath!).delete();
+
+      final reconstructed = CharacterGenerationContextStore(
+        root: temp,
+        maxReferenceImageBytes: 3,
+      );
+      expect(await reconstructed.get(missing.sessionId), isNull);
+      expect(await reconstructed.get(oversized.sessionId), isNull);
+      expect(_quarantinedFiles(temp), hasLength(2));
+    });
+
+    test(
+      'rebuild honors a configured reference-image limit above 25 MiB',
+      () async {
+        const imageBytes = 25 * 1024 * 1024 + 1;
+        const configuredLimit = 26 * 1024 * 1024;
+        final source = File(_join(temp.path, 'large-reference-image'));
+        await source.writeAsBytes(Uint8List(imageBytes), flush: true);
+        final sharedIndex = ComfyStorageIndex(root: temp);
+        final store = CharacterGenerationContextStore(
+          root: temp,
+          index: sharedIndex,
+          maxReferenceImageBytes: configuredLimit,
+        );
+        final saved = await store.save(
+          context(id: 'large-reference'),
+          referenceImage: source,
+        );
+        await File(_join(temp.path, 'index.json')).writeAsString('{');
+
+        final reconstructed = CharacterGenerationContextStore(
+          root: temp,
+          index: sharedIndex,
+          maxReferenceImageBytes: configuredLimit,
+        );
+        expect((await reconstructed.storageIndex.read()).contextIds, [
+          saved.sessionId,
+        ]);
+        expect(await reconstructed.get(saved.sessionId), isNotNull);
+        expect(_quarantinedFiles(temp), hasLength(1));
+      },
+    );
+
+    test(
       'recovers abandoned character journals before image integrity decode',
       () async {
         final oldImageSource = File(_join(temp.path, 'journal-old.png'));
@@ -872,6 +1056,19 @@ Future<void> _simulateAbandonedTransaction(
   if (committed) {
     await File('${journal.path}.committed').writeAsString(id, flush: true);
   }
+}
+
+Future<void> _writeRecoveryJournal(
+  Directory root, {
+  required String id,
+  required List<Map<String, Object?>> entries,
+}) async {
+  final directory = Directory(_join(root.path, '.transactions'));
+  await directory.create(recursive: true);
+  await File(_join(directory.path, '$id.journal.json')).writeAsString(
+    jsonEncode({'schemaVersion': 1, 'transactionId': id, 'entries': entries}),
+    flush: true,
+  );
 }
 
 String _relativeStoragePath(Directory root, File file) {
