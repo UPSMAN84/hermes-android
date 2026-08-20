@@ -66,15 +66,11 @@ void main() {
     );
 
     test('rejects non-2xx without publishing a destination', () async {
-      var chunksRead = 0;
+      final body = _CancellableResponseBody([
+        Uint8List.fromList([1, 2, 3]),
+      ]);
       final client = _FixtureClient(
-        (_) => _response(
-          statusCode: 404,
-          chunks: [
-            Uint8List.fromList([1, 2, 3]),
-          ],
-          onChunk: () => chunksRead++,
-        ),
+        (_) => http.StreamedResponse(body, 404),
       );
       final destination = File(
         '${temp.path}${Platform.pathSeparator}missing.png',
@@ -89,18 +85,21 @@ void main() {
         throwsA(isA<MediaDownloadHttpException>()),
       );
 
-      expect(chunksRead, 0);
+      expect(body.listenCount, 1);
+      expect(body.cancelCount, 1);
+      expect(body.acceptedChunks, isEmpty);
+      expect(body.deliveredChunks, isEmpty);
       expect(await destination.exists(), isFalse);
-      expect(_partFiles(temp), isEmpty);
+      expect(_files(temp), isEmpty);
     });
 
     test('rejects a declared over-limit response before body chunks', () async {
-      var chunksRead = 0;
+      final body = _CancellableResponseBody([Uint8List(1)]);
       final client = _FixtureClient(
-        (_) => _response(
-          chunks: [Uint8List(1)],
-          declaredLength: 7,
-          onChunk: () => chunksRead++,
+        (_) => http.StreamedResponse(
+          body,
+          200,
+          contentLength: 7,
         ),
       );
       final destination = File(
@@ -116,9 +115,12 @@ void main() {
         throwsA(isA<MediaDownloadLimitException>()),
       );
 
-      expect(chunksRead, 0);
+      expect(body.listenCount, 1);
+      expect(body.cancelCount, 1);
+      expect(body.acceptedChunks, isEmpty);
+      expect(body.deliveredChunks, isEmpty);
       expect(await destination.exists(), isFalse);
-      expect(_partFiles(temp), isEmpty);
+      expect(_files(temp), isEmpty);
     });
 
     test('counts a missing content-length response', () async {
@@ -167,14 +169,11 @@ void main() {
     test(
       'declined confirmation reads no chunks and cleans the partial',
       () async {
-        var chunksRead = 0;
+        final body = _CancellableResponseBody([
+          Uint8List.fromList([1, 2, 3]),
+        ]);
         final client = _FixtureClient(
-          (_) => _response(
-            chunks: [
-              Uint8List.fromList([1, 2, 3]),
-            ],
-            onChunk: () => chunksRead++,
-          ),
+          (_) => http.StreamedResponse(body, 200),
         );
         final destination = File(
           '${temp.path}${Platform.pathSeparator}declined.png',
@@ -190,9 +189,45 @@ void main() {
           throwsA(isA<MediaDownloadDeclinedException>()),
         );
 
-        expect(chunksRead, 0);
+        expect(body.listenCount, 1);
+        expect(body.cancelCount, 1);
+        expect(body.acceptedChunks, isEmpty);
+        expect(body.deliveredChunks, isEmpty);
         expect(await destination.exists(), isFalse);
+        expect(_files(temp), isEmpty);
+      },
+    );
+
+    test(
+      'restores an existing destination when publishing the partial fails',
+      () async {
+        final destination = File(
+          '${temp.path}${Platform.pathSeparator}existing.png',
+        );
+        await destination.writeAsBytes([1, 2, 3]);
+        final operations = _FaultInjectingFileOperations(
+          failRename: (file, newPath) =>
+              file.path.endsWith('.part') && newPath == destination.path,
+        );
+        final client = _FixtureClient(
+          (_) => _response(chunks: [Uint8List.fromList([9, 8, 7])]),
+        );
+
+        await expectLater(
+          DefaultMediaDownloadService(
+            httpClient: client,
+            fileOperations: operations,
+          ).download(
+            Uri.parse('http://host/replacement.png'),
+            destination: destination,
+            maxBytes: 6,
+          ),
+          throwsA(isA<StateError>()),
+        );
+
+        expect(await destination.readAsBytes(), [1, 2, 3]);
         expect(_partFiles(temp), isEmpty);
+        expect(_oldFiles(temp), isEmpty);
       },
     );
 
@@ -391,6 +426,150 @@ void main() {
         expect(_files(temp), isEmpty);
       },
     );
+
+    test('retries cleanup of a partial left by a stream error on close', () async {
+      var failedOnce = false;
+      final operations = _FaultInjectingFileOperations(
+        failDelete: (file) {
+          if (!failedOnce && file.path.endsWith('.part')) {
+            failedOnce = true;
+            return true;
+          }
+          return false;
+        },
+      );
+      final client = _FixtureClient(
+        (_) => http.StreamedResponse(
+          Stream<List<int>>.multi((controller) {
+            controller.add([1, 2]);
+            controller.addError(StateError('stream failed'));
+            controller.close();
+          }),
+          200,
+        ),
+      );
+      final cache = MediaCacheService(
+        root: temp,
+        httpClient: client,
+        fileOperations: operations,
+      );
+
+      await expectLater(
+        cache.cache(Uri.parse('http://host/view?filename=broken.png')),
+        throwsA(isA<StateError>()),
+      );
+      await cache.close();
+
+      expect(
+        operations.deleteAttempts.where((path) => path.endsWith('.part')).length,
+        2,
+      );
+      expect(_partFiles(temp), isEmpty);
+    });
+
+    test('retries stale replacement old-file cleanup on close', () async {
+      var failedOnce = false;
+      final operations = _FaultInjectingFileOperations(
+        failDelete: (file) {
+          if (!failedOnce && file.path.endsWith('.old')) {
+            failedOnce = true;
+            return true;
+          }
+          return false;
+        },
+      );
+      final responses = Queue<http.StreamedResponse>.of([
+        _response(chunks: [Uint8List.fromList([1, 2, 3])]),
+        _response(chunks: [Uint8List.fromList([7, 8, 9])]),
+      ]);
+      final cache = MediaCacheService(
+        root: temp,
+        httpClient: _FixtureClient((_) => responses.removeFirst()),
+        fileOperations: operations,
+        maxAge: Duration.zero,
+      );
+      final uri = Uri.parse('http://host/view?filename=stale.png');
+
+      await cache.cache(uri);
+      final replacement = await cache.cache(uri);
+      await cache.close();
+
+      expect(await replacement!.readAsBytes(), [7, 8, 9]);
+      expect(_oldFiles(temp), isEmpty);
+      expect(
+        operations.deleteAttempts.where((path) => path.endsWith('.old')).length,
+        2,
+      );
+    });
+
+    test('counts an undeletable partial when enforcing cache capacity', () async {
+      final operations = _FaultInjectingFileOperations(
+        failDelete: (file) => file.path.endsWith('orphan.part'),
+      );
+      final responses = Queue<http.StreamedResponse>.of([
+        _response(chunks: [Uint8List.fromList([1, 1, 1, 1])]),
+        _response(chunks: [Uint8List.fromList([2, 2, 2, 2])]),
+      ]);
+      final cache = MediaCacheService(
+        root: temp,
+        httpClient: _FixtureClient((_) => responses.removeFirst()),
+        fileOperations: operations,
+        maxCacheBytes: 6,
+      );
+      final oldUri = Uri.parse('http://host/view?filename=old.png');
+      final newUri = Uri.parse('http://host/view?filename=new.png');
+      final old = await cache.cache(oldUri);
+      await old!.setLastModified(DateTime(2000));
+      await File(
+        '${temp.path}${Platform.pathSeparator}orphan.part',
+      ).writeAsBytes([3, 3]);
+
+      final newest = await cache.cache(newUri);
+      await cache.close();
+
+      expect(await old.exists(), isFalse);
+      expect(await newest!.readAsBytes(), [2, 2, 2, 2]);
+      expect(await _totalBytes(temp), 6);
+    });
+
+    test(
+      'different downloads finish before one serialized capacity scan',
+      () async {
+        final listGate = Completer<void>();
+        final operations = _FaultInjectingFileOperations(
+          listGate: listGate.future,
+        );
+        final cache = MediaCacheService(
+          root: temp,
+          httpClient: _FixtureClient(
+            (_) => _response(chunks: [Uint8List.fromList([1, 2, 3, 4])]),
+          ),
+          fileOperations: operations,
+          maxCacheBytes: 5,
+        );
+        var firstFinished = false;
+        var secondFinished = false;
+        final first = cache
+            .cache(Uri.parse('http://host/view?filename=first.png'))
+            .whenComplete(() => firstFinished = true);
+        final second = cache
+            .cache(Uri.parse('http://host/view?filename=second.png'))
+            .whenComplete(() => secondFinished = true);
+
+        try {
+          await _waitUntil(() => firstFinished && secondFinished);
+          expect(operations.listCount, 1);
+        } finally {
+          if (!listGate.isCompleted) listGate.complete();
+          await Future.wait([first, second]);
+          await cache.close();
+        }
+
+        expect(operations.listCount, 1);
+        expect(_canonicalFiles(temp), hasLength(1));
+        expect(await _totalBytes(temp), lessThanOrEqualTo(5));
+      },
+    );
   });
 
   group('MediaExportService remote downloads', () {
@@ -434,15 +613,12 @@ void main() {
     );
 
     test('declines an unknown-size save before reading chunks', () async {
-      var chunksRead = 0;
+      final body = _CancellableResponseBody([
+        Uint8List.fromList([1, 2, 3]),
+      ]);
       var saved = false;
       final client = _FixtureClient(
-        (_) => _response(
-          chunks: [
-            Uint8List.fromList([1, 2, 3]),
-          ],
-          onChunk: () => chunksRead++,
-        ),
+        (_) => http.StreamedResponse(body, 200),
       );
       final service = MediaExportService(
         root: temp,
@@ -462,7 +638,10 @@ void main() {
         throwsA(isA<MediaDownloadDeclinedException>()),
       );
 
-      expect(chunksRead, 0);
+      expect(body.listenCount, 1);
+      expect(body.cancelCount, 1);
+      expect(body.acceptedChunks, isEmpty);
+      expect(body.deliveredChunks, isEmpty);
       expect(saved, isFalse);
       expect(_files(temp), isEmpty);
     });
@@ -533,6 +712,94 @@ void main() {
         expect(_files(temp), isEmpty);
       },
     );
+
+    test('defaults the public export hard cap to exactly 2 GiB', () {
+      expect(
+        MediaExportService.defaultMaxDownloadBytes,
+        2 * 1024 * 1024 * 1024,
+      );
+    });
+
+    test('default hard cap rejects a declared cap plus one before share', () async {
+      var shared = false;
+      final body = _CancellableResponseBody([Uint8List(1)]);
+      final client = _FixtureClient(
+        (_) => http.StreamedResponse(
+          body,
+          200,
+          contentLength: MediaExportService.defaultMaxDownloadBytes + 1,
+        ),
+      );
+      final service = MediaExportService(
+        root: temp,
+        downloadService: DefaultMediaDownloadService(httpClient: client),
+        shareFile: (_) async => shared = true,
+      );
+
+      await expectLater(
+        service.shareRemote(Uri.parse('http://host/view?filename=huge.png')),
+        throwsA(isA<MediaDownloadLimitException>()),
+      );
+
+      expect(body.listenCount, 1);
+      expect(body.cancelCount, 1);
+      expect(body.acceptedChunks, isEmpty);
+      expect(body.deliveredChunks, isEmpty);
+      expect(shared, isFalse);
+      expect(_files(temp), isEmpty);
+    });
+
+    test('default hard cap rejects an undeclared huge chunk before share', () async {
+      var shared = false;
+      final client = _FixtureClient(
+        (_) => _response(chunks: [_HugeChunk(MediaExportService.defaultMaxDownloadBytes + 1)]),
+      );
+      final service = MediaExportService(
+        root: temp,
+        downloadService: DefaultMediaDownloadService(httpClient: client),
+        shareFile: (_) async => shared = true,
+      );
+
+      await expectLater(
+        service.shareRemote(
+          Uri.parse('http://host/view?filename=undeclared.png'),
+          confirmAfterHeaders: (_) async => true,
+        ),
+        throwsA(isA<MediaDownloadLimitException>()),
+      );
+
+      expect(shared, isFalse);
+      expect(_files(temp), isEmpty);
+    });
+
+    test('default hard cap rejects a lying huge chunk before save', () async {
+      var saved = false;
+      final client = _FixtureClient(
+        (_) => _response(
+          declaredLength: 1,
+          chunks: [_HugeChunk(MediaExportService.defaultMaxDownloadBytes + 1)],
+        ),
+      );
+      final service = MediaExportService(
+        root: temp,
+        downloadService: DefaultMediaDownloadService(httpClient: client),
+        saveFile: (_, {required isVideo}) async {
+          saved = true;
+          return null;
+        },
+      );
+
+      await expectLater(
+        service.saveRemote(
+          Uri.parse('http://host/view?filename=lying.png'),
+          isVideo: false,
+        ),
+        throwsA(isA<MediaDownloadLimitException>()),
+      );
+
+      expect(saved, isFalse);
+      expect(_files(temp), isEmpty);
+    });
   });
 }
 
@@ -552,9 +819,115 @@ final class _FixtureClient extends http.BaseClient {
   }
 }
 
+final class _CancellableResponseBody extends Stream<List<int>> {
+  _CancellableResponseBody(this.chunks);
+
+  final List<List<int>> chunks;
+  final List<List<int>> acceptedChunks = [];
+  final List<List<int>> deliveredChunks = [];
+  int listenCount = 0;
+  int cancelCount = 0;
+
+  @override
+  StreamSubscription<List<int>> listen(
+    void Function(List<int>)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) {
+    listenCount++;
+    var cancelled = false;
+    late final StreamController<List<int>> controller;
+    controller = StreamController<List<int>>(
+      sync: true,
+      onListen: () {
+        scheduleMicrotask(() {
+          if (cancelled) return;
+          for (final chunk in chunks) {
+            acceptedChunks.add(chunk);
+            controller.add(chunk);
+          }
+          controller.close();
+        });
+      },
+      onCancel: () {
+        cancelled = true;
+        cancelCount++;
+      },
+    );
+    return controller.stream.listen(
+      (chunk) {
+        deliveredChunks.add(chunk);
+        onData?.call(chunk);
+      },
+      onError: onError,
+      onDone: onDone,
+      cancelOnError: cancelOnError,
+    );
+  }
+}
+
+final class _HugeChunk extends ListBase<int> {
+  _HugeChunk(this._length);
+
+  final int _length;
+
+  @override
+  int get length => _length;
+
+  @override
+  set length(int value) => throw UnsupportedError('fixed fake chunk');
+
+  @override
+  int operator [](int index) => 0;
+
+  @override
+  void operator []=(int index, int value) =>
+      throw UnsupportedError('read-only fake chunk');
+}
+
+final class _FaultInjectingFileOperations implements MediaFileOperations {
+  _FaultInjectingFileOperations({
+    this.failDelete,
+    this.failRename,
+    this.listGate,
+  });
+
+  final bool Function(File file)? failDelete;
+  final bool Function(File file, String newPath)? failRename;
+  final Future<void>? listGate;
+  final List<String> deleteAttempts = [];
+  int listCount = 0;
+
+  @override
+  Future<void> delete(File file) async {
+    deleteAttempts.add(file.path);
+    if (failDelete?.call(file) ?? false) {
+      throw StateError('injected delete failure: ${file.path}');
+    }
+    await file.delete();
+  }
+
+  @override
+  Future<File> rename(File file, String newPath) async {
+    if (failRename?.call(file, newPath) ?? false) {
+      throw StateError('injected rename failure: ${file.path}');
+    }
+    return file.rename(newPath);
+  }
+
+  @override
+  Stream<FileSystemEntity> list(Directory directory) async* {
+    listCount++;
+    final gate = listGate;
+    if (gate != null) await gate;
+    yield* directory.list();
+  }
+}
+
 http.StreamedResponse _response({
   int statusCode = 200,
-  required List<Uint8List> chunks,
+  required List<List<int>> chunks,
   int? declaredLength,
   Map<String, String> headers = const {},
   Future<void>? beforeChunks,
@@ -582,6 +955,25 @@ List<File> _files(Directory root) =>
 List<File> _partFiles(Directory root) => _files(
   root,
 ).where((file) => file.path.endsWith('.part')).toList(growable: false);
+
+List<File> _oldFiles(Directory root) => _files(
+  root,
+).where((file) => file.path.endsWith('.old')).toList(growable: false);
+
+List<File> _canonicalFiles(Directory root) => _files(root)
+    .where(
+      (file) =>
+          !file.path.endsWith('.part') && !file.path.endsWith('.old'),
+    )
+    .toList(growable: false);
+
+Future<int> _totalBytes(Directory root) async {
+  var total = 0;
+  for (final file in _files(root)) {
+    total += await file.length();
+  }
+  return total;
+}
 
 Future<void> _waitUntil(bool Function() condition) async {
   for (var i = 0; i < 100; i++) {

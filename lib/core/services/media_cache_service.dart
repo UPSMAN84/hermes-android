@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
@@ -52,13 +53,40 @@ abstract interface class MediaCachePort {
   Future<void> remove(Uri uri);
 }
 
+abstract interface class MediaFileOperations {
+  Future<void> delete(File file);
+
+  Future<File> rename(File file, String newPath);
+
+  Stream<FileSystemEntity> list(Directory directory);
+}
+
+final class DefaultMediaFileOperations implements MediaFileOperations {
+  const DefaultMediaFileOperations();
+
+  @override
+  Future<void> delete(File file) => file.delete();
+
+  @override
+  Future<File> rename(File file, String newPath) => file.rename(newPath);
+
+  @override
+  Stream<FileSystemEntity> list(Directory directory) => directory.list();
+}
+
 final class DefaultMediaDownloadService implements MediaDownloadPort {
   // Keep the public named httpClient parameter; storage remains private.
-  DefaultMediaDownloadService({required http.Client httpClient})
+  DefaultMediaDownloadService({
+    required http.Client httpClient,
+    MediaFileOperations fileOperations = const DefaultMediaFileOperations(),
+  })
     // ignore: prefer_initializing_formals
-    : _httpClient = httpClient;
+    : _httpClient = httpClient,
+       // ignore: prefer_initializing_formals
+       _fileOperations = fileOperations;
 
   final http.Client _httpClient;
+  final MediaFileOperations _fileOperations;
 
   static int _temporaryFileSequence = 0;
 
@@ -96,24 +124,35 @@ final class DefaultMediaDownloadService implements MediaDownloadPort {
       final response = await _httpClient.send(request);
 
       if (response.statusCode < 200 || response.statusCode >= 300) {
+        await _abort(response.stream);
         throw MediaDownloadHttpException(response.statusCode);
       }
 
       final declaredBytes = response.contentLength;
       if (declaredBytes != null && declaredBytes > maxBytes) {
+        await _abort(response.stream);
         throw MediaDownloadLimitException(maxBytes);
       }
 
       final confirm = confirmAfterHeaders;
       if (confirm != null) {
-        final accepted = await confirm(
-          MediaDownloadInfo(
-            statusCode: response.statusCode,
-            contentType: response.headers['content-type'],
-            declaredBytes: declaredBytes,
-          ),
-        );
-        if (!accepted) throw const MediaDownloadDeclinedException();
+        late final bool accepted;
+        try {
+          accepted = await confirm(
+            MediaDownloadInfo(
+              statusCode: response.statusCode,
+              contentType: response.headers['content-type'],
+              declaredBytes: declaredBytes,
+            ),
+          );
+        } catch (_) {
+          await _abort(response.stream);
+          rethrow;
+        }
+        if (!accepted) {
+          await _abort(response.stream);
+          throw const MediaDownloadDeclinedException();
+        }
       }
 
       sink = part.openWrite();
@@ -136,12 +175,26 @@ final class DefaultMediaDownloadService implements MediaDownloadPort {
           await sink.close();
         } catch (_) {}
       }
-      if (await part.exists()) {
+      try {
+        if (await part.exists()) {
+          await _fileOperations.delete(part);
+        }
+      } catch (_) {}
+      rethrow;
+    }
+  }
+
+  static Future<void> _abort(Stream<List<int>> stream) async {
+    StreamSubscription<List<int>>? subscription;
+    try {
+      subscription = stream.listen(null, onError: (_) {});
+      await subscription.cancel();
+    } catch (_) {
+      if (subscription != null) {
         try {
-          await part.delete();
+          await subscription.cancel();
         } catch (_) {}
       }
-      rethrow;
     }
   }
 
@@ -151,26 +204,30 @@ final class DefaultMediaDownloadService implements MediaDownloadPort {
     return File('${destination.path}.$timestamp.$sequence.$suffix');
   }
 
-  static Future<File> _promote(File part, File destination) async {
+  Future<File> _promote(File part, File destination) async {
     File? old;
     if (await destination.exists()) {
       old = _uniqueSibling(destination, 'old');
-      await destination.rename(old.path);
+      await _fileOperations.rename(destination, old.path);
     }
 
     try {
-      await part.rename(destination.path);
+      await _fileOperations.rename(part, destination.path);
     } catch (_) {
       if (old != null && await old.exists()) {
-        if (await destination.exists()) await destination.delete();
-        await old.rename(destination.path);
+        if (await destination.exists()) {
+          try {
+            await _fileOperations.delete(destination);
+          } catch (_) {}
+        }
+        await _fileOperations.rename(old, destination.path);
       }
       rethrow;
     }
 
     if (old != null && await old.exists()) {
       try {
-        await old.delete();
+        await _fileOperations.delete(old);
       } catch (_) {}
     }
     return destination;
@@ -186,10 +243,15 @@ final class MediaCacheService implements MediaCachePort {
     this.maxCacheBytes = 512 * 1024 * 1024,
     this.maxAge = const Duration(days: 30),
     DateTime Function()? clock,
+    MediaFileOperations fileOperations = const DefaultMediaFileOperations(),
   }) : _root = Future<Directory>.value(root),
+       _fileOperations = fileOperations,
        _downloadService =
            downloadService ??
-           DefaultMediaDownloadService(httpClient: httpClient ?? http.Client()),
+           DefaultMediaDownloadService(
+             httpClient: httpClient ?? http.Client(),
+             fileOperations: fileOperations,
+           ),
        _clock = clock ?? DateTime.now;
 
   MediaCacheService._appDefault()
@@ -197,6 +259,7 @@ final class MediaCacheService implements MediaCachePort {
       maxImageBytes = 50 * 1024 * 1024,
       maxCacheBytes = 512 * 1024 * 1024,
       maxAge = const Duration(days: 30),
+      _fileOperations = const DefaultMediaFileOperations(),
       _downloadService = appMediaDownloadService,
       _clock = DateTime.now;
 
@@ -204,9 +267,12 @@ final class MediaCacheService implements MediaCachePort {
   final int maxImageBytes;
   final int maxCacheBytes;
   final Duration maxAge;
+  final MediaFileOperations _fileOperations;
   final MediaDownloadPort _downloadService;
   final DateTime Function() _clock;
   final Map<String, Future<File>> _inFlight = {};
+  Future<void>? _maintenanceFuture;
+  bool _maintenanceRequested = false;
 
   static final MediaCacheService appDefault = MediaCacheService._appDefault();
 
@@ -238,6 +304,7 @@ final class MediaCacheService implements MediaCachePort {
     operation = _cache(uri, headers: headers, requireImage: requireImage)
         .whenComplete(() {
           if (identical(_inFlight[key], operation)) _inFlight.remove(key);
+          _scheduleMaintenance();
         });
     _inFlight[key] = operation;
     return operation;
@@ -268,10 +335,9 @@ final class MediaCacheService implements MediaCachePort {
             ? (info) async {
                 final type = info.contentType?.toLowerCase();
                 return type == null || type.startsWith('image/');
-    }
+              }
             : null,
       );
-    await _evictIfNeeded();
       return downloaded;
     } catch (_) {
       if (staleIsComplete && await _isComplete(destination)) {
@@ -291,8 +357,20 @@ final class MediaCacheService implements MediaCachePort {
     }
 
     final file = await _fileForUri(uri);
-    if (await file.exists()) await file.delete();
+    if (await file.exists()) await _fileOperations.delete(file);
   }
+
+  Future<void> drainMaintenance() async {
+    if (_maintenanceFuture == null) _scheduleMaintenance();
+    while (true) {
+      final active = _maintenanceFuture;
+      if (active == null) return;
+      await active;
+      if (_maintenanceFuture == null && !_maintenanceRequested) return;
+    }
+  }
+
+  Future<void> close() => drainMaintenance();
 
   Future<File> _fileForUri(Uri uri) async {
     final root = await _root;
@@ -330,17 +408,96 @@ final class MediaCacheService implements MediaCachePort {
     return hash.toRadixString(16).padLeft(8, '0');
   }
 
-  Future<void> _evictIfNeeded() async {
+  void _scheduleMaintenance() {
+    _maintenanceRequested = true;
+    if (_maintenanceFuture != null) return;
+
+    late final Future<void> operation;
+    operation = _runMaintenance().whenComplete(() {
+      if (identical(_maintenanceFuture, operation)) {
+        _maintenanceFuture = null;
+      }
+      if (_maintenanceRequested) _scheduleMaintenance();
+    });
+    _maintenanceFuture = operation;
+  }
+
+  Future<void> _runMaintenance() async {
+    await Future<void>.delayed(Duration.zero);
+    while (true) {
+      _maintenanceRequested = false;
+      await _waitForInFlight();
+      _maintenanceRequested = false;
+      await _maintainCache();
+      if (!_maintenanceRequested) return;
+    }
+  }
+
+  Future<void> _waitForInFlight() async {
+    while (_inFlight.isNotEmpty) {
+      final current = _inFlight.values.toList(growable: false);
+      await Future.wait<void>(
+        current.map((future) => future.then<void>((_) {}, onError: (_) {})),
+      );
+    }
+  }
+
+  Future<void> _maintainCache() async {
     try {
       final root = await _root;
+      await root.create(recursive: true);
       final entries = <({File file, DateTime modified, int size})>[];
       var totalBytes = 0;
-      await for (final entity in root.list()) {
-        if (entity is! File ||
-            entity.path.endsWith('.part') ||
-            entity.path.endsWith('.old')) {
+      await for (final entity in _fileOperations.list(root)) {
+        if (entity is! File) continue;
+
+        if (entity.path.endsWith('.part')) {
+          var deleted = false;
+          if (_inFlight.isEmpty) {
+            try {
+              await _fileOperations.delete(entity);
+              deleted = true;
+            } catch (_) {}
+          }
+          if (!deleted) totalBytes += await _safeLength(entity);
           continue;
         }
+
+        if (entity.path.endsWith('.old')) {
+          final canonical = _canonicalForOld(entity);
+          if (canonical == null) {
+            totalBytes += await _safeLength(entity);
+            continue;
+          }
+
+          if (await _safeExists(canonical)) {
+            try {
+              await _fileOperations.delete(entity);
+              continue;
+            } catch (_) {
+              totalBytes += await _safeLength(entity);
+              continue;
+            }
+          }
+
+          try {
+            final restored = await _fileOperations.rename(
+              entity,
+              canonical.path,
+            );
+            final stat = await restored.stat();
+            entries.add((
+              file: restored,
+              modified: stat.modified,
+              size: stat.size,
+            ));
+            totalBytes += stat.size;
+          } catch (_) {
+            totalBytes += await _safeLength(entity);
+          }
+          continue;
+        }
+
         try {
           final stat = await entity.stat();
           entries.add((file: entity, modified: stat.modified, size: stat.size));
@@ -352,10 +509,32 @@ final class MediaCacheService implements MediaCachePort {
       for (final entry in entries) {
         if (totalBytes <= maxCacheBytes) break;
         try {
-          await entry.file.delete();
+          await _fileOperations.delete(entry.file);
           totalBytes -= entry.size;
         } catch (_) {}
-    }
+      }
     } catch (_) {}
+  }
+
+  static File? _canonicalForOld(File old) {
+    final match = RegExp(r'^(.*)\.\d+\.\d+\.old$').firstMatch(old.path);
+    if (match == null) return null;
+    return File(match.group(1)!);
+  }
+
+  static Future<bool> _safeExists(File file) async {
+    try {
+      return await file.exists();
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<int> _safeLength(File file) async {
+    try {
+      return await file.length();
+    } catch (_) {
+      return 0;
+    }
   }
 }

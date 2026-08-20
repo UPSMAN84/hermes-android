@@ -224,6 +224,38 @@ void main() {
     await tester.pump();
   });
 
+  testWidgets('image gallery keeps using the chat injected media cache', (
+    tester,
+  ) async {
+    final cache = _RecordingMediaCache();
+    final gw = _FakeGateway(
+      messages: [_FakeGateway.msg('tool', r'rendered: C:\out\tool_0001.png')],
+    );
+    final expected = Uri.parse(
+      'http://0.0.0.0:8188/view?filename=tool_0001.png&type=output',
+    );
+
+    await tester.pumpWidget(_app(gw, _SilentTts(), mediaCache: cache));
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+    cache.uris.clear();
+
+    final moreMenu = tester.widget<PopupMenuButton<String>>(
+      find.byType(PopupMenuButton<String>),
+    );
+    moreMenu.onSelected!('gallery');
+    await tester.pump();
+    for (var i = 0; i < 5; i++) {
+      await tester.pump(const Duration(milliseconds: 100));
+    }
+
+    expect(cache.uris, [expected]);
+
+    await tester.pumpWidget(const SizedBox());
+    await tester.pump();
+  });
+
   testWidgets('a send shows the typed text immediately and streams the reply', (
     tester,
   ) async {

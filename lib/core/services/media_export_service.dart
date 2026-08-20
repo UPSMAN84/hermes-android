@@ -16,13 +16,14 @@ class MediaExportService {
     MediaDownloadPort? downloadService,
     Future<void> Function(File)? shareFile,
     Future<String?> Function(File, {required bool isVideo})? saveFile,
-    this.maxDownloadBytes = 0x7fffffffffffffff,
+    this.maxDownloadBytes = defaultMaxDownloadBytes,
   }) : _rootProvider = _resolveRootProvider(root, rootProvider),
        _downloadService = downloadService ?? appMediaDownloadService,
        _shareFile = shareFile ?? share,
        _saveFile = saveFile ?? saveToGallery;
 
   static const int confirmationBytes = 512 * 1024 * 1024;
+  static const int defaultMaxDownloadBytes = 2 * 1024 * 1024 * 1024;
 
   static final MediaExportService appDefault = MediaExportService(
     rootProvider: getTemporaryDirectory,

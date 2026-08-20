@@ -32,6 +32,19 @@ class _ControlledMediaCache implements MediaCachePort {
   Future<void> remove(Uri uri) async {}
 }
 
+class _RecordingMediaCache implements MediaCachePort {
+  final List<Uri> uris = [];
+
+  @override
+  Future<File?> cache(Uri uri, {Map<String, String> headers = const {}}) async {
+    uris.add(uri);
+    return null;
+  }
+
+  @override
+  Future<void> remove(Uri uri) async {}
+}
+
 Map<String, dynamic> _tool(String content) => {
   'role': 'tool',
   'content': content,
@@ -52,6 +65,7 @@ Future<Map<String, dynamic>?> _openAndLongPress(
   WidgetTester tester,
   List<Map<String, dynamic>> messages, {
   String? longPressUrl,
+  MediaCachePort? mediaCache,
 }) async {
   Map<String, dynamic>? popped;
   await tester.pumpWidget(
@@ -62,8 +76,11 @@ Future<Map<String, dynamic>?> _openAndLongPress(
           popped = await Navigator.push<Map<String, dynamic>>(
             context,
             MaterialPageRoute(
-                builder: (_) =>
-                    MediaGalleryScreen(messages: messages, comfyBaseUrl: _base),
+                builder: (_) => MediaGalleryScreen(
+                  messages: messages,
+                  comfyBaseUrl: _base,
+                  mediaCache: mediaCache,
+                ),
             ),
           );
         },
@@ -130,6 +147,25 @@ void main() {
     ]);
     // Two distinct images, not three mentions.
     expect(find.text('Images (2)'), findsOneWidget);
+  });
+
+  testWidgets('uses the injected cache once for each generated image', (
+    tester,
+  ) async {
+    final cache = _RecordingMediaCache();
+    const first = '$_base/view?filename=TG_1.png&type=output';
+    const second = '$_base/view?filename=TG_2.png&type=output';
+
+    await _openAndLongPress(
+      tester,
+      [
+        _tool(r'rendered: C:\out\TG_1.png'),
+        _tool(r'rendered: C:\out\TG_2.png'),
+      ],
+      mediaCache: cache,
+    );
+
+    expect(cache.uris, [Uri.parse(first), Uri.parse(second)]);
   });
 
   testWidgets('leaves videos out of the image gallery', (tester) async {

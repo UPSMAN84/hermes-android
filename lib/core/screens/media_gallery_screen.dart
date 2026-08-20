@@ -4,15 +4,18 @@ import 'package:flutter/material.dart';
 
 import '../services/comfyui.dart';
 import '../services/connection_manager.dart';
+import '../services/media_cache_service.dart';
 import '../widgets/cached_media_thumbnail.dart';
 
 class MediaGalleryScreen extends StatelessWidget {
   final List<Map<String, dynamic>> messages;
   final String comfyBaseUrl;
+  final MediaCachePort? mediaCache;
 
   const MediaGalleryScreen({
     required this.messages,
     required this.comfyBaseUrl,
+    this.mediaCache,
     super.key,
   });
 
@@ -99,11 +102,12 @@ class MediaGalleryScreen extends StatelessWidget {
                 onLongPress: () => Navigator.pop(context, tiles[i].source),
                 child: CachedMediaThumbnail(
                   url: urls[i],
+                  mediaCache: mediaCache,
                   borderRadius: 4,
-                // Without a decode bound these tiles decoded generated images
-                // at native resolution — a 1536² PNG is ~9MB of bitmap, so a
-                // 40-image chat tried to hold hundreds of MB to draw a grid of
-                // ~130pt thumbnails. Decode at tile size instead.
+                  // Without a decode bound these tiles decoded generated images
+                  // at native resolution — a 1536² PNG is ~9MB of bitmap, so a
+                  // 40-image chat tried to hold hundreds of MB to draw a grid of
+                  // ~130pt thumbnails. Decode at tile size instead.
                   decodeWidth: _tileDecodeWidth(context),
                 ),
               ),

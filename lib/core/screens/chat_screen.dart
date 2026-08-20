@@ -1848,6 +1848,7 @@ class _ChatScreenState extends State<ChatScreen> {
         builder: (_) => MediaGalleryScreen(
           messages: _messages,
           comfyBaseUrl: _comfyBaseUrl,
+          mediaCache: _mediaCache,
         ),
       ),
     );
