@@ -89,9 +89,25 @@ void main() {
         expect(multipart.files.single.field, 'image');
         expect(multipart.files.single.filename, 'local.png');
         expect(multipart.files.single.length, _pngBytes.length);
+        expect(multipart.files.single.contentType.toString(), 'image/png');
         expect(client.requests.single.body, containsAllInOrder(_pngBytes));
       },
     );
+
+    test('upload maps jpg files to the image/jpeg multipart subtype', () async {
+      final client = _RecordingClient(
+        (_, _) => _jsonResponse({
+          'name': 'server.jpg',
+          'subfolder': 'uploads',
+          'type': 'input',
+        }),
+      );
+
+      await _comfy(client).uploadImage(_jpegBytes, fileName: 'local.jpg');
+
+      final request = client.requests.single.request as http.MultipartRequest;
+      expect(request.files.single.contentType.toString(), 'image/jpeg');
+    });
 
     test('upload rejects unsafe filenames before network IO', () async {
       final client = _RecordingClient(
@@ -183,6 +199,109 @@ void main() {
       },
     );
 
+    test('accepted prompt preserves nonempty partial node errors', () async {
+      final client = _RecordingClient(
+        (_, _) => _jsonResponse({
+          'prompt_id': 'accepted-partial',
+          'number': 8,
+          'node_errors': {
+            '7': {
+              'class_type': 'CheckpointLoaderSimple',
+              'errors': [
+                {
+                  'type': 'value_not_in_list',
+                  'message': 'Value not in list',
+                  'details': 'ckpt_name',
+                },
+              ],
+            },
+          },
+        }),
+      );
+
+      final submission = await _comfy(client).submitPrompt(<String, dynamic>{});
+
+      expect(submission.promptId, 'accepted-partial');
+      expect(submission.nodeErrors, {
+        '7': {
+          'class_type': 'CheckpointLoaderSimple',
+          'errors': [
+            {
+              'type': 'value_not_in_list',
+              'message': 'Value not in list',
+              'details': 'ckpt_name',
+            },
+          ],
+        },
+      });
+      expect(client.requests, hasLength(1));
+    });
+
+    test('malformed prompt 2xx is uncertain after exactly one send', () async {
+      final client = _RecordingClient(
+        (_, _) => http.StreamedResponse(
+          Stream<List<int>>.value(utf8.encode('{not-json')),
+          200,
+        ),
+      );
+
+      await expectLater(
+        _comfy(client).submitPrompt(<String, dynamic>{}),
+        throwsA(isA<ComfySubmissionUncertainException>()),
+      );
+
+      expect(client.requests, hasLength(1));
+    });
+
+    test('missing prompt_id in a 2xx is uncertain after one send', () async {
+      final client = _RecordingClient(
+        (_, _) =>
+            _jsonResponse({'number': 9, 'node_errors': <String, Object?>{}}),
+      );
+
+      await expectLater(
+        _comfy(client).submitPrompt(<String, dynamic>{}),
+        throwsA(isA<ComfySubmissionUncertainException>()),
+      );
+
+      expect(client.requests, hasLength(1));
+    });
+
+    test('blank prompt_id in a 2xx is uncertain after one send', () async {
+      final client = _RecordingClient(
+        (_, _) => _jsonResponse({
+          'prompt_id': '   ',
+          'number': 10,
+          'node_errors': <String, Object?>{},
+        }),
+      );
+
+      await expectLater(
+        _comfy(client).submitPrompt(<String, dynamic>{}),
+        throwsA(isA<ComfySubmissionUncertainException>()),
+      );
+
+      expect(client.requests, hasLength(1));
+    });
+
+    test('oversized prompt 2xx is uncertain after exactly one send', () async {
+      final client = _RecordingClient(
+        (_, _) => http.StreamedResponse(
+          Stream<List<int>>.value(
+            utf8.encode('{"prompt_id":"accepted-but-too-large"}'),
+          ),
+          200,
+        ),
+      );
+
+      await expectLater(
+        _comfy(client, maxJsonBytes: 8).submitPrompt(<String, dynamic>{}),
+        throwsA(isA<ComfySubmissionUncertainException>()),
+      );
+
+      expect(client.requests, hasLength(1));
+    });
+
     test('prompt idle timeout sends once and becomes uncertain', () async {
       final client = _HangingPromptBodyClient();
       final comfy = _comfy(
@@ -196,6 +315,25 @@ void main() {
         }),
         throwsA(isA<ComfySubmissionUncertainException>()),
       );
+
+      expect(client.promptRequests, 1);
+      await client.dispose();
+    });
+
+    test('prompt non-2xx headers stay definite when the body idles', () async {
+      final client = _HangingPromptBodyClient(statusCode: 400);
+
+      try {
+        await _comfy(
+          client,
+          idleTimeout: const Duration(milliseconds: 10),
+        ).submitPrompt(<String, dynamic>{});
+        fail('Expected ComfyApiException');
+      } on ComfySubmissionUncertainException {
+        fail('A definite non-2xx status must not be uncertain');
+      } on ComfyApiException catch (error) {
+        expect(error.statusCode, 400);
+      }
 
       expect(client.promptRequests, 1);
       await client.dispose();
@@ -238,6 +376,7 @@ void main() {
           expect(error.details, 'One output failed');
           expect(error.nodeErrors, contains('7'));
         }
+        expect(client.requests, hasLength(1));
       },
     );
 
@@ -598,6 +737,9 @@ final class _RecordingClient extends http.BaseClient {
 }
 
 final class _HangingPromptBodyClient extends http.BaseClient {
+  _HangingPromptBodyClient({this.statusCode = 200});
+
+  final int statusCode;
   final StreamController<List<int>> _body = StreamController<List<int>>();
   int promptRequests = 0;
 
@@ -605,7 +747,7 @@ final class _HangingPromptBodyClient extends http.BaseClient {
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
     await request.finalize().drain<void>();
     if (request.url.path.endsWith('/prompt')) promptRequests++;
-    return http.StreamedResponse(_body.stream, 200);
+    return http.StreamedResponse(_body.stream, statusCode);
   }
 
   Future<void> dispose() => _body.close();

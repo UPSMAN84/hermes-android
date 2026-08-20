@@ -158,11 +158,20 @@ final class ComfyUiClient {
     Uint8List bytes, {
     required String fileName,
   }) async {
-    _validateImageUpload(bytes, fileName: fileName, maxBytes: _maxUploadBytes);
+    final imageSubtype = _validateImageUpload(
+      bytes,
+      fileName: fileName,
+      maxBytes: _maxUploadBytes,
+    );
     final uri = _endpoint.route('upload/image');
     final pending = _multipartRequest('POST', uri)
       ..request.files.add(
-        http.MultipartFile.fromBytes('image', bytes, filename: fileName),
+        http.MultipartFile.fromBytes(
+          'image',
+          bytes,
+          filename: fileName,
+          contentType: http.MediaType('image', imageSubtype),
+        ),
       )
       ..request.fields['type'] = 'input';
     final json = await _requestObject(pending);
@@ -202,29 +211,43 @@ final class ComfyUiClient {
     try {
       json = await _requestObject(pending, exposeTransportFailure: true);
     } on _ComfyTransportFailure catch (error) {
+      final statusCode = error.statusCode;
+      if (statusCode != null && (statusCode < 200 || statusCode >= 300)) {
+        throw ComfyApiException(
+          message: error.message,
+          uri: uri,
+          statusCode: statusCode,
+          cause: error.cause,
+        );
+      }
       throw ComfySubmissionUncertainException(
         message:
             'Prompt response became uncertain after submission started: ${error.message}',
         uri: uri,
         cause: error.cause,
       );
+    } on ComfyApiException catch (error) {
+      final statusCode = error.statusCode;
+      if (statusCode != null && statusCode >= 200 && statusCode < 300) {
+        throw ComfySubmissionUncertainException(
+          message:
+              'Prompt response was unusable after submission started: ${error.message}',
+          uri: uri,
+          cause: error,
+        );
+      }
+      rethrow;
     }
 
     final nodeErrors = _optionalObject(json['node_errors']);
-    if (nodeErrors != null && nodeErrors.isNotEmpty) {
-      throw _apiErrorFromJson(
-        uri: uri,
-        statusCode: 200,
-        responseBody: jsonEncode(json),
-        json: json,
-        fallbackMessage: 'ComfyUI rejected one or more prompt nodes',
-      );
-    }
-
     final promptId = json['prompt_id'];
     final rawNumber = json['number'];
-    if (promptId is! String || promptId.isEmpty || rawNumber is! num?) {
-      throw _protocolError(uri, 'Prompt response is missing a valid prompt_id');
+    if (promptId is! String || promptId.trim().isEmpty) {
+      throw ComfySubmissionUncertainException(
+        message:
+            'Prompt response was unusable after submission started: missing a valid prompt_id',
+        uri: uri,
+      );
     }
     final number = rawNumber is num ? rawNumber.toInt() : null;
     return ComfyPromptSubmission(
@@ -364,6 +387,7 @@ final class ComfyUiClient {
       throw ComfyApiException(
         message: error.message,
         uri: pending.request.url,
+        statusCode: error.statusCode,
         cause: error.cause,
       );
     }
@@ -459,6 +483,7 @@ final class ComfyUiClient {
         throw _ComfyTransportFailure(
           'Response body was interrupted or idle for ${_idleTimeout.inMilliseconds} ms',
           error,
+          statusCode: response.statusCode,
         );
       } finally {
         try {
@@ -491,10 +516,11 @@ final class _BufferedResponse {
 }
 
 final class _ComfyTransportFailure implements Exception {
-  const _ComfyTransportFailure(this.message, this.cause);
+  const _ComfyTransportFailure(this.message, this.cause, {this.statusCode});
 
   final String message;
   final Object cause;
+  final int? statusCode;
 }
 
 ComfyApiException _protocolError(
