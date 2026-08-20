@@ -6,12 +6,26 @@ import '../models/character_generation_context.dart';
 import '../models/comfy_workflow.dart';
 import '../models/connection.dart';
 import '../models/generation_job.dart';
+import '../models/media_asset.dart';
 import '../services/generation_repository.dart';
 import '../services/generation_repository_host.dart';
 import '../services/media_export_service.dart';
 import '../widgets/generation_form.dart';
 import '../widgets/generation_job_card.dart';
 import '../widgets/workflow_library_tab.dart';
+
+/// Results [CreateScreen] can pop back to its caller with.
+sealed class CreateScreenResult {
+  const CreateScreenResult();
+}
+
+/// Image-only: video Discuss is never offered (see [GenerationJobCard] and
+/// [_MediaKindTab], which only wires onDiscuss for the image tab).
+final class DiscussGeneratedImage extends CreateScreenResult {
+  const DiscussGeneratedImage(this.asset);
+
+  final MediaAsset asset;
+}
 
 /// Image/Video/Workflows creation shell. The repository is always the one
 /// app-scoped instance ([GenerationRepositoryHost]) unless a test injects
@@ -199,6 +213,27 @@ class _MediaKindTabState extends State<_MediaKindTab> {
     }
   }
 
+  void _discussOutput(GenerationJob job, ComfyOutputRef output) {
+    Navigator.of(context).pop(
+      DiscussGeneratedImage(
+        MediaAsset(
+          id: '${job.localId}-${output.filename}',
+          jobId: job.localId,
+          workflowId: job.workflowId,
+          kind: job.kind,
+          endpointSnapshot: job.endpointSnapshot,
+          filename: output.filename,
+          subfolder: output.subfolder,
+          type: output.type,
+          sourceSessionId: job.sourceSessionId,
+          sourceMessageId: job.sourceMessageId,
+          createdAt: job.createdAt,
+          updatedAt: job.updatedAt,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     if (_workflows.isEmpty) {
@@ -265,6 +300,9 @@ class _MediaKindTabState extends State<_MediaKindTab> {
             onRetry: () => widget.repository.retryAsNew(job.localId),
             onSave: (output) => _saveOutput(job, output),
             onShare: (output) => _shareOutput(job, output),
+            onDiscuss: widget.kind == ComfyMediaKind.image
+                ? (output) => _discussOutput(job, output)
+                : null,
           ),
       ],
     );

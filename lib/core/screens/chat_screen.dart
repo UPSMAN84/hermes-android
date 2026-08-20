@@ -21,11 +21,16 @@ import 'package:speech_to_text/speech_to_text.dart';
 import '../models/pending_chat_send.dart';
 import '../services/speech_recognition_coordinator.dart';
 
+import '../models/character_generation_context.dart';
+import '../models/comfy_workflow.dart';
+import '../models/media_asset.dart';
 import '../services/background_activity_service.dart';
 import '../services/character_voice_prefs.dart';
 import '../services/chatterbox_service.dart';
 import '../services/connection_manager.dart';
 import '../services/comfyui.dart';
+import '../services/generation_repository.dart';
+import '../services/generation_repository_host.dart';
 import '../services/media_cache_service.dart';
 import '../services/media_export_service.dart';
 import '../services/reply_notification_service.dart';
@@ -37,6 +42,7 @@ import '../utils/row_keys.dart';
 import '../widgets/cached_media_thumbnail.dart';
 import 'call_screen.dart';
 import 'character_picker_screen.dart';
+import 'create_screen.dart';
 import 'media_gallery_screen.dart';
 import 'session_list_screen.dart';
 import 'skills_screen.dart';
@@ -67,6 +73,8 @@ class ChatScreen extends StatefulWidget {
   final TtsProvider Function()? ttsOverride;
   final MediaCachePort? mediaCache;
   final MediaExportService? mediaExport;
+  final GenerationRepository? generationRepository;
+  final MediaDownloadPort? mediaDownload;
 
   const ChatScreen({
     required this.connection,
@@ -77,6 +85,8 @@ class ChatScreen extends StatefulWidget {
     this.ttsOverride,
     this.mediaCache,
     this.mediaExport,
+    this.generationRepository,
+    this.mediaDownload,
     super.key,
   });
 
@@ -89,6 +99,14 @@ class _ChatScreenState extends State<ChatScreen> {
       widget.mediaCache ?? MediaCacheService.appDefault;
   MediaExportService get _mediaExport =>
       widget.mediaExport ?? MediaExportService.appDefault;
+  Future<GenerationRepository> _resolveGenerationRepository() async {
+    final injected = widget.generationRepository;
+    if (injected != null) return injected;
+    return (await GenerationRepositoryHost.instance()).repository;
+  }
+
+  MediaDownloadPort get _mediaDownload =>
+      widget.mediaDownload ?? appMediaDownloadService;
 
   List<Map<String, dynamic>> _messages = [];
   final List<Map<String, dynamic>> _toolMessages = [];
@@ -334,6 +352,62 @@ class _ChatScreenState extends State<ChatScreen> {
     // The persona turn has to go after the state is applied, because it sends
     // a message and the send path reads _characterImagePath.
     if (picked != null) await _sendCharacterSetup();
+
+    // Only on the moment a character card is actually loaded (not on every
+    // reopen of an existing character session, when widget.characterCard is
+    // null and the appearance text isn't available) -- a session that
+    // already has a saved context just keeps using it.
+    final card = widget.characterCard;
+    if (picked != null && card != null) {
+      unawaited(_saveCharacterGenerationContext(picked, card));
+    }
+  }
+
+  /// Best-effort: a Create-tab context prefill is a convenience, not a
+  /// requirement, so any failure here (repository unavailable, avatar
+  /// download failing) must leave the character chat itself unaffected.
+  Future<void> _saveCharacterGenerationContext(
+    CharacterSummary picked,
+    CharacterCard card,
+  ) async {
+    try {
+      final repository = await _resolveGenerationRepository();
+      final now = DateTime.now();
+      final generationContext = CharacterGenerationContext.fromCard(
+        sessionId: widget.session.id,
+        card: card,
+        now: now,
+      );
+      File? referenceImage;
+      try {
+        final tempDir = await getTemporaryDirectory();
+        final destination = File(
+          '${tempDir.path}${Platform.pathSeparator}'
+          'character-avatar-${now.microsecondsSinceEpoch}',
+        );
+        await _mediaDownload.download(
+          Uri.parse(_client.characterImageUrl(picked.primaryImage)),
+          destination: destination,
+          maxBytes: 10 * 1024 * 1024,
+          headers: _client.authHeaders,
+        );
+        referenceImage = destination;
+      } catch (_) {
+        // The context still saves without an avatar.
+      }
+      await repository.saveCharacterContext(
+        generationContext,
+        referenceImage: referenceImage,
+      );
+      // Synchronous: CharacterGenerationContextStore.save() already copied
+      // the bytes it needs; this temp file is a single one-off cleanup, not
+      // a hot path.
+      if (referenceImage != null && referenceImage.existsSync()) {
+        try {
+          referenceImage.deleteSync();
+        } catch (_) {}
+      }
+    } catch (_) {}
   }
 
   // ── Character background ────────────────────────────────────────────
@@ -1328,119 +1402,119 @@ class _ChatScreenState extends State<ChatScreen> {
     _streamCancelToken = StreamCancelToken();
     try {
       await _gateway.sendMessageStreaming(
-      message: text,
-      sessionId: widget.session.id,
-      imageDataUrls: pendingSend.imageDataUrls,
-      cancelToken: _streamCancelToken,
-      onToken: (token) {
-        if (!mounted) return;
-        _pendingTokens.write(token);
-        _tokenFlushTimer ??= Timer(
-          _flushDelayFor(_streamingContentLength),
-          _flushPendingTokens,
-        );
-      },
-      onToolProgress: (progress) {
-        if (!mounted) return;
-        _upsertToolProgress(progress);
-      },
-      onDone: () async {
-        // Server-side history is about to replace _messages wholesale — drop
-        // any buffered tokens instead of letting a stray delayed flush write
-        // them onto the freshly fetched list.
-        _tokenFlushTimer?.cancel();
-        _tokenFlushTimer = null;
-        _pendingTokens.clear();
-        _streamCancelToken = null;
-        if (!mounted) return;
-        // Refresh messages to get the final server-side state
-        try {
-          final messages = await _client.getMessages(widget.session.id);
+        message: text,
+        sessionId: widget.session.id,
+        imageDataUrls: pendingSend.imageDataUrls,
+        cancelToken: _streamCancelToken,
+        onToken: (token) {
           if (!mounted) return;
-          _extractToolMessages(messages);
-          final settled = _mediaUrlsIn(messages);
-          setState(() {
-            _messages = messages;
-            _streaming = false;
-            _sending = false;
-            _showScrollToBottom = false;
-            // Drop only the URLs the refetched transcript actually carries, so
-            // nothing renders twice. Anything whose tool-result row hasn't
-            // been persisted yet stays put rather than blinking out and
-            // reappearing a poll later — that flash is what _pollForLateMedia
-            // used to paper over.
-            _liveMediaUrls.removeWhere(settled.contains);
-          });
-          // The image tool's result row may land just after this refetch;
-          // poll briefly so a freshly generated image doesn't require leaving
-          // and reopening the chat to appear.
-          _pollForLateMedia();
-          // The foreground service (started unconditionally above, not only
-          // when actually backgrounded) keeps the notification "Waiting for a
-          // reply…" up throughout, then just dismisses it on completion --
-          // nothing tells the user it's actually done if they weren't looking
-          // at the screen. Only worth a notification if they in fact weren't.
-          if (WidgetsBinding.instance.lifecycleState !=
-              AppLifecycleState.resumed) {
-            final lastAssistant = messages.reversed.firstWhere(
-              (m) => m['role'] == 'assistant',
-              orElse: () => const <String, dynamic>{},
-            );
+          _pendingTokens.write(token);
+          _tokenFlushTimer ??= Timer(
+            _flushDelayFor(_streamingContentLength),
+            _flushPendingTokens,
+          );
+        },
+        onToolProgress: (progress) {
+          if (!mounted) return;
+          _upsertToolProgress(progress);
+        },
+        onDone: () async {
+          // Server-side history is about to replace _messages wholesale — drop
+          // any buffered tokens instead of letting a stray delayed flush write
+          // them onto the freshly fetched list.
+          _tokenFlushTimer?.cancel();
+          _tokenFlushTimer = null;
+          _pendingTokens.clear();
+          _streamCancelToken = null;
+          if (!mounted) return;
+          // Refresh messages to get the final server-side state
+          try {
+            final messages = await _client.getMessages(widget.session.id);
+            if (!mounted) return;
+            _extractToolMessages(messages);
+            final settled = _mediaUrlsIn(messages);
+            setState(() {
+              _messages = messages;
+              _streaming = false;
+              _sending = false;
+              _showScrollToBottom = false;
+              // Drop only the URLs the refetched transcript actually carries, so
+              // nothing renders twice. Anything whose tool-result row hasn't
+              // been persisted yet stays put rather than blinking out and
+              // reappearing a poll later — that flash is what _pollForLateMedia
+              // used to paper over.
+              _liveMediaUrls.removeWhere(settled.contains);
+            });
+            // The image tool's result row may land just after this refetch;
+            // poll briefly so a freshly generated image doesn't require leaving
+            // and reopening the chat to appear.
+            _pollForLateMedia();
+            // The foreground service (started unconditionally above, not only
+            // when actually backgrounded) keeps the notification "Waiting for a
+            // reply…" up throughout, then just dismisses it on completion --
+            // nothing tells the user it's actually done if they weren't looking
+            // at the screen. Only worth a notification if they in fact weren't.
+            if (WidgetsBinding.instance.lifecycleState !=
+                AppLifecycleState.resumed) {
+              final lastAssistant = messages.reversed.firstWhere(
+                (m) => m['role'] == 'assistant',
+                orElse: () => const <String, dynamic>{},
+              );
               final replyText = parseMessageContent(
                 lastAssistant['content'],
               ).text.trim();
-            if (replyText.isNotEmpty) {
-              ReplyNotificationService.showReplyReady(
-                widget.session.id,
-                title: 'Hermes replied',
-                preview: replyText.length > 200
-                    ? '${replyText.substring(0, 200)}…'
-                    : replyText,
-              );
+              if (replyText.isNotEmpty) {
+                ReplyNotificationService.showReplyReady(
+                  widget.session.id,
+                  title: 'Hermes replied',
+                  preview: replyText.length > 200
+                      ? '${replyText.substring(0, 200)}…'
+                      : replyText,
+                );
+              }
             }
-          }
-          if (_awaitingVoiceReply) {
-            _awaitingVoiceReply = false;
-            final assistant = messages.reversed.firstWhere(
-              (message) => message['role'] == 'assistant',
-              orElse: () => const <String, dynamic>{},
-            );
-            final assistantText = assistant['content']?.toString();
-            if (assistantText != null) {
-              await _speakAssistantText(
-                assistantText,
-                message: assistant.isEmpty ? null : assistant,
+            if (_awaitingVoiceReply) {
+              _awaitingVoiceReply = false;
+              final assistant = messages.reversed.firstWhere(
+                (message) => message['role'] == 'assistant',
+                orElse: () => const <String, dynamic>{},
+              );
+              final assistantText = assistant['content']?.toString();
+              if (assistantText != null) {
+                await _speakAssistantText(
+                  assistantText,
+                  message: assistant.isEmpty ? null : assistant,
                   onComplete: _autoContinueEnabled
                       ? _scheduleAutoContinue
                       : null,
-              );
+                );
+              } else if (_autoContinueEnabled) {
+                _scheduleAutoContinue();
+              }
             } else if (_autoContinueEnabled) {
+              // Voice reply is off, so there's no playback-finished signal to
+              // wait on — just pace on a fixed delay instead.
               _scheduleAutoContinue();
             }
-          } else if (_autoContinueEnabled) {
-            // Voice reply is off, so there's no playback-finished signal to
-            // wait on — just pace on a fixed delay instead.
-            _scheduleAutoContinue();
-          }
             WidgetsBinding.instance.addPostFrameCallback(
               (_) => _scrollToBottom(),
             );
-        } catch (e) {
+          } catch (e) {
+            if (!mounted) return;
+            setState(() {
+              _streaming = false;
+              _sending = false;
+            });
+          }
+        },
+        onError: (error) async {
+          _tokenFlushTimer?.cancel();
+          _tokenFlushTimer = null;
+          _pendingTokens.clear();
+          _streamCancelToken = null;
           if (!mounted) return;
-          setState(() {
-            _streaming = false;
-            _sending = false;
-          });
-        }
-      },
-      onError: (error) async {
-        _tokenFlushTimer?.cancel();
-        _tokenFlushTimer = null;
-        _pendingTokens.clear();
-        _streamCancelToken = null;
-        if (!mounted) return;
-        await _handleSendError(pendingSend, error, baselineMessageCount);
-      },
+          await _handleSendError(pendingSend, error, baselineMessageCount);
+        },
       );
     } finally {
       // Always stop once the send completes — success, error, or cancel —
@@ -1654,112 +1728,123 @@ class _ChatScreenState extends State<ChatScreen> {
       appBar: _searching
           ? _buildSearchAppBar()
           : AppBar(
-        title: Text(
-          _characterName ?? widget.session.title,
-          maxLines: 1,
-          overflow: TextOverflow.ellipsis,
-        ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.search),
-            tooltip: 'Search this chat',
-            onPressed: _toggleSearch,
-          ),
-          IconButton(
-            icon: const Icon(Icons.history),
-            tooltip: 'All chats',
-            onPressed: _openSessionList,
-          ),
-          IconButton(
-            icon: const Icon(Icons.face_retouching_natural),
-            tooltip: 'Characters',
-            onPressed: _streaming ? null : _pickCharacter,
-          ),
-          IconButton(
-            icon: const Icon(Icons.add_comment_outlined),
-            tooltip: 'New chat',
-            onPressed: _streaming ? null : _startNewChat,
-          ),
-          PopupMenuButton<String>(
-            tooltip: 'More',
-            onSelected: (value) {
-              switch (value) {
-                case 'auto_continue':
-                  _toggleAutoContinue();
-                  break;
-                case 'gallery':
-                  _openGallery();
-                  break;
-                case 'call':
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (_) => CallScreen(
-                        connection: widget.connection,
-                        session: widget.session,
-                      ),
-                    ),
-                  );
-                  break;
-              }
-            },
-            itemBuilder: (context) => [
-              PopupMenuItem(
-                value: 'auto_continue',
-                child: ListTile(
-                  leading: Icon(
-                    _autoContinueEnabled ? Icons.repeat_on : Icons.repeat,
-                    color: _autoContinueEnabled
-                        ? Theme.of(context).colorScheme.primary
-                        : null,
-                  ),
-                  title: Text(
+              title: Text(
+                _characterName ?? widget.session.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              actions: [
+                IconButton(
+                  icon: const Icon(Icons.search),
+                  tooltip: 'Search this chat',
+                  onPressed: _toggleSearch,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.history),
+                  tooltip: 'All chats',
+                  onPressed: _openSessionList,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.face_retouching_natural),
+                  tooltip: 'Characters',
+                  onPressed: _streaming ? null : _pickCharacter,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.add_comment_outlined),
+                  tooltip: 'New chat',
+                  onPressed: _streaming ? null : _startNewChat,
+                ),
+                PopupMenuButton<String>(
+                  tooltip: 'More',
+                  onSelected: (value) {
+                    switch (value) {
+                      case 'auto_continue':
+                        _toggleAutoContinue();
+                        break;
+                      case 'create_media':
+                        _openCreate();
+                        break;
+                      case 'gallery':
+                        _openGallery();
+                        break;
+                      case 'call':
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(
+                            builder: (_) => CallScreen(
+                              connection: widget.connection,
+                              session: widget.session,
+                            ),
+                          ),
+                        );
+                        break;
+                    }
+                  },
+                  itemBuilder: (context) => [
+                    PopupMenuItem(
+                      value: 'auto_continue',
+                      child: ListTile(
+                        leading: Icon(
+                          _autoContinueEnabled ? Icons.repeat_on : Icons.repeat,
+                          color: _autoContinueEnabled
+                              ? Theme.of(context).colorScheme.primary
+                              : null,
+                        ),
+                        title: Text(
                           _autoContinueEnabled
                               ? 'Auto-continue on'
                               : 'Auto-continue',
+                        ),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    ),
+                    const PopupMenuItem(
+                      value: 'create_media',
+                      child: ListTile(
+                        leading: Icon(Icons.auto_fix_high),
+                        title: Text('Create media'),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    ),
+                    const PopupMenuItem(
+                      value: 'gallery',
+                      child: ListTile(
+                        leading: Icon(Icons.photo_library_outlined),
+                        title: Text('Media'),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    ),
+                    const PopupMenuItem(
+                      value: 'call',
+                      child: ListTile(
+                        leading: Icon(Icons.call),
+                        title: Text('Phone call mode'),
+                        contentPadding: EdgeInsets.zero,
+                      ),
+                    ),
+                  ],
+                ),
+                if (_streaming)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 4),
+                    child: TextButton.icon(
+                      onPressed: _stopStreaming,
+                      icon: const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
+                      label: const Text('Stop', style: TextStyle(fontSize: 13)),
+                    ),
+                  )
+                else
+                  IconButton(
+                    icon: const Icon(Icons.refresh),
+                    onPressed: _loading ? null : _fetchMessages,
+                    tooltip: 'Refresh',
                   ),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'gallery',
-                child: ListTile(
-                  leading: Icon(Icons.photo_library_outlined),
-                  title: Text('Image gallery'),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-              const PopupMenuItem(
-                value: 'call',
-                child: ListTile(
-                  leading: Icon(Icons.call),
-                  title: Text('Phone call mode'),
-                  contentPadding: EdgeInsets.zero,
-                ),
-              ),
-            ],
-          ),
-          if (_streaming)
-            Padding(
-              padding: const EdgeInsets.only(right: 4),
-              child: TextButton.icon(
-                onPressed: _stopStreaming,
-                icon: const SizedBox(
-                  width: 16,
-                  height: 16,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-                label: const Text('Stop', style: TextStyle(fontSize: 13)),
-              ),
-            )
-          else
-            IconButton(
-              icon: const Icon(Icons.refresh),
-              onPressed: _loading ? null : _fetchMessages,
-              tooltip: 'Refresh',
+              ],
             ),
-        ],
-      ),
       body: Stack(
         children: [
           if (_characterImagePath != null) _buildCharacterBackdrop(),
@@ -1811,30 +1896,30 @@ class _ChatScreenState extends State<ChatScreen> {
 
   Widget _buildChatColumn() {
     return Center(
-        child: ConstrainedBox(
-          constraints: BoxConstraints(
-            maxWidth: Responsive.isTablet(context) ? 800 : double.infinity,
-          ),
-          child: Column(
-            children: [
-              Expanded(
-                child: Stack(
-                  children: [
-                    _buildBody(),
-                    Positioned(
-                      right: 16,
-                      bottom: 12,
-                      child: _buildScrollToBottomButton(),
-                    ),
-                  ],
-                ),
-              ),
-              if (_speakingMessage != null) _buildSpeakingJumpBar(),
-              if (_showingSlashSuggestions) _buildSlashSuggestions(),
-              _buildInputBar(),
-            ],
-          ),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: Responsive.isTablet(context) ? 800 : double.infinity,
         ),
+        child: Column(
+          children: [
+            Expanded(
+              child: Stack(
+                children: [
+                  _buildBody(),
+                  Positioned(
+                    right: 16,
+                    bottom: 12,
+                    child: _buildScrollToBottomButton(),
+                  ),
+                ],
+              ),
+            ),
+            if (_speakingMessage != null) _buildSpeakingJumpBar(),
+            if (_showingSlashSuggestions) _buildSlashSuggestions(),
+            _buildInputBar(),
+          ],
+        ),
+      ),
     );
   }
 
@@ -1854,6 +1939,87 @@ class _ChatScreenState extends State<ChatScreen> {
     );
     if (source == null || !mounted) return;
     await _jumpToMessage(source);
+  }
+
+  /// Opens Create for this session: the app-scoped repository resolves
+  /// asynchronously (never constructed or disposed by this screen), then
+  /// this session's saved character context (null for an ordinary session,
+  /// which must leave the form editable and unblocked, not stuck loading).
+  Future<void> _openCreate({int initialTab = 0}) async {
+    final repository = await _resolveGenerationRepository();
+    if (!mounted) return;
+    final generationContext = await repository.getCharacterContext(
+      widget.session.id,
+    );
+    if (!mounted) return;
+    final result = await Navigator.push<CreateScreenResult>(
+      context,
+      MaterialPageRoute(
+        builder: (_) => CreateScreen(
+          connection: widget.connection,
+          initialTab: initialTab,
+          initialContext: generationContext,
+          repository: repository,
+        ),
+      ),
+    );
+    if (result is DiscussGeneratedImage) {
+      await _handleDiscussImage(result.asset);
+    }
+  }
+
+  /// Downloads a generated image and prepares it exactly like a
+  /// gallery-picked image (same multimodal attachment state, same preview
+  /// strip) without sending anything -- the user still has to hit send.
+  Future<void> _handleDiscussImage(MediaAsset asset) async {
+    final endpoint = ComfyEndpoint.parse(asset.endpointSnapshot);
+    final uri = endpoint.viewUri(asset.outputRef);
+    final tempDir = await getTemporaryDirectory();
+    final destination = File(
+      '${tempDir.path}${Platform.pathSeparator}'
+      'discuss-${DateTime.now().microsecondsSinceEpoch}',
+    );
+    try {
+      await _mediaDownload.download(
+        uri,
+        destination: destination,
+        maxBytes: 25 * 1024 * 1024,
+        confirmAfterHeaders: (info) async {
+          final type = info.contentType?.toLowerCase();
+          return type == null || type.startsWith('image/');
+        },
+      );
+      // Synchronous: the file is already bounded to 25 MiB and this is a
+      // single one-off read, not a hot path.
+      final bytes = destination.readAsBytesSync();
+      final mime = _sniffImageMime(bytes) ?? asset.contentType;
+      if (mime == null || !mime.startsWith('image/')) {
+        throw const FormatException(
+          'Downloaded file is not a recognizable image',
+        );
+      }
+      // Encoded on the main isolate deliberately, unlike _pickImage's
+      // Isolate.run(): this is a one-off, user-triggered action on an
+      // already-bounded (25 MiB) file, not a per-frame hot path.
+      final dataUrl = buildImageDataUrl(bytes, mime);
+      if (!mounted) return;
+      setState(() {
+        _pickedImageBytes = bytes;
+        _pickedImageMimeType = mime;
+        _pickedImageDataUrl = dataUrl;
+      });
+    } catch (error) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not load image: $error')));
+    } finally {
+      if (destination.existsSync()) {
+        try {
+          destination.deleteSync();
+        } catch (_) {}
+      }
+    }
   }
 
   /// App bar replacement while searching: query field plus hit counter and
@@ -2016,77 +2182,77 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             if (_pickedImageBytes != null) _buildImagePreviewStrip(),
             Row(
-          children: [
-            IconButton(
-              icon: const Icon(Icons.image_outlined),
-              tooltip: 'Attach photo',
-              onPressed: (!_loading && !_streaming && !_sending)
-                  ? _pickImage
-                  : null,
-            ),
-            Expanded(
-              child: TextField(
-                controller: _textController,
-                decoration: InputDecoration(
-                  hintText: 'Type a message…',
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(24),
-                  ),
-                  contentPadding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 8,
-                  ),
-                  isDense: true,
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.image_outlined),
+                  tooltip: 'Attach photo',
+                  onPressed: (!_loading && !_streaming && !_sending)
+                      ? _pickImage
+                      : null,
                 ),
-                minLines: 1,
-                maxLines: 4,
-                textCapitalization: TextCapitalization.sentences,
-                keyboardType: TextInputType.multiline,
-                textInputAction: TextInputAction.send,
-                enabled: !_loading && !_streaming,
-                onSubmitted: (_) => _sendMessage(),
-              ),
-            ),
-            const SizedBox(width: 8),
-            IconButton.filledTonal(
-              icon: Icon(_listening ? Icons.mic_off : Icons.mic),
+                Expanded(
+                  child: TextField(
+                    controller: _textController,
+                    decoration: InputDecoration(
+                      hintText: 'Type a message…',
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(24),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 8,
+                      ),
+                      isDense: true,
+                    ),
+                    minLines: 1,
+                    maxLines: 4,
+                    textCapitalization: TextCapitalization.sentences,
+                    keyboardType: TextInputType.multiline,
+                    textInputAction: TextInputAction.send,
+                    enabled: !_loading && !_streaming,
+                    onSubmitted: (_) => _sendMessage(),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
+                  icon: Icon(_listening ? Icons.mic_off : Icons.mic),
                   color: _listening
                       ? Theme.of(context).colorScheme.error
                       : null,
-              onPressed: (!_loading && !_streaming && !_sending)
-                  ? _toggleVoiceInput
-                  : null,
-              tooltip: _listening ? 'Stop listening' : 'Speak to Hermes',
-            ),
-            IconButton(
-              icon: Icon(
-                _voiceReplyEnabled ? Icons.volume_up : Icons.volume_off,
-              ),
-              onPressed: () {
-                setState(() => _voiceReplyEnabled = !_voiceReplyEnabled);
-                if (!_voiceReplyEnabled) {
-                  _xtts.stop();
-                }
-              },
-              tooltip: _voiceReplyEnabled
-                  ? 'Spoken replies on'
-                  : 'Spoken replies off',
-            ),
-            const SizedBox(width: 4),
-            CircleAvatar(
-              child: _streaming
-                  ? const SizedBox(
-                      width: 20,
-                      height: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : IconButton(
-                      icon: const Icon(Icons.send, size: 20),
-                      onPressed: _sendMessage,
-                      tooltip: 'Send',
-                    ),
-            ),
-          ],
+                  onPressed: (!_loading && !_streaming && !_sending)
+                      ? _toggleVoiceInput
+                      : null,
+                  tooltip: _listening ? 'Stop listening' : 'Speak to Hermes',
+                ),
+                IconButton(
+                  icon: Icon(
+                    _voiceReplyEnabled ? Icons.volume_up : Icons.volume_off,
+                  ),
+                  onPressed: () {
+                    setState(() => _voiceReplyEnabled = !_voiceReplyEnabled);
+                    if (!_voiceReplyEnabled) {
+                      _xtts.stop();
+                    }
+                  },
+                  tooltip: _voiceReplyEnabled
+                      ? 'Spoken replies on'
+                      : 'Spoken replies off',
+                ),
+                const SizedBox(width: 4),
+                CircleAvatar(
+                  child: _streaming
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : IconButton(
+                          icon: const Icon(Icons.send, size: 20),
+                          onPressed: _sendMessage,
+                          tooltip: 'Send',
+                        ),
+                ),
+              ],
             ),
           ],
         ),
@@ -2878,74 +3044,74 @@ class _MessageBubble extends StatelessWidget {
           if (content.isNotEmpty)
             MarkdownBody(
               data: content,
-            styleSheet: MarkdownStyleSheet(
-              p: (isUser
-                  ? theme.textTheme.bodyMedium?.copyWith(color: userTextColor)
-                  : theme.textTheme.bodyMedium?.copyWith(
-                      color: assistantTextColor,
-                      shadows: rp ? _rpDialogueHalo : null,
-                    )),
-              code: TextStyle(
-                backgroundColor: Colors.black.withValues(alpha: 0.12),
-                fontFamily: 'monospace',
-                color: isUser ? userTextColor : null,
-              ),
-              a: TextStyle(
-                color: isUser ? Colors.blue[900] : theme.colorScheme.primary,
-              ),
-              h1: isUser
+              styleSheet: MarkdownStyleSheet(
+                p: (isUser
+                    ? theme.textTheme.bodyMedium?.copyWith(color: userTextColor)
+                    : theme.textTheme.bodyMedium?.copyWith(
+                        color: assistantTextColor,
+                        shadows: rp ? _rpDialogueHalo : null,
+                      )),
+                code: TextStyle(
+                  backgroundColor: Colors.black.withValues(alpha: 0.12),
+                  fontFamily: 'monospace',
+                  color: isUser ? userTextColor : null,
+                ),
+                a: TextStyle(
+                  color: isUser ? Colors.blue[900] : theme.colorScheme.primary,
+                ),
+                h1: isUser
                     ? theme.textTheme.headlineSmall?.copyWith(
                         color: userTextColor,
                       )
-                  : theme.textTheme.headlineSmall,
-              h2: isUser
-                  ? theme.textTheme.titleLarge?.copyWith(color: userTextColor)
-                  : theme.textTheme.titleLarge,
-              h3: isUser
+                    : theme.textTheme.headlineSmall,
+                h2: isUser
+                    ? theme.textTheme.titleLarge?.copyWith(color: userTextColor)
+                    : theme.textTheme.titleLarge,
+                h3: isUser
                     ? theme.textTheme.titleMedium?.copyWith(
                         color: userTextColor,
                       )
-                  : theme.textTheme.titleMedium,
-              blockquote: TextStyle(
+                    : theme.textTheme.titleMedium,
+                blockquote: TextStyle(
                   color: isUser
                       ? userTextColor.withValues(alpha: 0.7)
                       : Colors.grey,
-                fontStyle: FontStyle.italic,
-              ),
-              blockquoteDecoration: BoxDecoration(
-                border: Border(
-                  left: BorderSide(
-                    color: isUser
-                        ? userTextColor.withValues(alpha: 0.4)
-                        : theme.colorScheme.primary,
-                    width: 3,
+                  fontStyle: FontStyle.italic,
+                ),
+                blockquoteDecoration: BoxDecoration(
+                  border: Border(
+                    left: BorderSide(
+                      color: isUser
+                          ? userTextColor.withValues(alpha: 0.4)
+                          : theme.colorScheme.primary,
+                      width: 3,
+                    ),
                   ),
                 ),
+                // *asterisks* — narration and actions. The markdown renderer
+                // surfaces them as emphasis, which is what makes roleplay
+                // styling possible without a custom parser.
+                em: isUser
+                    ? theme.textTheme.bodyMedium?.copyWith(
+                        fontStyle: FontStyle.italic,
+                        color: userTextColor,
+                      )
+                    : theme.textTheme.bodyMedium?.copyWith(
+                        fontStyle: rp ? FontStyle.normal : FontStyle.italic,
+                        fontWeight: rp ? FontWeight.bold : null,
+                        color: rp ? _rpNarration : null,
+                      ),
+                strong: isUser
+                    ? theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: userTextColor,
+                      )
+                    : theme.textTheme.bodyMedium?.copyWith(
+                        fontWeight: FontWeight.bold,
+                        color: rp ? _rpNarration : null,
+                      ),
               ),
-              // *asterisks* — narration and actions. The markdown renderer
-              // surfaces them as emphasis, which is what makes roleplay
-              // styling possible without a custom parser.
-              em: isUser
-                  ? theme.textTheme.bodyMedium?.copyWith(
-                      fontStyle: FontStyle.italic,
-                      color: userTextColor,
-                    )
-                  : theme.textTheme.bodyMedium?.copyWith(
-                      fontStyle: rp ? FontStyle.normal : FontStyle.italic,
-                      fontWeight: rp ? FontWeight.bold : null,
-                      color: rp ? _rpNarration : null,
-                    ),
-              strong: isUser
-                  ? theme.textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
-                      color: userTextColor,
-                    )
-                  : theme.textTheme.bodyMedium?.copyWith(
-                      fontWeight: FontWeight.bold,
-                      color: rp ? _rpNarration : null,
-                    ),
             ),
-          ),
           // Per-message actions: TTS replay + regenerate (assistant only),
           // edit & resend (user only).
           if (onReplay != null || onRegenerate != null || onEdit != null)
@@ -3172,6 +3338,33 @@ Future<void> _showMediaActions(
       ).showSnackBar(SnackBar(content: Text('Could not load media: $e')));
     }
   }
+}
+
+/// Verifies a downloaded file is actually an image by its magic bytes,
+/// rather than trusting the server's declared content-type alone -- the
+/// discuss-in-chat path feeds this straight into the same multimodal
+/// attachment path a user-picked image uses.
+String? _sniffImageMime(Uint8List bytes) {
+  bool startsWith(List<int> signature) {
+    if (bytes.length < signature.length) return false;
+    for (var i = 0; i < signature.length; i++) {
+      if (bytes[i] != signature[i]) return false;
+    }
+    return true;
+  }
+
+  if (startsWith(const [0x89, 0x50, 0x4e, 0x47])) return 'image/png';
+  if (startsWith(const [0xff, 0xd8, 0xff])) return 'image/jpeg';
+  if (startsWith(const [0x47, 0x49, 0x46, 0x38])) return 'image/gif';
+  if (bytes.length > 11 &&
+      startsWith(const [0x52, 0x49, 0x46, 0x46]) &&
+      bytes[8] == 0x57 &&
+      bytes[9] == 0x45 &&
+      bytes[10] == 0x42 &&
+      bytes[11] == 0x50) {
+    return 'image/webp';
+  }
+  return null;
 }
 
 Future<bool> _confirmMediaDownload(
@@ -3437,13 +3630,13 @@ class _VideoBubbleState extends State<_VideoBubble> {
   void initState() {
     super.initState();
     try {
-    // Must happen before the first Player is constructed.
-    ensureMediaKitInitialized();
+      // Must happen before the first Player is constructed.
+      ensureMediaKitInitialized();
       final player = Player();
       _player = player;
-    // Attach the controller before _openSource() below: this is what sets
-    // `--vid=auto`, and Player.open() awaits an attached controller's
-    // initialization, so the media is opened with video decoding enabled.
+      // Attach the controller before _openSource() below: this is what sets
+      // `--vid=auto`, and Player.open() awaits an attached controller's
+      // initialization, so the media is opened with video decoding enabled.
       _videoController = VideoController(player);
     } catch (e) {
       debugPrint('[media_kit] video initialization failed: $e');
@@ -3454,13 +3647,13 @@ class _VideoBubbleState extends State<_VideoBubble> {
     // Surface real decode/open failures instead of silently spinning forever.
     _subs.add(
       player.stream.error.listen((e) {
-      debugPrint('[media_kit] video error for ${widget.url}: $e');
-      if (mounted) setState(() => _failed = true);
+        debugPrint('[media_kit] video error for ${widget.url}: $e');
+        if (mounted) setState(() => _failed = true);
       }),
     );
     _subs.add(
       player.stream.playing.listen((p) {
-      if (mounted) setState(() => _playing = p);
+        if (mounted) setState(() => _playing = p);
       }),
     );
     _subs.add(player.stream.width.listen((_) => _updateAspect()));

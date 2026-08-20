@@ -8,10 +8,17 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
+import 'package:hermes_android/core/models/character_generation_context.dart';
+import 'package:hermes_android/core/models/comfy_workflow.dart';
+import 'package:hermes_android/core/models/generation_job.dart';
+import 'package:hermes_android/core/models/media_asset.dart';
 import 'package:hermes_android/core/screens/chat_screen.dart';
+import 'package:hermes_android/core/screens/create_screen.dart';
 import 'package:hermes_android/core/services/connection_manager.dart';
+import 'package:hermes_android/core/services/generation_repository.dart';
 import 'package:hermes_android/core/services/media_cache_service.dart';
 import 'package:hermes_android/core/services/tts_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -37,7 +44,7 @@ class _SilentTts implements TtsProvider {
   Future<void> speak(
     String text, {
     void Function()? onComplete,
-      bool keepActions = false,
+    bool keepActions = false,
     String? voiceOverride,
   }) async {
     spoken.add(text);
@@ -67,11 +74,184 @@ class _RecordingMediaCache implements MediaCachePort {
   Future<void> remove(Uri uri) async {}
 }
 
+/// path_provider has no mock registered by default in `flutter test` (it
+/// hits a real platform channel), which throws MissingPluginException on
+/// getTemporaryDirectory() -- point it at the OS temp dir instead. Reset
+/// automatically at the end of the test via addTearDown.
+void _mockPathProvider(WidgetTester tester) {
+  const channel = MethodChannel('plugins.flutter.io/path_provider');
+  tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(channel, (
+    call,
+  ) async {
+    if (call.method == 'getTemporaryDirectory') {
+      return Directory.systemTemp.path;
+    }
+    return null;
+  });
+  addTearDown(
+    () => tester.binding.defaultBinaryMessenger.setMockMethodCallHandler(
+      channel,
+      null,
+    ),
+  );
+}
+
+/// Serves fixed bytes for any download, ignoring the destination/URI --
+/// enough to exercise the discuss-in-chat attachment path without a real
+/// network call.
+class _FakeMediaDownload implements MediaDownloadPort {
+  _FakeMediaDownload(this.bytes);
+
+  final Uint8List bytes;
+  final String contentType = 'image/png';
+  final List<Uri> requested = [];
+
+  @override
+  Future<File> download(
+    Uri uri, {
+    required File destination,
+    required int maxBytes,
+    Map<String, String> headers = const {},
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) async {
+    requested.add(uri);
+    if (confirmAfterHeaders != null) {
+      final accepted = await confirmAfterHeaders(
+        MediaDownloadInfo(statusCode: 200, contentType: contentType),
+      );
+      if (!accepted) throw const MediaDownloadDeclinedException();
+    }
+    // Synchronous I/O deliberately: this fake is invoked from an
+    // unawaited() background task started inside initState(), whose async
+    // continuation is bound to the widget-test zone -- real async dart:io
+    // Futures started there don't resolve without pump()-driven microtask
+    // flushing the test harness doesn't do for raw file I/O. Sync calls
+    // block the isolate directly instead of relying on that zone's timer
+    // queue, so they complete regardless.
+    destination.parent.createSync(recursive: true);
+    destination.writeAsBytesSync(bytes);
+    return destination;
+  }
+}
+
+class _FakeGenerationRepository implements GenerationRepository {
+  final Map<String, CharacterGenerationContext> contexts = {};
+  final List<CharacterGenerationContext> savedContexts = [];
+  final List<File?> savedReferenceImages = [];
+
+  /// Resolves once saveCharacterContext() is actually called -- the caller
+  /// triggers it via an unawaited() fire-and-forget background task, so a
+  /// test can't just pumpAndSettle() and check state; it needs a genuine
+  /// signal to await (through tester.runAsync(), since real dart:io work
+  /// like the avatar temp-file write happens on this same path and doesn't
+  /// advance on pumpAndSettle()'s simulated frames alone).
+  final Completer<void> _firstSave = Completer<void>();
+  Future<void> get firstSave => _firstSave.future;
+
+  @override
+  Future<CharacterGenerationContext?> getCharacterContext(
+    String sessionId,
+  ) async => contexts[sessionId];
+
+  @override
+  Future<void> saveCharacterContext(
+    CharacterGenerationContext context, {
+    File? referenceImage,
+  }) async {
+    contexts[context.sessionId] = context;
+    savedContexts.add(context);
+    savedReferenceImages.add(referenceImage);
+    if (!_firstSave.isCompleted) _firstSave.complete();
+  }
+
+  @override
+  Future<void> deleteCharacterContext(String sessionId) async {
+    contexts.remove(sessionId);
+  }
+
+  @override
+  Future<void> initialize() async {}
+
+  @override
+  Stream<List<ComfyWorkflowDefinition>> watchWorkflows() =>
+      const Stream.empty();
+
+  @override
+  Stream<List<GenerationJob>> watchJobs() => const Stream.empty();
+
+  @override
+  Stream<List<MediaAsset>> watchMedia() => const Stream.empty();
+
+  @override
+  Stream<CharacterGenerationContext?> watchCharacterContext(String sessionId) =>
+      const Stream.empty();
+
+  @override
+  Future<GenerationJob> submit(GenerationRequest request) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> cancel(
+    String localJobId, {
+    bool confirmSharedInterrupt = false,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<GenerationJob> retryAsNew(String localJobId) =>
+      throw UnimplementedError();
+
+  @override
+  Future<void> reconcilePending() async {}
+
+  @override
+  Future<ComfyWorkflowDefinition?> getWorkflow(String workflowId) async => null;
+
+  @override
+  Future<void> saveWorkflow(
+    ComfyWorkflowDefinition workflow, {
+    required Uint8List sourceBytes,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<ComfyWorkflowDefinition> duplicateWorkflow(
+    String workflowId, {
+    required String name,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<WorkflowValidationResult> validateWorkflow(
+    String workflowId, {
+    required bool againstServer,
+  }) => throw UnimplementedError();
+
+  @override
+  Future<Uint8List> exportWorkflow(
+    String workflowId,
+    WorkflowExportKind kind,
+  ) => throw UnimplementedError();
+
+  @override
+  Future<void> deleteWorkflow(String workflowId) => throw UnimplementedError();
+
+  @override
+  Future<void> removeMedia(String assetId, {required bool clearCache}) async {}
+
+  @override
+  Future<void> upsertChatToolOutputs({
+    required ComfyEndpoint endpoint,
+    required String sessionId,
+    required List<JsonObject> messages,
+  }) async {}
+
+  @override
+  Future<void> dispose() async {}
+}
+
 /// Scriptable gateway. [messages] is what GET .../messages returns, and it can
 /// be swapped between calls to model the server changing underneath the app.
 class _FakeGateway {
   _FakeGateway({List<Map<String, dynamic>>? messages})
-      : messages = messages ?? [];
+    : messages = messages ?? [];
 
   List<Map<String, dynamic>> messages;
 
@@ -149,34 +329,46 @@ class _FakeClient extends http.BaseClient {
 }
 
 SavedConnection _conn() => SavedConnection(
-      id: 'c1',
-      label: 'Test',
-      host: 'localhost',
-      port: 8642,
-      apiKey: 'k',
-    );
+  id: 'c1',
+  label: 'Test',
+  host: 'localhost',
+  port: 8642,
+  apiKey: 'k',
+);
 
 Session _session() => Session(
-      id: 'sess-1',
-      title: 'Test chat',
-      model: 'hermes-agent',
-      source: 'mobile',
-      messageCount: 0,
-      isActive: true,
-      preview: '',
-      startedAt: 0,
-    );
+  id: 'sess-1',
+  title: 'Test chat',
+  model: 'hermes-agent',
+  source: 'mobile',
+  messageCount: 0,
+  isActive: true,
+  preview: '',
+  startedAt: 0,
+);
 
-Widget _app(_FakeGateway gw, _SilentTts tts, {MediaCachePort? mediaCache}) =>
-    MaterialApp(
-      home: ChatScreen(
-        connection: _conn(),
-        session: _session(),
-        httpClient: gw.client(),
-        ttsOverride: () => tts,
-        mediaCache: mediaCache,
-      ),
-    );
+Widget _app(
+  _FakeGateway gw,
+  _SilentTts tts, {
+  MediaCachePort? mediaCache,
+  CharacterSummary? character,
+  CharacterCard? characterCard,
+  GenerationRepository? generationRepository,
+  MediaDownloadPort? mediaDownload,
+  Session? session,
+}) => MaterialApp(
+  home: ChatScreen(
+    connection: _conn(),
+    session: session ?? _session(),
+    character: character,
+    characterCard: characterCard,
+    httpClient: gw.client(),
+    ttsOverride: () => tts,
+    mediaCache: mediaCache,
+    generationRepository: generationRepository,
+    mediaDownload: mediaDownload,
+  ),
+);
 
 void main() {
   setUp(() {
@@ -193,8 +385,8 @@ void main() {
   testWidgets('renders the transcript it fetched', (tester) async {
     final gw = _FakeGateway(
       messages: [
-      _FakeGateway.msg('user', 'hello there'),
-      _FakeGateway.msg('assistant', 'general kenobi'),
+        _FakeGateway.msg('user', 'hello there'),
+        _FakeGateway.msg('assistant', 'general kenobi'),
       ],
     );
 
@@ -283,8 +475,8 @@ void main() {
   ) async {
     final gw = _FakeGateway(
       messages: [
-      _FakeGateway.msg('user', 'an older question'),
-      _FakeGateway.msg('assistant', 'an older answer'),
+        _FakeGateway.msg('user', 'an older question'),
+        _FakeGateway.msg('assistant', 'an older answer'),
       ],
     )..streamFrames = ['ok'];
 
@@ -358,8 +550,8 @@ void main() {
   ) async {
     final gw = _FakeGateway(
       messages: [
-      _FakeGateway.msg('user', '${CharacterCard.setupMarker}\nYou are Ada.'),
-      _FakeGateway.msg('assistant', 'Hello, I am Ada.'),
+        _FakeGateway.msg('user', '${CharacterCard.setupMarker}\nYou are Ada.'),
+        _FakeGateway.msg('assistant', 'Hello, I am Ada.'),
       ],
     );
 
@@ -501,10 +693,10 @@ void main() {
     ) async {
       final gw = _FakeGateway(
         messages: [
-        _FakeGateway.msg('user', 'first question'),
-        _FakeGateway.msg('assistant', 'first answer'),
-        _FakeGateway.msg('user', 'second question'),
-        _FakeGateway.msg('assistant', 'second answer'),
+          _FakeGateway.msg('user', 'first question'),
+          _FakeGateway.msg('assistant', 'first answer'),
+          _FakeGateway.msg('user', 'second question'),
+          _FakeGateway.msg('assistant', 'second answer'),
         ],
       );
 
@@ -522,8 +714,8 @@ void main() {
     ) async {
       final gw = _FakeGateway(
         messages: [
-        _FakeGateway.msg('user', 'tell me a joke'),
-        _FakeGateway.msg('assistant', 'why did the chicken...'),
+          _FakeGateway.msg('user', 'tell me a joke'),
+          _FakeGateway.msg('assistant', 'why did the chicken...'),
         ],
       )..streamFrames = ['a new joke'];
 
@@ -611,4 +803,140 @@ void main() {
     expect(find.text('Failed to load messages'), findsNothing);
     expect(find.byType(TextField), findsOneWidget);
   });
+
+  testWidgets(
+    'Create media loads this session\'s context and passes the active connection',
+    (tester) async {
+      final repository = _FakeGenerationRepository();
+      final savedContext = CharacterGenerationContext(
+        sessionId: 'sess-1',
+        characterName: 'Hermes',
+        appearancePrompt: 'Silver hair.',
+        createdAt: DateTime.utc(2026, 8, 20),
+        updatedAt: DateTime.utc(2026, 8, 20),
+      );
+      repository.contexts['sess-1'] = savedContext;
+
+      await tester.pumpWidget(
+        _app(_FakeGateway(), _SilentTts(), generationRepository: repository),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Create media'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(CreateScreen), findsOneWidget);
+      final create = tester.widget<CreateScreen>(find.byType(CreateScreen));
+      expect(create.initialTab, 0);
+      expect(create.initialContext, savedContext);
+      expect(create.connection.id, _conn().id);
+      expect(identical(create.repository, repository), isTrue);
+    },
+  );
+
+  testWidgets(
+    'picking a character persists its appearance as a generation context',
+    (tester) async {
+      _mockPathProvider(tester);
+      final repository = _FakeGenerationRepository();
+      await tester.pumpWidget(
+        _app(
+          _FakeGateway(),
+          _SilentTts(),
+          generationRepository: repository,
+          // Avoids a real network attempt from the avatar-download
+          // best-effort path (the global appMediaDownloadService would
+          // otherwise try to reach a non-existent localhost server and hang
+          // pumpAndSettle waiting for a connection that never resolves).
+          mediaDownload: _FakeMediaDownload(Uint8List(0)),
+          character: const CharacterSummary(
+            name: 'Hermes',
+            images: ['hermes.png'],
+          ),
+          characterCard: const CharacterCard(
+            name: 'Hermes',
+            description: 'Silver hair and a blue coat.',
+          ),
+        ),
+      );
+      // A plain pumpAndSettle() here is flaky under the full suite (some
+      // interaction with earlier tests' background-service/stream state
+      // keeps scheduling frames past pumpAndSettle's own timeout) -- bound
+      // it instead of chasing the exact cross-test interaction.
+      for (var i = 0; i < 30; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      // saveCharacterContext() runs off an unawaited() background task, and
+      // the avatar temp-file write on its way there is real dart:io work
+      // that doesn't advance on simulated frames alone -- wait for the
+      // actual completion signal in the real zone instead of guessing a
+      // delay.
+      await tester.runAsync(
+        () => repository.firstSave.timeout(const Duration(seconds: 5)),
+      );
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+
+      expect(repository.savedContexts, hasLength(1));
+      final saved = repository.savedContexts.single;
+      expect(saved.sessionId, 'sess-1');
+      expect(saved.characterName, 'Hermes');
+      expect(saved.appearancePrompt, 'Silver hair and a blue coat.');
+    },
+  );
+
+  testWidgets(
+    'discuss image prepares the existing multimodal draft without sending',
+    (tester) async {
+      _mockPathProvider(tester);
+      final repository = _FakeGenerationRepository();
+      // A real (decodable) 1x1 transparent PNG -- Image.memory actually
+      // decodes the bytes once they're set as the picked-image preview, so
+      // a bare magic-byte prefix (enough to satisfy _sniffImageMime) isn't
+      // enough here.
+      final download = _FakeMediaDownload(
+        base64Decode(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk'
+          '+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+        ),
+      );
+      final gw = _FakeGateway();
+      await tester.pumpWidget(
+        _app(
+          gw,
+          _SilentTts(),
+          generationRepository: repository,
+          mediaDownload: download,
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byTooltip('More'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Create media'));
+      await tester.pumpAndSettle();
+
+      final createElement = tester.element(find.byType(CreateScreen));
+      final asset = MediaAsset(
+        id: 'asset-1',
+        jobId: 'job-1',
+        workflowId: 'workflow-1',
+        kind: ComfyMediaKind.image,
+        endpointSnapshot: 'http://host:8188',
+        filename: 'result.png',
+        createdAt: DateTime.utc(2026, 8, 20),
+        updatedAt: DateTime.utc(2026, 8, 20),
+      );
+      Navigator.of(createElement).pop(DiscussGeneratedImage(asset));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(CreateScreen), findsNothing);
+      expect(find.text('Photo attached'), findsOneWidget);
+      expect(download.requested, hasLength(1));
+      expect(gw.sendCount, 0);
+    },
+  );
 }
