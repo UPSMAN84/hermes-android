@@ -5,11 +5,26 @@
 // *path* embedded in a tool-result string. ComfyUI already serves those files
 // over HTTP at GET /view?filename=<name>&type=output, so we extract the
 // filename from the tool content and build a fetchable URL the app renders.
+import '../models/comfy_workflow.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class ComfyUiPrefs {
   static const baseUrl = 'comfyui_base_url';
   static const defaultBaseUrl = 'http://0.0.0.0:8188';
+
+  /// Loads only a user-configured ComfyUI endpoint.
+  ///
+  /// The historic wildcard default is not reachable from a phone, so it is
+  /// migrated to an absent configuration rather than used as an endpoint.
+  static Future<ComfyEndpoint?> loadConfiguredEndpoint(
+    SharedPreferences prefs,
+  ) async {
+    final raw = prefs.getString(baseUrl);
+    if (raw == null || raw == defaultBaseUrl || raw == '$defaultBaseUrl/') {
+      return null;
+    }
+    return ComfyEndpoint.parse(raw);
+  }
 }
 
 class ComfyUi {
@@ -63,7 +78,13 @@ class ComfyUi {
   /// Builds the ComfyUI /view URL for a given filename. [type] is ComfyUI's
   /// own file-source classifier (`output` for generated results, `input` for
   /// uploaded/source images, `temp` for intermediate previews).
-  static String viewUrl(String baseUrl, String filename, {String type = 'output'}) {
-    return '${normalizeBaseUrl(baseUrl)}/view?filename=${Uri.encodeComponent(filename)}&type=${Uri.encodeComponent(type)}';
+  static String viewUrl(
+    String baseUrl,
+    String filename, {
+    String type = 'output',
+  }) {
+    return ComfyEndpoint.parse(
+      normalizeBaseUrl(baseUrl),
+    ).viewUri(ComfyOutputRef(filename: filename, type: type)).toString();
   }
 }
