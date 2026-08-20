@@ -10,6 +10,7 @@
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
 
 import 'foreground_service_lease.dart';
+import 'generation_repository.dart';
 
 @pragma('vm:entry-point')
 void backgroundSendTaskStartCallback() {
@@ -50,3 +51,26 @@ Future<bool> startBackgroundSendService() {
 }
 
 Future<void> stopBackgroundSendService() => ForegroundServiceLease.release();
+
+/// Adapts the shared [ForegroundServiceLease] to [ForegroundLeasePort] for
+/// [GenerationRepository]'s socket-observation lifetime -- a job generating
+/// in the background gets the same "don't let the OS suspend the process"
+/// protection as a streaming chat reply or an active phone call, and shares
+/// the same single process-global foreground service via the lease's
+/// refcounting rather than fighting either of them for it.
+final class GenerationForegroundLease implements ForegroundLeasePort {
+  const GenerationForegroundLease();
+
+  @override
+  Future<bool> acquire({required String notificationText}) {
+    return ForegroundServiceLease.acquire(
+      notificationTitle: 'Hermes',
+      notificationText: notificationText,
+      serviceTypes: const [ForegroundServiceTypes.dataSync],
+      callback: backgroundSendTaskStartCallback,
+    );
+  }
+
+  @override
+  Future<void> release() => ForegroundServiceLease.release();
+}

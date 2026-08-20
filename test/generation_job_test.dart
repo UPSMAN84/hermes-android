@@ -293,11 +293,7 @@ void main() {
         promptId: null,
       );
       expect(
-        reduceGenerationJob(
-          submitting,
-          const CancelRequested(),
-          later(),
-        ).state,
+        reduceGenerationJob(submitting, const CancelRequested(), later()).state,
         GenerationJobState.submitting,
       );
     });
@@ -327,43 +323,40 @@ void main() {
       );
     });
 
-    test(
-      'partial executed outputs accumulate without becoming terminal',
-      () {
-        final queued = job(state: GenerationJobState.queued);
-        final firstSeen = reduceGenerationJob(
-          queued,
-          ExecutionOutputsObserved([outputRef()]),
-          later(),
-        );
-        expect(firstSeen.state, GenerationJobState.running);
-        expect(firstSeen.outputs, hasLength(1));
+    test('partial executed outputs accumulate without becoming terminal', () {
+      final queued = job(state: GenerationJobState.queued);
+      final firstSeen = reduceGenerationJob(
+        queued,
+        ExecutionOutputsObserved([outputRef()]),
+        later(),
+      );
+      expect(firstSeen.state, GenerationJobState.running);
+      expect(firstSeen.outputs, hasLength(1));
 
-        final second = ComfyOutputRef(
-          filename: 'second.png',
-          subfolder: 'images',
-          type: 'output',
-        );
-        final accumulated = reduceGenerationJob(
-          firstSeen,
-          ExecutionOutputsObserved([outputRef(), second]),
-          later(),
-        );
-        expect(accumulated.outputs, hasLength(2));
+      final second = ComfyOutputRef(
+        filename: 'second.png',
+        subfolder: 'images',
+        type: 'output',
+      );
+      final accumulated = reduceGenerationJob(
+        firstSeen,
+        ExecutionOutputsObserved([outputRef(), second]),
+        later(),
+      );
+      expect(accumulated.outputs, hasLength(2));
 
-        final cancelling = job(
-          state: GenerationJobState.cancelling,
-          outputs: [outputRef()],
-        );
-        final stillCancelling = reduceGenerationJob(
-          cancelling,
-          ExecutionOutputsObserved([second]),
-          later(),
-        );
-        expect(stillCancelling.state, GenerationJobState.cancelling);
-        expect(stillCancelling.outputs, hasLength(2));
-      },
-    );
+      final cancelling = job(
+        state: GenerationJobState.cancelling,
+        outputs: [outputRef()],
+      );
+      final stillCancelling = reduceGenerationJob(
+        cancelling,
+        ExecutionOutputsObserved([second]),
+        later(),
+      );
+      expect(stillCancelling.state, GenerationJobState.cancelling);
+      expect(stillCancelling.outputs, hasLength(2));
+    });
 
     test('nested node errors are immutable after reduction', () {
       final messages = <Object?>['original'];
@@ -507,40 +500,43 @@ void main() {
       },
     );
 
-    test('a File or raw bytes accidentally placed in submittedValues is rejected', () {
-      expect(
-        () => GenerationRequest(
-          workflowId: 'workflow-1',
-          kind: ComfyMediaKind.image,
-          submittedValues: {'image': File('leaked.png')},
-        ),
-        throwsArgumentError,
-      );
-      expect(
-        () => GenerationRequest(
-          workflowId: 'workflow-1',
-          kind: ComfyMediaKind.image,
-          submittedValues: {
-            'nested': {'bytes': Uint8List(4)},
-          },
-        ),
-        throwsArgumentError,
-      );
-      expect(
-        () => GenerationJob(
-          localId: 'job-1',
-          workflowId: 'workflow-1',
-          kind: ComfyMediaKind.image,
-          state: GenerationJobState.draft,
-          endpointFingerprint: 'x',
-          endpointSnapshot: 'http://host:8188',
-          submittedValues: {'image': File('leaked.png')},
-          createdAt: created(),
-          updatedAt: created(),
-        ),
-        throwsArgumentError,
-      );
-    });
+    test(
+      'a File or raw bytes accidentally placed in submittedValues is rejected',
+      () {
+        expect(
+          () => GenerationRequest(
+            workflowId: 'workflow-1',
+            kind: ComfyMediaKind.image,
+            submittedValues: {'image': File('leaked.png')},
+          ),
+          throwsArgumentError,
+        );
+        expect(
+          () => GenerationRequest(
+            workflowId: 'workflow-1',
+            kind: ComfyMediaKind.image,
+            submittedValues: {
+              'nested': {'bytes': Uint8List(4)},
+            },
+          ),
+          throwsArgumentError,
+        );
+        expect(
+          () => GenerationJob(
+            localId: 'job-1',
+            workflowId: 'workflow-1',
+            kind: ComfyMediaKind.image,
+            state: GenerationJobState.draft,
+            endpointFingerprint: 'x',
+            endpointSnapshot: 'http://host:8188',
+            submittedValues: {'image': File('leaked.png')},
+            createdAt: created(),
+            updatedAt: created(),
+          ),
+          throwsArgumentError,
+        );
+      },
+    );
   });
 
   group('media assets', () {
