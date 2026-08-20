@@ -65,6 +65,8 @@ class ChatScreen extends StatefulWidget {
   /// already mockable (SharedPreferences).
   final http.Client? httpClient;
   final TtsProvider Function()? ttsOverride;
+  final MediaCachePort? mediaCache;
+  final MediaExportService? mediaExport;
 
   const ChatScreen({
     required this.connection,
@@ -73,6 +75,8 @@ class ChatScreen extends StatefulWidget {
     this.characterCard,
     this.httpClient,
     this.ttsOverride,
+    this.mediaCache,
+    this.mediaExport,
     super.key,
   });
 
@@ -81,6 +85,11 @@ class ChatScreen extends StatefulWidget {
 }
 
 class _ChatScreenState extends State<ChatScreen> {
+  MediaCachePort get _mediaCache =>
+      widget.mediaCache ?? MediaCacheService.appDefault;
+  MediaExportService get _mediaExport =>
+      widget.mediaExport ?? MediaExportService.appDefault;
+
   List<Map<String, dynamic>> _messages = [];
   final List<Map<String, dynamic>> _toolMessages = [];
   bool _loading = true;
@@ -117,7 +126,8 @@ class _ChatScreenState extends State<ChatScreen> {
       SpeechRecognitionCoordinator.instance;
   SpeechToText get _speechToText => _speechCoordinator.speech;
   late TtsProvider _xtts =
-      widget.ttsOverride?.call() ?? XttsService(fallbackHost: widget.connection.host);
+      widget.ttsOverride?.call() ??
+      XttsService(fallbackHost: widget.connection.host);
   bool _speechAvailable = false;
   bool _listening = false;
   bool _voiceReplyEnabled = true;
@@ -680,6 +690,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
       onComplete?.call();
     }
+
     try {
       await _xtts.speak(
         spokenText,
@@ -692,7 +703,10 @@ class _ChatScreenState extends State<ChatScreen> {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('TTS failed: $e', style: const TextStyle(color: Colors.black87)),
+          content: Text(
+            'TTS failed: $e',
+            style: const TextStyle(color: Colors.black87),
+          ),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 4),
         ),
@@ -785,7 +799,10 @@ class _ChatScreenState extends State<ChatScreen> {
       setState(() => _speakingMessage = null);
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Voice playback failed: $e', style: const TextStyle(color: Colors.black87)),
+          content: Text(
+            'Voice playback failed: $e',
+            style: const TextStyle(color: Colors.black87),
+          ),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 3),
         ),
@@ -839,7 +856,8 @@ class _ChatScreenState extends State<ChatScreen> {
     final follow = !_showScrollToBottom;
     setState(() {
       if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
-        _messages.last['content'] = (_messages.last['content'] as String) + chunk;
+        _messages.last['content'] =
+            (_messages.last['content'] as String) + chunk;
       }
     });
     if (follow) {
@@ -909,7 +927,10 @@ class _ChatScreenState extends State<ChatScreen> {
       if (_messages.isNotEmpty) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Refresh failed: $errStr', style: const TextStyle(color: Colors.black87)),
+            content: Text(
+              'Refresh failed: $errStr',
+              style: const TextStyle(color: Colors.black87),
+            ),
             backgroundColor: Colors.orange,
             duration: const Duration(seconds: 6),
           ),
@@ -1035,7 +1056,8 @@ class _ChatScreenState extends State<ChatScreen> {
       final role = (msg['role'] as String?) ?? '';
       if (role != 'tool') continue;
 
-      final name = (msg['name'] as String?) ??
+      final name =
+          (msg['name'] as String?) ??
           (msg['tool_name'] as String?) ??
           (msg['toolCallName'] as String?) ??
           '';
@@ -1140,9 +1162,7 @@ class _ChatScreenState extends State<ChatScreen> {
     if (selected == null || !mounted) return;
     final prompt = 'Use the "$selected" skill: ';
     _textController.text = prompt;
-    _textController.selection = TextSelection.collapsed(
-      offset: prompt.length,
-    );
+    _textController.selection = TextSelection.collapsed(offset: prompt.length);
   }
 
   Future<void> _cmdSwitchModel() async {
@@ -1154,9 +1174,9 @@ class _ChatScreenState extends State<ChatScreen> {
       options = await dashboard.getModelOptions();
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not load models: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not load models: $e')));
       return;
     }
     if (!mounted) return;
@@ -1196,13 +1216,15 @@ class _ChatScreenState extends State<ChatScreen> {
       await dashboard.setModel('main', provider, model);
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Model set to $model — applies to new sessions')),
+        SnackBar(
+          content: Text('Model set to $model — applies to new sessions'),
+        ),
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not set model: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not set model: $e')));
     }
   }
 
@@ -1242,7 +1264,8 @@ class _ChatScreenState extends State<ChatScreen> {
     if (text.isEmpty) return;
     if (_sending || _streaming) return;
 
-    if (textOverride == null && _slashCommands.containsKey(text.toLowerCase())) {
+    if (textOverride == null &&
+        _slashCommands.containsKey(text.toLowerCase())) {
       _textController.text = '';
       await _handleSlashCommand(text.toLowerCase());
       return;
@@ -1363,8 +1386,9 @@ class _ChatScreenState extends State<ChatScreen> {
               (m) => m['role'] == 'assistant',
               orElse: () => const <String, dynamic>{},
             );
-            final replyText =
-                parseMessageContent(lastAssistant['content']).text.trim();
+              final replyText = parseMessageContent(
+                lastAssistant['content'],
+              ).text.trim();
             if (replyText.isNotEmpty) {
               ReplyNotificationService.showReplyReady(
                 widget.session.id,
@@ -1386,7 +1410,9 @@ class _ChatScreenState extends State<ChatScreen> {
               await _speakAssistantText(
                 assistantText,
                 message: assistant.isEmpty ? null : assistant,
-                onComplete: _autoContinueEnabled ? _scheduleAutoContinue : null,
+                  onComplete: _autoContinueEnabled
+                      ? _scheduleAutoContinue
+                      : null,
               );
             } else if (_autoContinueEnabled) {
               _scheduleAutoContinue();
@@ -1396,7 +1422,9 @@ class _ChatScreenState extends State<ChatScreen> {
             // wait on — just pace on a fixed delay instead.
             _scheduleAutoContinue();
           }
-          WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+            WidgetsBinding.instance.addPostFrameCallback(
+              (_) => _scrollToBottom(),
+            );
         } catch (e) {
           if (!mounted) return;
           setState(() {
@@ -1552,7 +1580,10 @@ class _ChatScreenState extends State<ChatScreen> {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Send failed: $e', style: const TextStyle(color: Colors.black87)),
+          content: Text(
+            'Send failed: $e',
+            style: const TextStyle(color: Colors.black87),
+          ),
           backgroundColor: Colors.orange,
           duration: const Duration(seconds: 6),
         ),
@@ -1580,9 +1611,7 @@ class _ChatScreenState extends State<ChatScreen> {
     setState(() {
       final idx = toolCallId.isEmpty
           ? -1
-          : _toolMessages.indexWhere(
-              (m) => m['toolCallId'] == toolCallId,
-            );
+          : _toolMessages.indexWhere((m) => m['toolCallId'] == toolCallId);
       final payload = {
         'role': 'tool_progress',
         'content': content,
@@ -1599,8 +1628,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
 
-    if (done &&
-        (tool == 'image_generate' || tool == 'video_generate')) {
+    if (done && (tool == 'image_generate' || tool == 'video_generate')) {
       // Newer servers emit hermes.tool.progress with the rendered filename
       // directly in the SSE payload — render off that and skip polling.
       final filename = progress['filename']?.toString();
@@ -1686,7 +1714,9 @@ class _ChatScreenState extends State<ChatScreen> {
                         : null,
                   ),
                   title: Text(
-                    _autoContinueEnabled ? 'Auto-continue on' : 'Auto-continue',
+                          _autoContinueEnabled
+                              ? 'Auto-continue on'
+                              : 'Auto-continue',
                   ),
                   contentPadding: EdgeInsets.zero,
                 ),
@@ -1760,6 +1790,7 @@ class _ChatScreenState extends State<ChatScreen> {
             children: [
               CachedMediaThumbnail(
                 url: _client.characterImageUrl(_characterImagePath!),
+                mediaCache: _mediaCache,
                 headers: _client.authHeaders,
                 fit: BoxFit.cover,
                 // Decode near screen width, not the card's native resolution —
@@ -1911,9 +1942,9 @@ class _ChatScreenState extends State<ChatScreen> {
   Widget _buildSpeakingJumpBar() {
     final speaking = _speakingMessage;
     if (speaking == null) return const SizedBox.shrink();
-    final preview = parseMessageContent(speaking['content']).text
-        .replaceAll(RegExp(r'\s+'), ' ')
-        .trim();
+    final preview = parseMessageContent(
+      speaking['content'],
+    ).text.replaceAll(RegExp(r'\s+'), ' ').trim();
     return Material(
       color: Theme.of(context).colorScheme.surfaceContainerHighest,
       child: InkWell(
@@ -2018,7 +2049,9 @@ class _ChatScreenState extends State<ChatScreen> {
             const SizedBox(width: 8),
             IconButton.filledTonal(
               icon: Icon(_listening ? Icons.mic_off : Icons.mic),
-              color: _listening ? Theme.of(context).colorScheme.error : null,
+                  color: _listening
+                      ? Theme.of(context).colorScheme.error
+                      : null,
               onPressed: (!_loading && !_streaming && !_sending)
                   ? _toggleVoiceInput
                   : null,
@@ -2181,7 +2214,11 @@ class _ChatScreenState extends State<ChatScreen> {
           child = _ToolProgressCard(items: item, verbose: _verboseMode);
         } else if (item is List<String>) {
           // Generated media (images/videos) extracted from tool results.
-          child = _MediaRow(urls: item);
+          child = _MediaRow(
+            urls: item,
+            mediaCache: _mediaCache,
+            mediaExport: _mediaExport,
+          );
         } else {
           final msg = item as Map<String, dynamic>;
           final role = (msg['role'] as String?) ?? 'assistant';
@@ -2191,6 +2228,7 @@ class _ChatScreenState extends State<ChatScreen> {
           child = _MessageBubble(
             content: parsed.text,
             imageUrls: parsed.imageUrls,
+            mediaCache: _mediaCache,
             isUser: isUser,
             verbose: _verboseMode,
             metadata: msg,
@@ -2325,8 +2363,7 @@ class _ChatScreenState extends State<ChatScreen> {
   void _stepSearch(int delta) {
     if (_searchHits.isEmpty) return;
     setState(() {
-      _searchCursor =
-          (_searchCursor + delta) % _searchHits.length;
+      _searchCursor = (_searchCursor + delta) % _searchHits.length;
       if (_searchCursor < 0) _searchCursor += _searchHits.length;
     });
     _revealSearchHit();
@@ -2377,7 +2414,8 @@ class _ChatScreenState extends State<ChatScreen> {
     int liveMediaCount,
     String comfyBaseUrl,
     bool lastMessageEmpty,
-  })? _displayCacheKey;
+  })?
+  _displayCacheKey;
 
   /// Bumped by [_invalidateDisplayList] whenever _messages, _toolMessages,
   /// _liveMediaUrls or _comfyBaseUrl are mutated in a way the row list depends
@@ -2636,8 +2674,9 @@ class _EditMessageDialog extends StatefulWidget {
 }
 
 class _EditMessageDialogState extends State<_EditMessageDialog> {
-  late final TextEditingController _controller =
-      TextEditingController(text: widget.initialText);
+  late final TextEditingController _controller = TextEditingController(
+    text: widget.initialText,
+  );
 
   @override
   void dispose() {
@@ -2675,6 +2714,7 @@ class _EditMessageDialogState extends State<_EditMessageDialog> {
 class _MessageBubble extends StatelessWidget {
   final String content;
   final List<String> imageUrls;
+  final MediaCachePort mediaCache;
   final bool isUser;
   final bool verbose;
   final Map<String, dynamic> metadata;
@@ -2703,6 +2743,7 @@ class _MessageBubble extends StatelessWidget {
   const _MessageBubble({
     required this.content,
     this.imageUrls = const [],
+    required this.mediaCache,
     required this.isUser,
     this.verbose = false,
     this.metadata = const {},
@@ -2741,8 +2782,9 @@ class _MessageBubble extends StatelessWidget {
     final assistantBubbleColor = rp
         ? const Color(0xFF141414).withValues(alpha: 0.82)
         : (isDark ? const Color(0xFF2A2A2A) : const Color(0xFFEAEAEA));
-    final assistantTextColor =
-        rp ? _rpDialogue : (isDark ? Colors.white : Colors.black87);
+    final assistantTextColor = rp
+        ? _rpDialogue
+        : (isDark ? Colors.white : Colors.black87);
     // White text on this gold measures ~2.1:1 contrast — well under WCAG AA's
     // 4.5:1 minimum for normal text. Dark text on the same gold comfortably
     // clears it, so every isUser text color below uses this instead of white.
@@ -2821,7 +2863,11 @@ class _MessageBubble extends StatelessWidget {
                       (url) => SizedBox(
                         width: 140,
                         height: 140,
-                        child: CachedMediaThumbnail(url: url, borderRadius: 12),
+                        child: CachedMediaThumbnail(
+                          url: url,
+                          mediaCache: mediaCache,
+                          borderRadius: 12,
+                        ),
                       ),
                     )
                     .toList(),
@@ -2847,16 +2893,22 @@ class _MessageBubble extends StatelessWidget {
                 color: isUser ? Colors.blue[900] : theme.colorScheme.primary,
               ),
               h1: isUser
-                  ? theme.textTheme.headlineSmall?.copyWith(color: userTextColor)
+                    ? theme.textTheme.headlineSmall?.copyWith(
+                        color: userTextColor,
+                      )
                   : theme.textTheme.headlineSmall,
               h2: isUser
                   ? theme.textTheme.titleLarge?.copyWith(color: userTextColor)
                   : theme.textTheme.titleLarge,
               h3: isUser
-                  ? theme.textTheme.titleMedium?.copyWith(color: userTextColor)
+                    ? theme.textTheme.titleMedium?.copyWith(
+                        color: userTextColor,
+                      )
                   : theme.textTheme.titleMedium,
               blockquote: TextStyle(
-                color: isUser ? userTextColor.withValues(alpha: 0.7) : Colors.grey,
+                  color: isUser
+                      ? userTextColor.withValues(alpha: 0.7)
+                      : Colors.grey,
                 fontStyle: FontStyle.italic,
               ),
               blockquoteDecoration: BoxDecoration(
@@ -2899,16 +2951,19 @@ class _MessageBubble extends StatelessWidget {
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Align(
-                alignment:
-                    isUser ? Alignment.centerRight : Alignment.centerLeft,
+                alignment: isUser
+                    ? Alignment.centerRight
+                    : Alignment.centerLeft,
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     if (!isUser && onReplay != null)
                       IconButton(
                         padding: EdgeInsets.zero,
-                        constraints:
-                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        constraints: const BoxConstraints(
+                          minWidth: 28,
+                          minHeight: 28,
+                        ),
                         icon: Icon(
                           isSpeaking
                               ? Icons.stop_rounded
@@ -2921,8 +2976,10 @@ class _MessageBubble extends StatelessWidget {
                     if (!isUser && onRegenerate != null)
                       IconButton(
                         padding: EdgeInsets.zero,
-                        constraints:
-                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        constraints: const BoxConstraints(
+                          minWidth: 28,
+                          minHeight: 28,
+                        ),
                         icon: const Icon(Icons.refresh_rounded),
                         tooltip: 'Ask again (sends as a new message)',
                         color: isDark ? Colors.white54 : Colors.black45,
@@ -2931,8 +2988,10 @@ class _MessageBubble extends StatelessWidget {
                     if (isUser && onEdit != null)
                       IconButton(
                         padding: EdgeInsets.zero,
-                        constraints:
-                            const BoxConstraints(minWidth: 28, minHeight: 28),
+                        constraints: const BoxConstraints(
+                          minWidth: 28,
+                          minHeight: 28,
+                        ),
                         icon: const Icon(Icons.edit_outlined, size: 18),
                         tooltip: 'Edit & resend as a new message',
                         color: userTextColor.withValues(alpha: 0.6),
@@ -2956,15 +3015,11 @@ class _MessageBubble extends StatelessWidget {
   }
 }
 
-
 class _ToolProgressCard extends StatelessWidget {
   final List<Map<String, dynamic>> items;
   final bool verbose;
 
-  const _ToolProgressCard({
-    required this.items,
-    this.verbose = false,
-  });
+  const _ToolProgressCard({required this.items, this.verbose = false});
 
   @override
   Widget build(BuildContext context) {
@@ -2980,7 +3035,9 @@ class _ToolProgressCard extends StatelessWidget {
 
     final emojis = items.map((item) {
       final content = (item['content'] as String?) ?? '';
-      return content.isNotEmpty ? content.substring(0, content.length < 2 ? content.length : 2) : '\uD83D\uDD27';
+      return content.isNotEmpty
+          ? content.substring(0, content.length < 2 ? content.length : 2)
+          : '\uD83D\uDD27';
     }).toList();
 
     return Container(
@@ -3000,20 +3057,14 @@ class _ToolProgressCard extends StatelessWidget {
             style: const TextStyle(fontSize: 13),
           ),
           const SizedBox(width: 6),
-          Text(
-            emojis.join(' '),
-            style: const TextStyle(fontSize: 13),
-          ),
+          Text(emojis.join(' '), style: const TextStyle(fontSize: 13)),
           if (active)
             Padding(
               padding: const EdgeInsets.only(left: 8),
               child: SizedBox(
                 width: 12,
                 height: 12,
-                child: CircularProgressIndicator(
-                  strokeWidth: 1.5,
-                  color: fg,
-                ),
+                child: CircularProgressIndicator(strokeWidth: 1.5, color: fg),
               ),
             ),
         ],
@@ -3029,7 +3080,13 @@ class _ToolProgressCard extends StatelessWidget {
 /// A column of generated media (images and/or videos) from tool results.
 class _MediaRow extends StatelessWidget {
   final List<String> urls;
-  const _MediaRow({required this.urls});
+  final MediaCachePort mediaCache;
+  final MediaExportService mediaExport;
+  const _MediaRow({
+    required this.urls,
+    required this.mediaCache,
+    required this.mediaExport,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -3043,22 +3100,27 @@ class _MediaRow extends StatelessWidget {
       children: urls.map((u) {
         final filename = Uri.parse(u).queryParameters['filename'] ?? '';
         return ComfyUi.isVideo(filename)
-            ? _VideoBubble(url: u, key: ValueKey(u))
-            : _ImageBubble(url: u, key: ValueKey(u));
+            ? _VideoBubble(url: u, mediaExport: mediaExport, key: ValueKey(u))
+            : _ImageBubble(
+                url: u,
+                mediaCache: mediaCache,
+                mediaExport: mediaExport,
+                key: ValueKey(u),
+              );
       }).toList(),
     );
   }
 }
 
 /// Share / save-to-gallery bottom sheet for a generated media bubble.
-/// Re-resolves [url] through MediaCacheService rather than threading a
-/// [File] through bubble state -- cheap once cached, and keeps both
-/// _ImageBubble and _VideoBubble from needing extra fields just for this.
+/// Exports [url] remotely so sharing and saving use bounded downloads.
 Future<void> _showMediaActions(
   BuildContext context,
   String url, {
   required bool isVideo,
+  required MediaExportService mediaExport,
 }) async {
+  if (!context.mounted) return;
   final action = await showModalBottomSheet<String>(
     context: context,
     builder: (sheetContext) => SafeArea(
@@ -3080,29 +3142,65 @@ Future<void> _showMediaActions(
   );
   if (action == null || !context.mounted) return;
 
-  final File file;
   try {
-    file = await MediaCacheService.fileFor(url);
+    final uri = Uri.parse(url);
+    Future<bool> confirm(MediaDownloadInfo info) =>
+        _confirmMediaDownload(context, info);
+
+    if (action == 'share') {
+      await mediaExport.shareRemote(uri, confirmAfterHeaders: confirm);
+      if (!context.mounted) return;
+      return;
+    }
+
+    final error = await mediaExport.saveRemote(
+      uri,
+      isVideo: isVideo,
+      confirmAfterHeaders: confirm,
+    );
+    if (!context.mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(error ?? 'Saved to Photos')));
+  } on MediaDownloadDeclinedException {
+    return;
   } catch (e) {
     if (context.mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not load media: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not load media: $e')));
     }
-    return;
   }
-  if (!context.mounted) return;
+}
 
-  if (action == 'share') {
-    await MediaExportService.share(file);
-    return;
-  }
-  final error = await MediaExportService.saveToGallery(file, isVideo: isVideo);
-  if (context.mounted) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(error ?? 'Saved to Photos')),
-    );
-  }
+Future<bool> _confirmMediaDownload(
+  BuildContext context,
+  MediaDownloadInfo info,
+) async {
+  if (!context.mounted) return false;
+  final declaredBytes = info.declaredBytes;
+  final description = declaredBytes == null
+      ? 'The download size is unknown.'
+      : 'This download is ${(declaredBytes / (1024 * 1024)).toStringAsFixed(1)} MiB.';
+  final accepted = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) => AlertDialog(
+      title: const Text('Download media?'),
+      content: Text('$description Continue?'),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogContext, false),
+          child: const Text('Cancel'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogContext, true),
+          child: const Text('Download'),
+        ),
+      ],
+    ),
+  );
+  if (!context.mounted) return false;
+  return accepted ?? false;
 }
 
 /// Small overlay button for [_showMediaActions], shared by _ImageBubble and
@@ -3138,7 +3236,14 @@ class _MediaActionButton extends StatelessWidget {
 /// the whole transcript into repeated decode churn while scrolling.
 class _ImageBubble extends StatefulWidget {
   final String url;
-  const _ImageBubble({required this.url, super.key});
+  final MediaCachePort mediaCache;
+  final MediaExportService mediaExport;
+  const _ImageBubble({
+    required this.url,
+    required this.mediaCache,
+    required this.mediaExport,
+    super.key,
+  });
 
   @override
   State<_ImageBubble> createState() => _ImageBubbleState();
@@ -3148,7 +3253,7 @@ class _ImageBubbleState extends State<_ImageBubble> {
   // Built once, not in build(): a fresh Future per rebuild makes FutureBuilder
   // resubscribe and drop back to `waiting`, which flickers the image to a
   // spinner on every streaming-token flush.
-  Future<File>? _fileFuture;
+  Future<File?>? _fileFuture;
 
   @override
   void initState() {
@@ -3159,11 +3264,14 @@ class _ImageBubbleState extends State<_ImageBubble> {
   @override
   void didUpdateWidget(_ImageBubble oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (oldWidget.url != widget.url) _resolve();
+    if (oldWidget.url != widget.url ||
+        !identical(oldWidget.mediaCache, widget.mediaCache)) {
+      _resolve();
+    }
   }
 
   void _resolve() {
-    _fileFuture = MediaCacheService.fileFor(widget.url);
+    _fileFuture = widget.mediaCache.cache(Uri.parse(widget.url));
   }
 
   @override
@@ -3182,7 +3290,7 @@ class _ImageBubbleState extends State<_ImageBubble> {
         borderRadius: BorderRadius.circular(18),
         color: Theme.of(context).colorScheme.surfaceContainerHighest,
       ),
-      child: FutureBuilder<File>(
+      child: FutureBuilder<File?>(
         future: _fileFuture,
         builder: (context, snapshot) {
           if (snapshot.connectionState != ConnectionState.done) {
@@ -3226,8 +3334,12 @@ class _ImageBubbleState extends State<_ImageBubble> {
                 top: 4,
                 right: 4,
                 child: _MediaActionButton(
-                  onPressed: () =>
-                      _showMediaActions(context, widget.url, isVideo: false),
+                  onPressed: () => _showMediaActions(
+                    context,
+                    widget.url,
+                    isVideo: false,
+                    mediaExport: widget.mediaExport,
+                  ),
                 ),
               ),
             ],
@@ -3244,9 +3356,7 @@ class _ImageBubbleState extends State<_ImageBubble> {
           backgroundColor: Colors.black,
           appBar: AppBar(backgroundColor: Colors.black),
           body: SafeArea(
-            child: Center(
-              child: InteractiveViewer(child: Image.file(file)),
-            ),
+            child: Center(child: InteractiveViewer(child: Image.file(file))),
           ),
         ),
       ),
@@ -3264,7 +3374,8 @@ class _ImageBubbleState extends State<_ImageBubble> {
 /// ComfyUI/WAN clips.
 class _VideoBubble extends StatefulWidget {
   final String url;
-  const _VideoBubble({required this.url, super.key});
+  final MediaExportService mediaExport;
+  const _VideoBubble({required this.url, required this.mediaExport, super.key});
 
   @override
   State<_VideoBubble> createState() => _VideoBubbleState();
@@ -3307,8 +3418,8 @@ class _VideoBubbleState extends State<_VideoBubble> {
   // ComfyUI/WAN clips carry no audio track either, mpv selected no tracks at
   // all ("No video or audio streams selected"), leaving width/height null and
   // the bubble permanently black behind its play button.
-  late final Player _player;
-  late final VideoController _videoController;
+  Player? _player;
+  VideoController? _videoController;
   bool _ready = false;
   bool _failed = false;
   bool _playing = false;
@@ -3324,23 +3435,35 @@ class _VideoBubbleState extends State<_VideoBubble> {
   @override
   void initState() {
     super.initState();
+    try {
     // Must happen before the first Player is constructed.
     ensureMediaKitInitialized();
-    _player = Player();
+      final player = Player();
+      _player = player;
     // Attach the controller before _openSource() below: this is what sets
     // `--vid=auto`, and Player.open() awaits an attached controller's
     // initialization, so the media is opened with video decoding enabled.
-    _videoController = VideoController(_player);
+      _videoController = VideoController(player);
+    } catch (e) {
+      debugPrint('[media_kit] video initialization failed: $e');
+      _failed = true;
+      return;
+    }
+    final player = _player!;
     // Surface real decode/open failures instead of silently spinning forever.
-    _subs.add(_player.stream.error.listen((e) {
+    _subs.add(
+      player.stream.error.listen((e) {
       debugPrint('[media_kit] video error for ${widget.url}: $e');
       if (mounted) setState(() => _failed = true);
-    }));
-    _subs.add(_player.stream.playing.listen((p) {
+      }),
+    );
+    _subs.add(
+      player.stream.playing.listen((p) {
       if (mounted) setState(() => _playing = p);
-    }));
-    _subs.add(_player.stream.width.listen((_) => _updateAspect()));
-    _subs.add(_player.stream.height.listen((_) => _updateAspect()));
+      }),
+    );
+    _subs.add(player.stream.width.listen((_) => _updateAspect()));
+    _subs.add(player.stream.height.listen((_) => _updateAspect()));
     _openSource();
   }
 
@@ -3357,6 +3480,8 @@ class _VideoBubbleState extends State<_VideoBubble> {
   }
 
   Future<void> _openSource() async {
+    final player = _player;
+    if (player == null || _videoController == null) return;
     final epoch = ++_openEpoch;
     if (_ready || _failed) {
       setState(() {
@@ -3366,25 +3491,13 @@ class _VideoBubbleState extends State<_VideoBubble> {
       });
     }
     try {
-      // Resolve through the disk cache first so a re-opened chat plays from
-      // a local file instead of re-fetching the same clip from the LAN
-      // gateway every time. A cache-fetch failure (offline, file gone)
-      // falls back to the direct URL — media_kit can still stream it live.
-      String source = widget.url;
-      try {
-        final file = await MediaCacheService.fileFor(widget.url);
-        source = file.path;
-      } catch (e) {
-        debugPrint('[media_kit] cache fetch failed for ${widget.url}: $e');
-      }
-      if (!mounted || epoch != _openEpoch) return;
-      final platform = _player.platform;
+      final platform = player.platform;
       if (platform is NativePlayer) {
         await platform.setProperty('cache-dir', await _mpvCacheDir());
       }
       if (!mounted || epoch != _openEpoch) return;
       // Open paused so multiple clips in a transcript don't all autoplay.
-      await _player.open(Media(source), play: false);
+      await player.open(Media(widget.url), play: false);
       if (!mounted || epoch != _openEpoch) return;
       setState(() => _ready = true);
     } catch (e) {
@@ -3394,8 +3507,10 @@ class _VideoBubbleState extends State<_VideoBubble> {
   }
 
   void _updateAspect() {
-    final w = _player.state.width;
-    final h = _player.state.height;
+    final player = _player;
+    if (player == null) return;
+    final w = player.state.width;
+    final h = player.state.height;
     if (w != null && h != null && w > 0 && h > 0) {
       final next = w / h;
       if (next != _aspect && mounted) setState(() => _aspect = next);
@@ -3403,7 +3518,9 @@ class _VideoBubbleState extends State<_VideoBubble> {
   }
 
   void _togglePlay() {
-    _playing ? _player.pause() : _player.play();
+    final player = _player;
+    if (player == null) return;
+    _playing ? player.pause() : player.play();
   }
 
   @override
@@ -3411,19 +3528,24 @@ class _VideoBubbleState extends State<_VideoBubble> {
     for (final s in _subs) {
       s.cancel();
     }
-    _player.dispose();
+    _player?.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
     final maxW = MediaQuery.of(context).size.width - 80;
+    final player = _player;
+    final videoController = _videoController;
     Widget body;
-    if (_failed) {
+    if (_failed || player == null || videoController == null) {
       body = const SizedBox(
         height: 100,
         child: Center(
-          child: Text('video unavailable', style: TextStyle(color: Colors.grey)),
+          child: Text(
+            'video unavailable',
+            style: TextStyle(color: Colors.grey),
+          ),
         ),
       );
     } else if (!_ready) {
@@ -3440,7 +3562,7 @@ class _VideoBubbleState extends State<_VideoBubble> {
             AspectRatio(
               aspectRatio: _aspect,
               child: Video(
-                controller: _videoController,
+                controller: videoController,
                 controls: NoVideoControls,
               ),
             ),
@@ -3462,14 +3584,18 @@ class _VideoBubbleState extends State<_VideoBubble> {
               left: 0,
               right: 0,
               bottom: 0,
-              child: _VideoProgressBar(player: _player),
+              child: _VideoProgressBar(player: player),
             ),
             Positioned(
               top: 4,
               right: 4,
               child: _MediaActionButton(
-                onPressed: () =>
-                    _showMediaActions(context, widget.url, isVideo: true),
+                onPressed: () => _showMediaActions(
+                  context,
+                  widget.url,
+                  isVideo: true,
+                  mediaExport: widget.mediaExport,
+                ),
               ),
             ),
           ],

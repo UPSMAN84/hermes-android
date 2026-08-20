@@ -5,14 +5,37 @@
 // CachedMediaThumbnail's disk-cache lookup fails in a test (no path_provider),
 // which is fine — it renders its broken-image state and the tile is still
 // there to press.
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/screens/media_gallery_screen.dart';
+import 'package:hermes_android/core/services/media_cache_service.dart';
+import 'package:hermes_android/core/widgets/cached_media_thumbnail.dart';
 
 const _base = 'http://comfy:8188';
 
-Map<String, dynamic> _tool(String content) =>
-    {'role': 'tool', 'content': content};
+class _ControlledMediaCache implements MediaCachePort {
+  final completer = Completer<File?>();
+  final List<Uri> uris = [];
+  final List<Map<String, String>> headers = [];
+
+  @override
+  Future<File?> cache(Uri uri, {Map<String, String> headers = const {}}) {
+    uris.add(uri);
+    this.headers.add(Map<String, String>.of(headers));
+    return completer.future;
+  }
+
+  @override
+  Future<void> remove(Uri uri) async {}
+}
+
+Map<String, dynamic> _tool(String content) => {
+  'role': 'tool',
+  'content': content,
+};
 
 Map<String, dynamic> _userWithImage(String dataUrl) => {
       'role': 'user',
@@ -31,24 +54,24 @@ Future<Map<String, dynamic>?> _openAndLongPress(
   String? longPressUrl,
 }) async {
   Map<String, dynamic>? popped;
-  await tester.pumpWidget(MaterialApp(
+  await tester.pumpWidget(
+    MaterialApp(
     home: Builder(
       builder: (context) => ElevatedButton(
         onPressed: () async {
           popped = await Navigator.push<Map<String, dynamic>>(
             context,
             MaterialPageRoute(
-              builder: (_) => MediaGalleryScreen(
-                messages: messages,
-                comfyBaseUrl: _base,
-              ),
+                builder: (_) =>
+                    MediaGalleryScreen(messages: messages, comfyBaseUrl: _base),
             ),
           );
         },
         child: const Text('open'),
       ),
     ),
-  ));
+    ),
+  );
   await tester.tap(find.text('open'));
   // Bounded pumps rather than pumpAndSettle: the thumbnails sit on a
   // CircularProgressIndicator (their disk-cache lookup never resolves without
@@ -68,8 +91,36 @@ Future<Map<String, dynamic>?> _openAndLongPress(
 }
 
 void main() {
-  testWidgets('counts each generated image once, however often it is named',
-      (tester) async {
+  testWidgets('ignores a cache completion after the thumbnail is disposed', (
+    tester,
+  ) async {
+    final cache = _ControlledMediaCache();
+
+    await tester.pumpWidget(
+      CachedMediaThumbnail(
+        url: 'http://comfy:8188/view?filename=still.png&type=output',
+        headers: const {'Authorization': 'Bearer test'},
+        mediaCache: cache,
+      ),
+    );
+
+    expect(cache.uris, [
+      Uri.parse('http://comfy:8188/view?filename=still.png&type=output'),
+    ]);
+    expect(cache.headers, [
+      {'Authorization': 'Bearer test'},
+    ]);
+
+    await tester.pumpWidget(const SizedBox());
+    cache.completer.complete(null);
+    await tester.pump();
+
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('counts each generated image once, however often it is named', (
+    tester,
+  ) async {
     // A filename can resurface in later tool output (a post-render directory
     // listing, say) without being a second picture.
     await _openAndLongPress(tester, [
@@ -97,24 +148,25 @@ void main() {
     expect(find.text('Images (2)'), findsOneWidget);
   });
 
-  testWidgets('long-pressing a tile pops the message that produced it',
-      (tester) async {
+  testWidgets('long-pressing a tile pops the message that produced it', (
+    tester,
+  ) async {
     final first = _tool(r'rendered: C:\out\TG_1.png');
     final second = _tool(r'rendered: C:\out\TG_2.png');
 
-    final popped = await _openAndLongPress(
-      tester,
-      [first, second],
-      longPressUrl: '$_base/view?filename=TG_2.png&type=output',
-    );
+    final popped = await _openAndLongPress(tester, [
+      first,
+      second,
+    ], longPressUrl: '$_base/view?filename=TG_2.png&type=output');
 
     // Identity, not a copy — the chat screen matches on it to find the row.
     expect(popped, isNotNull);
     expect(identical(popped, second), isTrue);
   });
 
-  testWidgets('an empty gallery says so and offers nothing to press',
-      (tester) async {
+  testWidgets('an empty gallery says so and offers nothing to press', (
+    tester,
+  ) async {
     await _openAndLongPress(tester, [
       {'role': 'assistant', 'content': 'no pictures here'},
     ]);

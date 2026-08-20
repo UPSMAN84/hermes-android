@@ -1,195 +1,361 @@
-// Disk cache for ComfyUI-served media (images/videos referenced by URL from
-// tool results) so the app doesn't re-fetch the same generated file from the
-// gateway's LAN every time a chat is reopened or the gallery is revisited.
-//
-// Only network-served (http/https) URLs go through this — user-attached
-// images are `data:` URIs, already fully in-memory with no network round
-// trip, so there's nothing to cache for those.
-import 'dart:async';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
-class MediaCacheService {
-  MediaCacheService._();
+final http.Client _appMediaHttpClient = http.Client();
+final MediaDownloadPort appMediaDownloadService = DefaultMediaDownloadService(
+  httpClient: _appMediaHttpClient,
+);
 
-  /// Total on-disk budget. Generated media is regenerable and re-fetchable
-  /// from the gateway, so this is a convenience cache, not storage the user
-  /// is relying on — keep it bounded rather than growing forever.
-  static const int _maxBytes = 512 * 1024 * 1024; // 512 MB
+final class MediaDownloadLimitException implements Exception {
+  const MediaDownloadLimitException(this.limitBytes);
 
-  /// How long a cached copy is trusted before being re-fetched.
-  static const Duration _maxAge = Duration(days: 30);
+  final int limitBytes;
+}
 
-  static Directory? _dir;
-  static final http.Client _http = http.Client();
+final class MediaDownloadHttpException implements Exception {
+  const MediaDownloadHttpException(this.statusCode);
 
-  static Future<Directory> _cacheDir() async {
-    final cached = _dir;
-    if (cached != null) return cached;
-    final support = await getApplicationSupportDirectory();
-    final dir = Directory('${support.path}/media_cache');
-    if (!await dir.exists()) await dir.create(recursive: true);
-    _dir = dir;
-    return dir;
+  final int statusCode;
+}
+
+final class MediaDownloadDeclinedException implements Exception {
+  const MediaDownloadDeclinedException();
+}
+
+final class MediaDownloadInfo {
+  const MediaDownloadInfo({
+    required this.statusCode,
+    this.contentType,
+    this.declaredBytes,
+  });
+
+  final int statusCode;
+  final String? contentType;
+  final int? declaredBytes;
+}
+
+abstract interface class MediaDownloadPort {
+  Future<File> download(
+    Uri uri, {
+    required File destination,
+    required int maxBytes,
+    Map<String, String> headers = const {},
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  });
+}
+
+abstract interface class MediaCachePort {
+  Future<File?> cache(Uri uri, {Map<String, String> headers = const {}});
+
+  Future<void> remove(Uri uri);
+}
+
+final class DefaultMediaDownloadService implements MediaDownloadPort {
+  // Keep the public named httpClient parameter; storage remains private.
+  DefaultMediaDownloadService({required http.Client httpClient})
+    // ignore: prefer_initializing_formals
+    : _httpClient = httpClient;
+
+  final http.Client _httpClient;
+
+  static int _temporaryFileSequence = 0;
+
+  @override
+  Future<File> download(
+    Uri uri, {
+    required File destination,
+    required int maxBytes,
+    Map<String, String> headers = const {},
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) {
+    final copiedHeaders = Map<String, String>.of(headers);
+    return _download(
+      uri,
+      destination: destination,
+      maxBytes: maxBytes,
+      headers: copiedHeaders,
+      confirmAfterHeaders: confirmAfterHeaders,
+    );
   }
 
-  /// Stable 32-bit FNV-1a hash, as 8 hex chars. Dart's own hashCode is NOT
-  /// usable here — it is not guaranteed stable across process restarts, so a
-  /// cache keyed on it would miss (and re-download) after every app launch.
-  static String _hash(String s) {
-    var h = 0x811c9dc5;
-    for (var i = 0; i < s.length; i++) {
-      h ^= s.codeUnitAt(i);
-      h = (h * 0x01000193) & 0xFFFFFFFF;
+  Future<File> _download(
+    Uri uri, {
+    required File destination,
+    required int maxBytes,
+    required Map<String, String> headers,
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) async {
+    await destination.parent.create(recursive: true);
+    final part = _uniqueSibling(destination, 'part');
+    IOSink? sink;
+
+    try {
+      final request = http.Request('GET', uri)..headers.addAll(headers);
+      final response = await _httpClient.send(request);
+
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw MediaDownloadHttpException(response.statusCode);
+      }
+
+      final declaredBytes = response.contentLength;
+      if (declaredBytes != null && declaredBytes > maxBytes) {
+        throw MediaDownloadLimitException(maxBytes);
+      }
+
+      final confirm = confirmAfterHeaders;
+      if (confirm != null) {
+        final accepted = await confirm(
+          MediaDownloadInfo(
+            statusCode: response.statusCode,
+            contentType: response.headers['content-type'],
+            declaredBytes: declaredBytes,
+          ),
+        );
+        if (!accepted) throw const MediaDownloadDeclinedException();
+      }
+
+      sink = part.openWrite();
+      var receivedBytes = 0;
+      await for (final chunk in response.stream) {
+        receivedBytes += chunk.length;
+        if (receivedBytes > maxBytes) {
+          throw MediaDownloadLimitException(maxBytes);
+        }
+        sink.add(chunk);
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+
+      return await _promote(part, destination);
+    } catch (_) {
+      if (sink != null) {
+        try {
+          await sink.close();
+        } catch (_) {}
+      }
+      if (await part.exists()) {
+        try {
+          await part.delete();
+        } catch (_) {}
+      }
+      rethrow;
     }
-    return h.toRadixString(16).padLeft(8, '0');
   }
 
-  /// A filesystem-safe cache key for [url].
-  ///
-  /// Hashes the FULL url, not just the filename: ComfyUI view URLs vary by
-  /// host and by `type` (output/input/temp) while reusing the same filename,
-  /// so keying on filename alone collides — `?filename=x.png&type=output` and
-  /// `?filename=x.png&type=input`, or the same filename served by two
-  /// different ComfyUI hosts, would share one cache entry and serve the wrong
-  /// image. The filename is still appended for human-readable cache dirs.
-  static String _keyFor(String url) {
-    final filename = Uri.tryParse(url)?.queryParameters['filename'] ?? '';
+  static File _uniqueSibling(File destination, String suffix) {
+    final sequence = _temporaryFileSequence++;
+    final timestamp = DateTime.now().microsecondsSinceEpoch;
+    return File('${destination.path}.$timestamp.$sequence.$suffix');
+  }
+
+  static Future<File> _promote(File part, File destination) async {
+    File? old;
+    if (await destination.exists()) {
+      old = _uniqueSibling(destination, 'old');
+      await destination.rename(old.path);
+    }
+
+    try {
+      await part.rename(destination.path);
+    } catch (_) {
+      if (old != null && await old.exists()) {
+        if (await destination.exists()) await destination.delete();
+        await old.rename(destination.path);
+      }
+      rethrow;
+    }
+
+    if (old != null && await old.exists()) {
+      try {
+        await old.delete();
+      } catch (_) {}
+    }
+    return destination;
+  }
+}
+
+final class MediaCacheService implements MediaCachePort {
+  MediaCacheService({
+    required Directory root,
+    http.Client? httpClient,
+    MediaDownloadPort? downloadService,
+    this.maxImageBytes = 50 * 1024 * 1024,
+    this.maxCacheBytes = 512 * 1024 * 1024,
+    this.maxAge = const Duration(days: 30),
+    DateTime Function()? clock,
+  }) : _root = Future<Directory>.value(root),
+       _downloadService =
+           downloadService ??
+           DefaultMediaDownloadService(httpClient: httpClient ?? http.Client()),
+       _clock = clock ?? DateTime.now;
+
+  MediaCacheService._appDefault()
+    : _root = _applicationCacheRoot(),
+      maxImageBytes = 50 * 1024 * 1024,
+      maxCacheBytes = 512 * 1024 * 1024,
+      maxAge = const Duration(days: 30),
+      _downloadService = appMediaDownloadService,
+      _clock = DateTime.now;
+
+  final Future<Directory> _root;
+  final int maxImageBytes;
+  final int maxCacheBytes;
+  final Duration maxAge;
+  final MediaDownloadPort _downloadService;
+  final DateTime Function() _clock;
+  final Map<String, Future<File>> _inFlight = {};
+
+  static final MediaCacheService appDefault = MediaCacheService._appDefault();
+
+  static Future<Directory> _applicationCacheRoot() async {
+    final support = await getApplicationSupportDirectory();
+    return Directory('${support.path}${Platform.pathSeparator}media_cache');
+  }
+
+  @override
+  Future<File?> cache(Uri uri, {Map<String, String> headers = const {}}) {
+    if (_isKnownVideo(uri)) return Future<File?>.value();
+    return _coalescedCache(
+      uri,
+      headers: Map<String, String>.of(headers),
+      requireImage: true,
+    );
+  }
+
+  Future<File> _coalescedCache(
+    Uri uri, {
+    required Map<String, String> headers,
+    required bool requireImage,
+  }) {
+    final key = uri.toString();
+    final existing = _inFlight[key];
+    if (existing != null) return existing;
+
+    late final Future<File> operation;
+    operation = _cache(uri, headers: headers, requireImage: requireImage)
+        .whenComplete(() {
+          if (identical(_inFlight[key], operation)) _inFlight.remove(key);
+        });
+    _inFlight[key] = operation;
+    return operation;
+  }
+
+  Future<File> _cache(
+    Uri uri, {
+    required Map<String, String> headers,
+    required bool requireImage,
+  }) async {
+    final root = await _root;
+    await root.create(recursive: true);
+    final destination = await _fileForUri(uri);
+    final staleIsComplete = await _isComplete(destination);
+
+    if (staleIsComplete) {
+      final age = _clock().difference(await destination.lastModified());
+      if (age < maxAge) return destination;
+    }
+
+    try {
+      final downloaded = await _downloadService.download(
+        uri,
+        destination: destination,
+        maxBytes: maxImageBytes,
+        headers: headers,
+        confirmAfterHeaders: requireImage
+            ? (info) async {
+                final type = info.contentType?.toLowerCase();
+                return type == null || type.startsWith('image/');
+    }
+            : null,
+      );
+    await _evictIfNeeded();
+      return downloaded;
+    } catch (_) {
+      if (staleIsComplete && await _isComplete(destination)) {
+        return destination;
+      }
+      rethrow;
+    }
+  }
+
+  @override
+  Future<void> remove(Uri uri) async {
+    final active = _inFlight[uri.toString()];
+    if (active != null) {
+      try {
+        await active;
+      } catch (_) {}
+    }
+
+    final file = await _fileForUri(uri);
+    if (await file.exists()) await file.delete();
+  }
+
+  Future<File> _fileForUri(Uri uri) async {
+    final root = await _root;
+    return File('${root.path}${Platform.pathSeparator}${_keyFor(uri)}');
+  }
+
+  static bool _isKnownVideo(Uri uri) {
+    const videoPattern = r'\.(mp4|webm|mkv|mov)$';
+    final queryFilename = uri.queryParameters['filename'];
+    return RegExp(videoPattern, caseSensitive: false).hasMatch(uri.path) ||
+        (queryFilename != null &&
+            RegExp(videoPattern, caseSensitive: false).hasMatch(queryFilename));
+  }
+
+  static Future<bool> _isComplete(File file) async =>
+      await file.exists() && await file.length() > 0;
+
+  static String _keyFor(Uri uri) {
+    final url = uri.toString();
+    final filename = uri.queryParameters['filename'] ?? '';
     final safeName = filename.replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
-    // Cap the readable half so the total stays well under the 255-byte
-    // per-component filesystem limit.
-    final suffix = safeName.isEmpty
-        ? ''
-        : '_${safeName.substring(0, safeName.length.clamp(0, 100))}';
+    final readable = safeName.length > 100
+        ? safeName.substring(0, 100)
+        : safeName;
+    final suffix = readable.isEmpty ? '' : '_$readable';
     return '${_hash(url)}$suffix';
   }
 
-  /// In-flight fetches, keyed by cache key. Two widgets referencing the same
-  /// URL (a thumbnail and its full view, a clip appearing twice in one
-  /// transcript) can both call [fileFor] before either has written to disk;
-  /// without this, both pass the exists()-check-miss above and both write to
-  /// the identical `<key>.tmp` path concurrently, racing each other's write
-  /// and rename. Coalescing to one shared Future makes every concurrent
-  /// caller for the same URL await a single fetch instead.
-  static final Map<String, Future<File>> _inflight = {};
-
-  /// Returns a local [File] holding [url]'s bytes — served from disk if
-  /// already downloaded, fetched and saved otherwise. Throws on a network
-  /// failure with nothing cached yet (callers show their own error state).
-  ///
-  /// [headers] carries auth for sources that need it (gateway character
-  /// images are behind the same Bearer token as every other API route;
-  /// ComfyUI's /view is not). Headers are NOT part of the cache key — the
-  /// same URL is the same bytes regardless of who asked.
-  static Future<File> fileFor(String url, {Map<String, String>? headers}) {
-    final key = _keyFor(url);
-    final existing = _inflight[key];
-    if (existing != null) return existing;
-    final future = _fetch(url, key, headers);
-    _inflight[key] = future;
-    future.whenComplete(() => _inflight.remove(key));
-    return future;
+  static String _hash(String value) {
+    var hash = 0x811c9dc5;
+    for (final unit in value.codeUnits) {
+      hash ^= unit;
+      hash = (hash * 0x01000193) & 0xffffffff;
+    }
+    return hash.toRadixString(16).padLeft(8, '0');
   }
 
-  static Future<File> _fetch(
-    String url,
-    String key,
-    Map<String, String>? headers,
-  ) async {
-    final dir = await _cacheDir();
-    final file = File('${dir.path}/$key');
-    if (await file.exists() && await file.length() > 0) {
-      // Bound staleness: ComfyUI's output counters (TG_00084_.png) restart
-      // when its output dir is cleared, so a reused filename would otherwise
-      // serve the old image from cache forever. Past the TTL, re-fetch.
-      final age = DateTime.now().difference(await file.lastModified());
-      if (age < _maxAge) return file;
-    }
-
-    final res = await _http.get(Uri.parse(url), headers: headers);
-    if (res.statusCode < 200 || res.statusCode >= 300) {
-      // A stale-but-present copy beats showing a broken image when the
-      // server is unreachable or the file is gone upstream.
-      if (await file.exists() && await file.length() > 0) return file;
-      throw Exception('HTTP ${res.statusCode} fetching $url');
-    }
-    // Write to a temp file first and rename — an interrupted write (app
-    // killed mid-download) must not leave a zero/partial-byte file that
-    // the exists()+length()>0 check above would then treat as cached.
-    final tmp = File('${file.path}.tmp');
-    await tmp.writeAsBytes(res.bodyBytes, flush: true);
-    await tmp.rename(file.path);
-    unawaited(_noteWrite(res.bodyBytes.length));
-    return file;
-  }
-
-  /// Running total of the cache directory, so the common case costs nothing.
-  ///
-  /// Eviction used to stat EVERY file in a directory allowed to reach 512MB
-  /// after every single download, just to discover it was under budget. Now
-  /// the total is tracked in memory and the directory is only walked when we
-  /// believe we are actually over. Null means "not yet established", which is
-  /// true once per process.
-  static int? _totalBytes;
-
-  static Future<void> _noteWrite(int bytes) async {
-    final known = _totalBytes;
-    if (known != null) {
-      _totalBytes = known + bytes;
-      if (_totalBytes! <= _maxBytes) return;
-    }
-    await _evictIfNeeded();
-  }
-
-  /// Trims the cache to [_maxBytes], oldest-first. Runs opportunistically
-  /// after a write (fire-and-forget — never blocks rendering) and is
-  /// self-guarded so concurrent writes can't run it twice at once.
-  static bool _evicting = false;
-
-  static Future<void> _evictIfNeeded() async {
-    if (_evicting) return;
-    _evicting = true;
+  Future<void> _evictIfNeeded() async {
     try {
-      final dir = await _cacheDir();
+      final root = await _root;
       final entries = <({File file, DateTime modified, int size})>[];
-      var total = 0;
-      await for (final entity in dir.list()) {
-        if (entity is! File) continue;
+      var totalBytes = 0;
+      await for (final entity in root.list()) {
+        if (entity is! File ||
+            entity.path.endsWith('.part') ||
+            entity.path.endsWith('.old')) {
+          continue;
+        }
         try {
           final stat = await entity.stat();
-          entries.add((
-            file: entity,
-            modified: stat.modified,
-            size: stat.size,
-          ));
-          total += stat.size;
-        } catch (_) {
-          // Raced with another delete — skip it.
-        }
+          entries.add((file: entity, modified: stat.modified, size: stat.size));
+          totalBytes += stat.size;
+        } catch (_) {}
       }
-      if (total <= _maxBytes) {
-        // Walking the directory is the only way to learn the real total, so
-        // record it while we have it.
-        _totalBytes = total;
-        return;
-      }
+
       entries.sort((a, b) => a.modified.compareTo(b.modified));
       for (final entry in entries) {
-        if (total <= _maxBytes) break;
+        if (totalBytes <= maxCacheBytes) break;
         try {
           await entry.file.delete();
-          total -= entry.size;
-        } catch (_) {
-          // Best-effort: a file in use just stays until the next pass.
-        }
-      }
-      _totalBytes = total;
-    } catch (_) {
-      // Eviction is housekeeping — never surface it to the caller.
-    } finally {
-      _evicting = false;
+          totalBytes -= entry.size;
+        } catch (_) {}
     }
+    } catch (_) {}
   }
 }
