@@ -44,6 +44,7 @@ Android client for [Hermes Agent](https://hermes-agent.nousresearch.com/) — ch
 - **Three-way theme toggle** — Dark / Light / System default.
 - **Keyboard handling** — auto-scroll on keyboard open, send action on Enter, FAB to scroll to bottom.
 - **Voice chat** — microphone dictation sends recognised speech to Hermes, with optional text-to-speech replies.
+- **ComfyUI image/video generation** — import ComfyUI workflows, generate images and video from the Create screen, browse everything generated in a global Media library, and hand a generated image straight into the chat as an attachment. See [Generate images and video with ComfyUI](#generate-images-and-video-with-comfyui).
 
 ## Screenshots
 
@@ -343,6 +344,47 @@ The Cron Jobs screen supports full CRUD:
 - **Pause/Resume** — Toggle job enabled state.
 - **Delete** — Remove a job (with confirmation).
 
+### Generate images and video with ComfyUI
+
+The Create screen talks directly to a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) server on your network — this is a separate connection from the Hermes Gateway/dashboard above, configured independently.
+
+#### 1. Configure the ComfyUI endpoint
+
+In **Settings**, enter the ComfyUI server URL (e.g. `http://192.168.1.50:8188`) and tap **Save**. **Test connection** confirms the app can reach it and reports the server's system/object info; **Open ComfyUI** opens the server's own web UI in your browser (see [Editing the node graph](#editing-the-node-graph) below).
+
+- **HTTPS is always accepted without a warning.**
+- **Plain HTTP to loopback, a LAN address (RFC1918), a Tailscale/CGNAT address (`100.64.0.0/10`), or `localhost` is accepted without a warning** — the app can prove those are private.
+- **Plain HTTP to anything else — including a Tailscale *hostname* like `foo.tailnet.ts.net`** — requires you to check an explicit acknowledgement ("This is plain HTTP to an address I cannot prove is private... I understand traffic may be visible on the network.") before it will save. A hostname can't be proven private the way a literal reserved-range address can, even if it happens to resolve to one.
+- For anything reachable off your LAN, prefer **HTTPS or a Tailscale address** over acknowledging plain HTTP.
+
+#### 2. Import a workflow
+
+ComfyUI workflows must be exported in **API format**, not the default UI format: in ComfyUI's web UI, enable **Settings → Enable Dev Mode Options**, then use **Save (API Format)** on the workflow you want to use. Import it into the app from the Create screen's **Workflows** tab via **Import workflow** (file picker) or **Paste workflow JSON** (clipboard).
+
+Every import shows a **Trust this workflow?** confirmation before anything runs — a workflow is an executable server program (arbitrary node graph), not inert data. After confirming, review and adjust the detected input bindings (prompt text, numeric ranges, file inputs, choices) before the workflow is usable for generation.
+
+#### 3. Generate
+
+Open **Create** from a chat session's navigation drawer, or **Create media** from a chat's **⋮ → More** menu (which also prefills a character's appearance into the prompt when available, without auto-sending it — the "Use character context" toggle composes it directly into the visible, editable prompt text). Pick **Image** or **Video**, choose an imported workflow, fill in the bound inputs, and tap **Generate**.
+
+Each job's card shows its live state — Draft, Submitting…, Queued, Running (with progress), Stopping…, Reconnecting…, Done, Failed, Stopped, or **Unknown — did not resubmit**. That last state means the app couldn't confirm whether ComfyUI actually accepted the prompt after a submission error — it never automatically retries a submission it isn't sure about, since ComfyUI has no way to detect a duplicate prompt. Use **Retry** deliberately once you know whether the first attempt landed.
+
+**Cancelling** a queued job just removes it from the queue. Cancelling a *running* job asks for confirmation first: **ComfyUI is a shared server, so interrupting affects whatever is currently executing there — even if another client started it.**
+
+A succeeded image job offers **Save**, **Share**, and **Discuss in chat** (video jobs offer Save/Share only). Discuss in chat downloads the generated image and attaches it to the current chat's multimodal input — exactly like picking a photo — without sending anything automatically.
+
+#### 4. The global Media library
+
+Every generated image and video the app has seen — from Create and from tool-rendered images surfaced in chat transcripts — is indexed into one global **Media** library (reachable from a chat's **⋮ → More** menu), independent of any single session. It supports All/Images/Videos filters, jumping back to the chat message a piece of media came from (when there is one), and removing an item locally — which never deletes anything from the ComfyUI server, only the app's own record and optionally its local disk cache.
+
+If ComfyUI's endpoint has changed since a piece of media was indexed, its saved snapshot is kept rather than rewritten, so older media keeps working against the server it actually came from; if the app can no longer parse that saved snapshot, the library shows the item as unavailable instead of guessing at a URL.
+
+Downloads (save/share) are capped at 2 GiB by default and prompt for confirmation above 512 MiB; cached image thumbnails are capped separately at 50 MiB. Video playback is stream-first (no full download before playback) and only one video plays at a time per screen.
+
+#### Editing the node graph
+
+The app never edits a workflow's node graph — bindings only change existing input values (prompt text, numbers, file references), not the graph's structure. For anything beyond that (adding/removing nodes, rewiring), use **Open ComfyUI** in Settings to open the server's own web UI in a desktop browser.
+
 ## Development
 
 ```bash
@@ -352,6 +394,30 @@ flutter analyze
 flutter test
 flutter run -d android
 ```
+
+### ComfyUI protocol and integration tests
+
+`flutter test` includes a VM-only protocol test that runs a real loopback HTTP/WebSocket ComfyUI stand-in (`test/comfyui_protocol_fake_server_test.dart`) — no device or real ComfyUI server needed.
+
+A device-level integration test (`integration_test/comfyui_generation_app_test.dart`) exercises the real `GenerationRepository`, ComfyUI client/socket, and Create/Media screens end to end against a similar loopback stand-in, and needs an attached device or emulator:
+
+```bash
+flutter test integration_test -d <device-id>
+```
+
+### Live verification against a real ComfyUI server
+
+`tool/run_comfyui_live_verification.ps1` is a read-mostly PowerShell script that checks a real ComfyUI server and a real Android device together: it validates connectivity and workflow node coverage, submits exactly one image prompt and one video prompt, waits for their outputs, and writes a redacted JSON evidence report (no prompts, workflow bodies, output filenames, credentials, or endpoint query strings). It never installs custom nodes/models or edits ComfyUI configuration, and never reports a gate as passed without a returned output.
+
+```powershell
+.\tool\run_comfyui_live_verification.ps1 `
+    -BaseUrl <explicit-http-or-https-uri> `
+    -ImageWorkflow <absolute-path-to-api-format-json> `
+    -VideoWorkflow <absolute-path-to-api-format-json> `
+    -DeviceId <adb-device-id>
+```
+
+If the endpoint, a workflow, or a device isn't available, that gate is recorded as not run — none of these checks are inferred from unit tests or a successful build.
 
 ## Build release APKs
 
