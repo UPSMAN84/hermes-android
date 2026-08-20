@@ -4,6 +4,8 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
+
 import '../models/character_generation_context.dart';
 import '../models/comfy_workflow.dart';
 import '../models/generation_job.dart';
@@ -16,16 +18,44 @@ abstract interface class RecordStore<T> {
   Future<void> delete(String id);
 }
 
+abstract interface class AtomicStoreFileSystem {
+  Future<Uint8List> readBytes(File file, {required int maxBytes});
+
+  Future<void> promote(File temporary, File target);
+}
+
+final class IoAtomicStoreFileSystem implements AtomicStoreFileSystem {
+  @override
+  Future<Uint8List> readBytes(File file, {required int maxBytes}) async {
+    final builder = BytesBuilder(copy: false);
+    var count = 0;
+    await for (final chunk in file.openRead()) {
+      count += chunk.length;
+      if (count > maxBytes) {
+        throw const FormatException('Record exceeds size limit');
+      }
+      builder.add(chunk);
+    }
+    return builder.takeBytes();
+  }
+
+  @override
+  Future<void> promote(File temporary, File target) =>
+      replaceFileAtomically(temp: temporary, target: target);
+}
+
 final class AtomicJsonStore {
   AtomicJsonStore({
     required this.root,
     required this.index,
     this.maxRecordBytes = 5 * 1024 * 1024,
-  });
+    AtomicStoreFileSystem? fileSystem,
+  }) : fileSystem = fileSystem ?? IoAtomicStoreFileSystem();
 
   final Directory root;
   final ComfyStorageIndex index;
   final int maxRecordBytes;
+  final AtomicStoreFileSystem fileSystem;
 
   Future<T> withRecordLock<T>(File target, Future<T> Function() action) async {
     final key = await _canonicalTargetPath(target);
@@ -34,13 +64,25 @@ final class AtomicJsonStore {
 
   Future<T> withRecordTransaction<T>(
     File primaryTarget,
-    Future<T> Function(AtomicFileTransaction transaction) action,
-  ) async {
+    Future<T> Function(AtomicFileTransaction transaction) action, {
+    Future<void> Function()? afterCommit,
+  }) async {
     await primaryTarget.parent.create(recursive: true);
-    return withRecordLock(
-      primaryTarget,
-      () => action(AtomicFileTransaction._(this)),
-    );
+    return withRecordLock(primaryTarget, () async {
+      final transaction = AtomicFileTransaction._(this);
+      try {
+        final result = await action(transaction);
+        await transaction._commit();
+        if (afterCommit != null) await afterCommit();
+        await transaction._finalize();
+        return result;
+      } catch (error, stackTrace) {
+        await transaction._rollback();
+        Error.throwWithStackTrace(error, stackTrace);
+      } finally {
+        await transaction._cleanup();
+      }
+    });
   }
 
   Future<void> writeJson(File target, Map<String, Object?> value) async {
@@ -79,18 +121,8 @@ final class AtomicJsonStore {
   Future<Uint8List> readBytes(File target) =>
       withRecordLock(target, () => _readBytesUnlocked(target));
 
-  Future<Uint8List> _readBytesUnlocked(File target) async {
-    final builder = BytesBuilder(copy: false);
-    var count = 0;
-    await for (final chunk in target.openRead()) {
-      count += chunk.length;
-      if (count > maxRecordBytes) {
-        throw const FormatException('Record exceeds size limit');
-      }
-      builder.add(chunk);
-    }
-    return builder.takeBytes();
-  }
+  Future<Uint8List> _readBytesUnlocked(File target) =>
+      fileSystem.readBytes(target, maxBytes: maxRecordBytes);
 
   Future<void> deleteFile(File target) => withRecordLock(target, () async {
     if (await target.exists()) await target.delete();
@@ -100,7 +132,7 @@ final class AtomicJsonStore {
     final temporary = File('${target.path}.${_uniqueSuffix()}.tmp');
     try {
       await temporary.writeAsBytes(bytes, flush: true);
-      await replaceFileAtomically(temp: temporary, target: target);
+      await fileSystem.promote(temporary, target);
     } finally {
       if (await temporary.exists()) await temporary.delete();
     }
@@ -127,7 +159,7 @@ final class AtomicJsonStore {
       await sink.flush();
       await sink.close();
       sink = null;
-      await replaceFileAtomically(temp: temporary, target: target);
+      await fileSystem.promote(temporary, target);
     } finally {
       await sink?.close();
       if (await temporary.exists()) await temporary.delete();
@@ -139,6 +171,10 @@ final class AtomicFileTransaction {
   AtomicFileTransaction._(this._store);
 
   final AtomicJsonStore _store;
+  final Map<String, _StagedFileMutation> _mutations = {};
+  bool _committed = false;
+  bool _finalized = false;
+  bool _rolledBack = false;
 
   Future<void> writeJson(File target, Map<String, Object?> value) async {
     final bytes = utf8.encode(jsonEncode(value));
@@ -150,27 +186,155 @@ final class AtomicFileTransaction {
       throw const FormatException('Record exceeds size limit');
     }
     await target.parent.create(recursive: true);
-    await _store._writeBytesUnlocked(target, bytes);
+    final temporary = File('${target.path}.${_uniqueSuffix()}.tmp');
+    try {
+      await temporary.writeAsBytes(bytes, flush: true);
+      await _stage(target, temporary);
+    } catch (_) {
+      if (await temporary.exists()) await temporary.delete();
+      rethrow;
+    }
   }
 
   Future<Map<String, Object?>> readJson(File target) async {
-    final decoded = jsonDecode(
-      utf8.decode(await _store._readBytesUnlocked(target)),
-    );
+    final decoded = jsonDecode(utf8.decode(await readBytes(target)));
     if (decoded is! Map) {
       throw const FormatException('Record must be a JSON object');
     }
     return decoded.map((key, value) => MapEntry(key.toString(), value));
   }
 
-  Future<Uint8List> readBytes(File target) => _store._readBytesUnlocked(target);
+  Future<Uint8List> readBytes(File target) async {
+    final key = await _canonicalTargetPath(target);
+    final staged = _mutations[key];
+    if (staged != null) {
+      final temporary = staged.temporary;
+      if (temporary == null) {
+        throw StoredRecordCorruption('Required record file is missing');
+      }
+      return _store._readBytesUnlocked(temporary);
+    }
+    if (!await target.exists()) {
+      throw StoredRecordCorruption('Required record file is missing');
+    }
+    return _store._readBytesUnlocked(target);
+  }
 
-  Future<void> copyFile(File source, File target, {required int maxBytes}) =>
-      _store._copyFileUnlocked(source, target, maxBytes: maxBytes);
+  Future<void> copyFile(
+    File source,
+    File target, {
+    required int maxBytes,
+  }) async {
+    await target.parent.create(recursive: true);
+    final temporary = File('${target.path}.${_uniqueSuffix()}.tmp');
+    IOSink? sink;
+    try {
+      sink = temporary.openWrite();
+      var count = 0;
+      await for (final chunk in source.openRead()) {
+        count += chunk.length;
+        if (count > maxBytes) {
+          throw const FormatException('File exceeds size limit');
+        }
+        sink.add(chunk);
+      }
+      await sink.flush();
+      await sink.close();
+      sink = null;
+      await _stage(target, temporary);
+    } catch (_) {
+      await sink?.close();
+      if (await temporary.exists()) await temporary.delete();
+      rethrow;
+    }
+  }
 
   Future<void> deleteFile(File target) async {
-    if (await target.exists()) await target.delete();
+    await _stage(target, null);
   }
+
+  Future<void> _stage(File target, File? temporary) async {
+    if (_committed || _finalized || _rolledBack) {
+      throw StateError('Transaction is no longer writable');
+    }
+    final key = await _canonicalTargetPath(target);
+    final previous = _mutations.remove(key);
+    if (previous?.temporary case final oldTemporary?) {
+      if (await oldTemporary.exists()) await oldTemporary.delete();
+    }
+    _mutations[key] = _StagedFileMutation(target: target, temporary: temporary);
+  }
+
+  Future<void> _commit() async {
+    if (_committed) throw StateError('Transaction already committed');
+    for (final mutation in _mutations.values) {
+      if (await mutation.target.exists()) {
+        mutation.backup = File(
+          '${mutation.target.path}.${_uniqueSuffix()}.transaction-backup',
+        );
+        await mutation.target.rename(mutation.backup!.path);
+        mutation.originalMoved = true;
+      }
+      final temporary = mutation.temporary;
+      if (temporary != null) {
+        mutation.promotionAttempted = true;
+        await _store.fileSystem.promote(temporary, mutation.target);
+      }
+    }
+    _committed = true;
+  }
+
+  Future<void> _rollback() async {
+    if (_finalized || _rolledBack) return;
+    Object? rollbackError;
+    StackTrace? rollbackStackTrace;
+    for (final mutation in _mutations.values.toList().reversed) {
+      try {
+        if (mutation.promotionAttempted && await mutation.target.exists()) {
+          await mutation.target.delete();
+        }
+        final backup = mutation.backup;
+        if (mutation.originalMoved && backup != null && await backup.exists()) {
+          if (await mutation.target.exists()) await mutation.target.delete();
+          await backup.rename(mutation.target.path);
+        }
+      } catch (error, stackTrace) {
+        rollbackError ??= error;
+        rollbackStackTrace ??= stackTrace;
+      }
+    }
+    _rolledBack = true;
+    if (rollbackError != null) {
+      Error.throwWithStackTrace(rollbackError, rollbackStackTrace!);
+    }
+  }
+
+  Future<void> _finalize() async {
+    _finalized = true;
+    for (final mutation in _mutations.values) {
+      final backup = mutation.backup;
+      if (backup != null && await backup.exists()) await backup.delete();
+    }
+  }
+
+  Future<void> _cleanup() async {
+    for (final mutation in _mutations.values) {
+      final temporary = mutation.temporary;
+      if (temporary != null && await temporary.exists()) {
+        await temporary.delete();
+      }
+    }
+  }
+}
+
+final class _StagedFileMutation {
+  _StagedFileMutation({required this.target, required this.temporary});
+
+  final File target;
+  final File? temporary;
+  File? backup;
+  bool originalMoved = false;
+  bool promotionAttempted = false;
 }
 
 Future<void> replaceFileAtomically({
@@ -203,13 +367,17 @@ Future<void> replaceFileAtomically({
 }
 
 final class ComfyStorageIndex {
-  ComfyStorageIndex({required this.root, this.maxRecordBytes = 5 * 1024 * 1024})
-    : _indexFile = File(_join(root.path, 'index.json')),
-      _mutexFile = File(_join(root.path, '.index-serialization')) {
+  ComfyStorageIndex({
+    required this.root,
+    this.maxRecordBytes = 5 * 1024 * 1024,
+    AtomicStoreFileSystem? fileSystem,
+  }) : _indexFile = File(_join(root.path, 'index.json')),
+       _mutexFile = File(_join(root.path, '.index-serialization')) {
     _atomic = AtomicJsonStore(
       root: root,
       index: this,
       maxRecordBytes: maxRecordBytes,
+      fileSystem: fileSystem,
     );
   }
 
@@ -258,6 +426,34 @@ final class ComfyStorageIndex {
     });
   }
 
+  Future<T> commitRecordMutation<T>({
+    required String collection,
+    required String id,
+    required bool presentAfterCommit,
+    required Future<T> Function(Future<void> Function() commitIndex) mutation,
+  }) async {
+    _validateCollection(collection);
+    validateRecordId(id);
+    return _atomic.withRecordLock(_mutexFile, () async {
+      final current = await _readOrRebuildUnlocked();
+      var indexCommitted = false;
+      Future<void> commitIndex() async {
+        if (indexCommitted) throw StateError('Index already committed');
+        final updated = presentAfterCommit
+            ? current.withAdded(collection, id)
+            : current.withRemoved(collection, id);
+        await _atomic.writeJson(_indexFile, updated.toJson());
+        indexCommitted = true;
+      }
+
+      final result = await mutation(commitIndex);
+      if (!indexCommitted) {
+        throw StateError('Record mutation did not commit the index');
+      }
+      return result;
+    });
+  }
+
   Future<ComfyIndexSnapshot> rebuild() =>
       _atomic.withRecordLock(_mutexFile, _rebuildUnlocked);
 
@@ -280,7 +476,8 @@ final class ComfyStorageIndex {
     if (!await _indexFile.exists()) return _rebuildUnlocked();
     try {
       return ComfyIndexSnapshot.fromJson(await _atomic.readJson(_indexFile));
-    } on Object {
+    } on Object catch (error) {
+      if (!isCorruptRecordError(error)) rethrow;
       await quarantine(_indexFile, collection: 'index');
       return _rebuildUnlocked();
     }
@@ -338,7 +535,8 @@ final class ComfyStorageIndex {
           throw const FormatException('Record ID does not match its filename');
         }
         ids.add(decodedId);
-      } on Object {
+      } on Object catch (error) {
+        if (!isCorruptRecordError(error)) rethrow;
         await quarantine(file, collection: directoryName);
       }
     }
@@ -349,11 +547,17 @@ final class ComfyStorageIndex {
   Future<String> _decodeWorkflow(File file, String id) async {
     return _atomic.withRecordTransaction(file, (transaction) async {
       final sidecar = await transaction.readJson(file);
-      await transaction.readJson(File(_join(file.parent.path, '$id.json')));
-      await transaction.readBytes(
+      final graph = await transaction.readJson(
+        File(_join(file.parent.path, '$id.json')),
+      );
+      final source = await transaction.readBytes(
         File(_join(file.parent.path, '$id.source.json')),
       );
-      final definition = ComfyWorkflowDefinition.fromJson(sidecar);
+      final definition = decodeStoredWorkflowDefinition(
+        sidecar: sidecar,
+        workingGraph: graph,
+        sourceBytes: source,
+      );
       return definition.id;
     });
   }
@@ -493,8 +697,55 @@ MediaAsset decodeStoredMediaAsset(Map<String, Object?> json) {
   return asset;
 }
 
+ComfyWorkflowDefinition decodeStoredWorkflowDefinition({
+  required Map<String, Object?> sidecar,
+  required Map<String, Object?> workingGraph,
+  required List<int> sourceBytes,
+}) {
+  final definition = ComfyWorkflowDefinition.fromJson(sidecar);
+  if (_canonicalJson(definition.workingGraph) != _canonicalJson(workingGraph)) {
+    throw StoredRecordCorruption(
+      'Workflow sidecar and working graph do not match',
+    );
+  }
+  final actualSourceHash = sha256.convert(sourceBytes).toString();
+  if (definition.sourceHash.toLowerCase() != actualSourceHash) {
+    throw StoredRecordCorruption('Workflow source hash does not match');
+  }
+  return definition;
+}
+
+final class StoredRecordCorruption implements Exception {
+  const StoredRecordCorruption(this.message);
+
+  final String message;
+
+  @override
+  String toString() => 'StoredRecordCorruption: $message';
+}
+
 bool isCorruptRecordError(Object error) =>
-    error is FormatException || error is TypeError || error is RangeError;
+    error is StoredRecordCorruption ||
+    error is FormatException ||
+    error is TypeError ||
+    error is RangeError;
+
+bool isMissingFileError(Object error) =>
+    error is FileSystemException &&
+    const {2, 3}.contains(error.osError?.errorCode);
+
+String _canonicalJson(Object? value) => jsonEncode(_canonicalizeJson(value));
+
+Object? _canonicalizeJson(Object? value) {
+  if (value is Map) {
+    final keys = value.keys.map((key) => key.toString()).toList()..sort();
+    return <String, Object?>{
+      for (final key in keys) key: _canonicalizeJson(value[key]),
+    };
+  }
+  if (value is List) return value.map(_canonicalizeJson).toList();
+  return value;
+}
 
 String _join(String first, String second, [String? third, String? fourth]) =>
     [first, second, ?third, ?fourth].join(Platform.pathSeparator);

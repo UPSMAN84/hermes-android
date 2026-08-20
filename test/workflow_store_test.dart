@@ -1,6 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:crypto/crypto.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/models/character_generation_context.dart';
 import 'package:hermes_android/core/models/comfy_workflow.dart';
@@ -103,21 +106,19 @@ void main() {
         final source = utf8.encode(
           '{\r\n  "1": {"class_type":"Known","inputs":{"text":"raw"}}\r\n}\r\n',
         );
+        final value = definition(sourceBytes: source);
         final store = WorkflowStore(root: temp);
 
-        await store.save(definition(), originalSource: source);
+        await store.save(value, originalSource: source);
 
         expect(await store.getOriginalSource('workflow-1'), source);
-        expect(
-          (await store.get('workflow-1'))!.toJson(),
-          definition().toJson(),
-        );
+        expect((await store.get('workflow-1'))!.toJson(), value.toJson());
         final directory = Directory(_join(temp.path, 'workflows'));
         expect(
           jsonDecode(
             await File(_join(directory.path, 'workflow-1.json')).readAsString(),
           ),
-          definition().workingGraph,
+          value.workingGraph,
         );
         expect(
           await File(
@@ -135,10 +136,89 @@ void main() {
                     as Map)
                 .map((key, value) => MapEntry(key.toString(), value)),
           ).toJson(),
-          definition().toJson(),
+          value.toJson(),
         );
       },
     );
+
+    test(
+      'rolls back every workflow promotion failure to the old logical record',
+      () async {
+        final oldSource = utf8.encode(validGraph);
+        final oldValue = definition(sourceBytes: oldSource);
+        await WorkflowStore(
+          root: temp,
+        ).save(oldValue, originalSource: oldSource);
+        final newSource = utf8.encode(
+          '{"2":{"class_type":"Known","inputs":{"text":"new"}}}',
+        );
+        final newValue = definition(
+          sourceBytes: newSource,
+          graph: {
+            '2': {
+              'class_type': 'Known',
+              'inputs': {'text': 'edited'},
+            },
+          },
+        );
+
+        for (final failAt in [1, 2, 3, 4]) {
+          final fileSystem = FaultInjectingAtomicStoreFileSystem(
+            failPromotionAt: failAt,
+          );
+          final failingStore = WorkflowStore(
+            root: temp,
+            fileSystem: fileSystem,
+          );
+
+          await expectLater(
+            failingStore.save(newValue, originalSource: newSource),
+            throwsA(isA<FileSystemException>()),
+            reason: 'promotion $failAt',
+          );
+
+          final reader = WorkflowStore(root: temp);
+          expect(
+            (await reader.get(oldValue.id))!.toJson(),
+            oldValue.toJson(),
+            reason: 'promotion $failAt',
+          );
+          expect(
+            await reader.getOriginalSource(oldValue.id),
+            oldSource,
+            reason: 'promotion $failAt',
+          );
+          expect(_atomicDebris(temp), isEmpty, reason: 'promotion $failAt');
+        }
+      },
+    );
+
+    test('quarantines workflow source-hash and graph mismatches', () async {
+      final store = WorkflowStore(root: temp);
+      final graphSource = utf8.encode(validGraph);
+      final graphValue = definition(
+        id: 'workflow-graph-mismatch',
+        sourceBytes: graphSource,
+      );
+      await store.save(graphValue, originalSource: graphSource);
+      await File(
+        _join(temp.path, 'workflows', '${graphValue.id}.json'),
+      ).writeAsString('{"different":true}');
+
+      expect(await store.get(graphValue.id), isNull);
+
+      final sourceValue = definition(
+        id: 'workflow-source-mismatch',
+        sourceBytes: graphSource,
+      );
+      await store.save(sourceValue, originalSource: graphSource);
+      await File(
+        _join(temp.path, 'workflows', '${sourceValue.id}.source.json'),
+      ).writeAsBytes(utf8.encode('{"tampered":true}'));
+
+      expect(await store.get(sourceValue.id), isNull);
+      expect(_quarantinedFiles(temp), hasLength(2));
+    });
 
     test(
       'rebuilds deterministically and quarantines one corrupt record',
@@ -232,6 +312,99 @@ void main() {
   });
 
   group('job store', () {
+    test('propagates operational reads but quarantines corrupt JSON', () async {
+      final value = job(id: 'job-io', state: GenerationJobState.queued);
+      final record = File(_join(temp.path, 'jobs', '${value.localId}.json'));
+      await GenerationJobStore(root: temp).save(value);
+      final failingStore = GenerationJobStore(
+        root: temp,
+        fileSystem: FaultInjectingAtomicStoreFileSystem(
+          failReadPath: record.path,
+        ),
+      );
+
+      await expectLater(
+        failingStore.get(value.localId),
+        throwsA(isA<FileSystemException>()),
+      );
+      expect(await record.exists(), isTrue);
+      expect(_quarantinedFiles(temp), isEmpty);
+
+      await record.writeAsString('{');
+      expect(await GenerationJobStore(root: temp).get(value.localId), isNull);
+      expect(await record.exists(), isFalse);
+      expect(_quarantinedFiles(temp), hasLength(1));
+    });
+
+    test('propagates index I/O errors without quarantining it', () async {
+      final store = GenerationJobStore(root: temp);
+      await store.save(job(state: GenerationJobState.queued));
+      final indexFile = File(_join(temp.path, 'index.json'));
+      final index = ComfyStorageIndex(
+        root: temp,
+        fileSystem: FaultInjectingAtomicStoreFileSystem(
+          failReadPath: indexFile.path,
+        ),
+      );
+
+      await expectLater(index.read(), throwsA(isA<FileSystemException>()));
+
+      expect(await indexFile.exists(), isTrue);
+      expect(_quarantinedFiles(temp), isEmpty);
+    });
+
+    test('propagates record I/O errors while rebuilding the index', () async {
+      final value = job(id: 'job-rebuild-io', state: GenerationJobState.queued);
+      final store = GenerationJobStore(root: temp);
+      await store.save(value);
+      final record = File(_join(temp.path, 'jobs', '${value.localId}.json'));
+      await File(_join(temp.path, 'index.json')).delete();
+      final index = ComfyStorageIndex(
+        root: temp,
+        fileSystem: FaultInjectingAtomicStoreFileSystem(
+          failReadPath: record.path,
+        ),
+      );
+
+      await expectLater(index.read(), throwsA(isA<FileSystemException>()));
+
+      expect(await record.exists(), isTrue);
+      expect(_quarantinedFiles(temp), isEmpty);
+    });
+
+    test(
+      'keeps record and index coherent during overlapping save/delete',
+      () async {
+        await ComfyStorageIndex(root: temp).read();
+        final fileSystem = FaultInjectingAtomicStoreFileSystem(
+          gateIndexPromotion: true,
+        );
+        final store = GenerationJobStore(root: temp, fileSystem: fileSystem);
+        final value = job(id: 'job-race', state: GenerationJobState.queued);
+        final record = File(_join(temp.path, 'jobs', '${value.localId}.json'));
+
+        final save = store.save(value);
+        await fileSystem.indexPromotionEntered.future;
+        final delete = store.delete(value.localId);
+        var deleteCompleted = false;
+        delete.whenComplete(() => deleteCompleted = true);
+        await Future<void>.delayed(Duration.zero);
+        await Future<void>.delayed(Duration.zero);
+
+        expect(deleteCompleted, isFalse);
+        expect(await record.exists(), isTrue);
+
+        fileSystem.releaseIndexPromotion();
+        await save;
+        await delete;
+        expect(await record.exists(), isFalse);
+        expect(
+          (await ComfyStorageIndex(root: temp).read()).jobIds,
+          isNot(contains(value.localId)),
+        );
+      },
+    );
+
     test(
       'lists every recoverable state including promptless submitting',
       () async {
@@ -354,6 +527,41 @@ void main() {
       expect(File(saved.referenceImagePath!).existsSync(), isFalse);
       expect(await source.exists(), isTrue);
     });
+
+    test('rolls back image and metadata promotion failures together', () async {
+      final oldImage = File(_join(temp.path, 'old.png'));
+      final newImage = File(_join(temp.path, 'new.png'));
+      await oldImage.writeAsBytes([1, 2, 3]);
+      await newImage.writeAsBytes([4, 5, 6]);
+      final oldValue = context(appearancePrompt: 'old appearance');
+      await CharacterGenerationContextStore(
+        root: temp,
+      ).save(oldValue, referenceImage: oldImage);
+
+      for (final failAt in [1, 2, 3]) {
+        final failingStore = CharacterGenerationContextStore(
+          root: temp,
+          fileSystem: FaultInjectingAtomicStoreFileSystem(
+            failPromotionAt: failAt,
+          ),
+        );
+        await expectLater(
+          failingStore.save(
+            context(appearancePrompt: 'new appearance'),
+            referenceImage: newImage,
+          ),
+          throwsA(isA<FileSystemException>()),
+          reason: 'promotion $failAt',
+        );
+
+        final loaded = await CharacterGenerationContextStore(
+          root: temp,
+        ).get(oldValue.sessionId);
+        expect(loaded!.appearancePrompt, 'old appearance');
+        expect(File(loaded.referenceImagePath!).readAsBytesSync(), [1, 2, 3]);
+        expect(_atomicDebris(temp), isEmpty, reason: 'promotion $failAt');
+      }
+    });
   });
 }
 
@@ -368,23 +576,36 @@ List<File> _quarantinedFiles(Directory root) {
   return quarantine.listSync(recursive: true).whereType<File>().toList();
 }
 
-ComfyWorkflowDefinition definition({String id = 'workflow-1'}) =>
-    ComfyWorkflowDefinition(
-      id: id,
-      name: 'Fixture $id',
-      kind: ComfyMediaKind.image,
-      workingGraph: {
+List<File> _atomicDebris(Directory root) => root
+    .listSync(recursive: true)
+    .whereType<File>()
+    .where(
+      (file) => file.path.contains('.tmp') || file.path.contains('.backup'),
+    )
+    .toList();
+
+ComfyWorkflowDefinition definition({
+  String id = 'workflow-1',
+  List<int>? sourceBytes,
+  Map<String, Object?>? graph,
+}) => ComfyWorkflowDefinition(
+  id: id,
+  name: 'Fixture $id',
+  kind: ComfyMediaKind.image,
+  workingGraph:
+      graph ??
+      {
         '1': {
           'class_type': 'Known',
           'inputs': {'text': id},
         },
       },
-      sourceHash: 'source-hash-$id',
-      sourceFileName: '$id.json',
-      bindings: const [],
-      createdAt: DateTime.utc(2026, 8, 20, 1),
-      updatedAt: DateTime.utc(2026, 8, 20, 2),
-    );
+  sourceHash: sha256.convert(sourceBytes ?? utf8.encode(validGraph)).toString(),
+  sourceFileName: '$id.json',
+  bindings: const [],
+  createdAt: DateTime.utc(2026, 8, 20, 1),
+  updatedAt: DateTime.utc(2026, 8, 20, 2),
+);
 
 GenerationJob job({
   String id = 'job-1',
@@ -424,11 +645,71 @@ MediaAsset asset({
   updatedAt: DateTime.utc(2026, 8, 20, 2),
 );
 
-CharacterGenerationContext context({String id = 'session-1'}) =>
-    CharacterGenerationContext(
-      sessionId: id,
-      characterName: 'Hermes',
-      appearancePrompt: 'Silver hair and a blue coat.',
-      createdAt: DateTime.utc(2026, 8, 20, 1),
-      updatedAt: DateTime.utc(2026, 8, 20, 2),
-    );
+CharacterGenerationContext context({
+  String id = 'session-1',
+  String appearancePrompt = 'Silver hair and a blue coat.',
+}) => CharacterGenerationContext(
+  sessionId: id,
+  characterName: 'Hermes',
+  appearancePrompt: appearancePrompt,
+  createdAt: DateTime.utc(2026, 8, 20, 1),
+  updatedAt: DateTime.utc(2026, 8, 20, 2),
+);
+
+final class FaultInjectingAtomicStoreFileSystem
+    implements AtomicStoreFileSystem {
+  FaultInjectingAtomicStoreFileSystem({
+    this.failPromotionAt,
+    String? failReadPath,
+    this.gateIndexPromotion = false,
+  }) : failReadPath = failReadPath == null
+           ? null
+           : _canonicalPath(failReadPath);
+
+  final int? failPromotionAt;
+  final String? failReadPath;
+  final bool gateIndexPromotion;
+  final IoAtomicStoreFileSystem _delegate = IoAtomicStoreFileSystem();
+  final Completer<void> indexPromotionEntered = Completer<void>();
+  final Completer<void> _indexPromotionRelease = Completer<void>();
+  int _promotionCount = 0;
+  bool _gated = false;
+
+  @override
+  Future<Uint8List> readBytes(File file, {required int maxBytes}) {
+    if (_canonicalPath(file.path) == failReadPath) {
+      throw FileSystemException(
+        'Injected permission failure',
+        file.path,
+        const OSError('Access denied', 5),
+      );
+    }
+    return _delegate.readBytes(file, maxBytes: maxBytes);
+  }
+
+  @override
+  Future<void> promote(File temporary, File target) async {
+    _promotionCount++;
+    if (_promotionCount == failPromotionAt) {
+      throw FileSystemException(
+        'Injected promotion failure',
+        target.path,
+        const OSError('Access denied', 5),
+      );
+    }
+    if (gateIndexPromotion &&
+        !_gated &&
+        target.path.endsWith('${Platform.pathSeparator}index.json')) {
+      _gated = true;
+      indexPromotionEntered.complete();
+      await _indexPromotionRelease.future;
+    }
+    await _delegate.promote(temporary, target);
+  }
+
+  void releaseIndexPromotion() {
+    if (!_indexPromotionRelease.isCompleted) _indexPromotionRelease.complete();
+  }
+}
+
+String _canonicalPath(String path) => File(path).absolute.path.toLowerCase();

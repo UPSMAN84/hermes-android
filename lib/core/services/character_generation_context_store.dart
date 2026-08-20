@@ -10,13 +10,20 @@ final class CharacterGenerationContextStore
     ComfyStorageIndex? index,
     this.maxRecordBytes = 5 * 1024 * 1024,
     this.maxReferenceImageBytes = 25 * 1024 * 1024,
+    AtomicStoreFileSystem? fileSystem,
   }) {
     storageIndex =
-        index ?? ComfyStorageIndex(root: root, maxRecordBytes: maxRecordBytes);
+        index ??
+        ComfyStorageIndex(
+          root: root,
+          maxRecordBytes: maxRecordBytes,
+          fileSystem: fileSystem,
+        );
     _atomic = AtomicJsonStore(
       root: root,
       index: storageIndex,
       maxRecordBytes: maxRecordBytes,
+      fileSystem: fileSystem,
     );
   }
 
@@ -65,10 +72,8 @@ final class CharacterGenerationContextStore
         return value;
       });
     } on Object catch (error) {
-      if (error is FileSystemException && !await record.exists()) return null;
-      if (!isCorruptRecordError(error) && error is! FileSystemException) {
-        rethrow;
-      }
+      if (isMissingFileError(error) && !await record.exists()) return null;
+      if (!isCorruptRecordError(error)) rethrow;
       await storageIndex.quarantine(record, collection: 'character-contexts');
       await storageIndex.removeAfterRecordDelete(
         collection: ComfyStorageIndex.contexts,
@@ -86,37 +91,39 @@ final class CharacterGenerationContextStore
     validateRecordId(value.sessionId);
     final record = _record(value.sessionId);
     final ownedImage = _referenceImage(value.sessionId);
-    final saved = await _atomic.withRecordTransaction(record, (
-      transaction,
-    ) async {
-      final CharacterGenerationContext saved;
-      if (referenceImage != null) {
-        await transaction.copyFile(
-          referenceImage,
-          ownedImage,
-          maxBytes: maxReferenceImageBytes,
-        );
-        saved = value.copyWith(referenceImagePath: ownedImage.absolute.path);
-      } else if (value.referenceImagePath != null) {
-        if (!_sameAbsolutePath(File(value.referenceImagePath!), ownedImage) ||
-            !await ownedImage.exists()) {
-          throw const FormatException('Unsafe character reference image path');
-        }
-        saved = value.copyWith(referenceImagePath: ownedImage.absolute.path);
-      } else {
-        saved = value;
-      }
-      await transaction.writeJson(record, saved.toJson());
-      if (saved.referenceImagePath == null) {
-        await transaction.deleteFile(ownedImage);
-      }
-      return saved;
-    });
-    await storageIndex.updateAfterRecordWrite(
+    return storageIndex.commitRecordMutation<CharacterGenerationContext>(
       collection: ComfyStorageIndex.contexts,
       id: value.sessionId,
+      presentAfterCommit: true,
+      mutation: (commitIndex) => _atomic.withRecordTransaction(record, (
+        transaction,
+      ) async {
+        final CharacterGenerationContext saved;
+        if (referenceImage != null) {
+          await transaction.copyFile(
+            referenceImage,
+            ownedImage,
+            maxBytes: maxReferenceImageBytes,
+          );
+          saved = value.copyWith(referenceImagePath: ownedImage.absolute.path);
+        } else if (value.referenceImagePath != null) {
+          if (!_sameAbsolutePath(File(value.referenceImagePath!), ownedImage) ||
+              !await ownedImage.exists()) {
+            throw const FormatException(
+              'Unsafe character reference image path',
+            );
+          }
+          saved = value.copyWith(referenceImagePath: ownedImage.absolute.path);
+        } else {
+          saved = value;
+        }
+        await transaction.writeJson(record, saved.toJson());
+        if (saved.referenceImagePath == null) {
+          await transaction.deleteFile(ownedImage);
+        }
+        return saved;
+      }, afterCommit: commitIndex),
     );
-    return saved;
   }
 
   @override
@@ -124,18 +131,15 @@ final class CharacterGenerationContextStore
     validateRecordId(id);
     final record = _record(id);
     final image = _referenceImage(id);
-    await _atomic.withRecordTransaction(record, (transaction) async {
-      await transaction.deleteFile(record);
-      await transaction.deleteFile(image);
-      final imageDirectory = image.parent;
-      if (await imageDirectory.exists() &&
-          await imageDirectory.list().isEmpty) {
-        await imageDirectory.delete();
-      }
-    });
-    await storageIndex.removeAfterRecordDelete(
+    await storageIndex.commitRecordMutation<void>(
       collection: ComfyStorageIndex.contexts,
       id: id,
+      presentAfterCommit: false,
+      mutation: (commitIndex) =>
+          _atomic.withRecordTransaction(record, (transaction) async {
+            await transaction.deleteFile(record);
+            await transaction.deleteFile(image);
+          }, afterCommit: commitIndex),
     );
   }
 

@@ -8,13 +8,20 @@ final class GenerationJobStore implements RecordStore<GenerationJob> {
     required this.root,
     ComfyStorageIndex? index,
     this.maxRecordBytes = 5 * 1024 * 1024,
+    AtomicStoreFileSystem? fileSystem,
   }) {
     storageIndex =
-        index ?? ComfyStorageIndex(root: root, maxRecordBytes: maxRecordBytes);
+        index ??
+        ComfyStorageIndex(
+          root: root,
+          maxRecordBytes: maxRecordBytes,
+          fileSystem: fileSystem,
+        );
     _atomic = AtomicJsonStore(
       root: root,
       index: storageIndex,
       maxRecordBytes: maxRecordBytes,
+      fileSystem: fileSystem,
     );
   }
 
@@ -60,10 +67,8 @@ final class GenerationJobStore implements RecordStore<GenerationJob> {
       }
       return value;
     } on Object catch (error) {
-      if (error is FileSystemException && !await record.exists()) return null;
-      if (!isCorruptRecordError(error) && error is! FileSystemException) {
-        rethrow;
-      }
+      if (isMissingFileError(error) && !await record.exists()) return null;
+      if (!isCorruptRecordError(error)) rethrow;
       await storageIndex.quarantine(record, collection: 'jobs');
       await storageIndex.removeAfterRecordDelete(
         collection: ComfyStorageIndex.jobs,
@@ -76,20 +81,32 @@ final class GenerationJobStore implements RecordStore<GenerationJob> {
   @override
   Future<void> save(GenerationJob value) async {
     validateRecordId(value.localId);
-    await _atomic.writeJson(_record(value.localId), value.toJson());
-    await storageIndex.updateAfterRecordWrite(
+    final record = _record(value.localId);
+    await storageIndex.commitRecordMutation<void>(
       collection: ComfyStorageIndex.jobs,
       id: value.localId,
+      presentAfterCommit: true,
+      mutation: (commitIndex) => _atomic.withRecordTransaction(
+        record,
+        (transaction) => transaction.writeJson(record, value.toJson()),
+        afterCommit: commitIndex,
+      ),
     );
   }
 
   @override
   Future<void> delete(String id) async {
     validateRecordId(id);
-    await _atomic.deleteFile(_record(id));
-    await storageIndex.removeAfterRecordDelete(
+    final record = _record(id);
+    await storageIndex.commitRecordMutation<void>(
       collection: ComfyStorageIndex.jobs,
       id: id,
+      presentAfterCommit: false,
+      mutation: (commitIndex) => _atomic.withRecordTransaction(
+        record,
+        (transaction) => transaction.deleteFile(record),
+        afterCommit: commitIndex,
+      ),
     );
   }
 

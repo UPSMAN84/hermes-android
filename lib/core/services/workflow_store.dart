@@ -10,13 +10,20 @@ final class WorkflowStore implements RecordStore<ComfyWorkflowDefinition> {
     required this.root,
     ComfyStorageIndex? index,
     this.maxRecordBytes = 5 * 1024 * 1024,
+    AtomicStoreFileSystem? fileSystem,
   }) {
     storageIndex =
-        index ?? ComfyStorageIndex(root: root, maxRecordBytes: maxRecordBytes);
+        index ??
+        ComfyStorageIndex(
+          root: root,
+          maxRecordBytes: maxRecordBytes,
+          fileSystem: fileSystem,
+        );
     _atomic = AtomicJsonStore(
       root: root,
       index: storageIndex,
       maxRecordBytes: maxRecordBytes,
+      fileSystem: fileSystem,
     );
   }
 
@@ -57,24 +64,40 @@ final class WorkflowStore implements RecordStore<ComfyWorkflowDefinition> {
     final sidecar = value.toJson();
     _checkSize(utf8.encode(jsonEncode(sidecar)));
     _checkSize(utf8.encode(jsonEncode(value.workingGraph)));
-    if (originalSource != null) _checkSize(originalSource);
+    if (originalSource != null) {
+      _checkSize(originalSource);
+      decodeStoredWorkflowDefinition(
+        sidecar: sidecar,
+        workingGraph: value.workingGraph,
+        sourceBytes: originalSource,
+      );
+    }
 
     final primary = _sidecar(value.id);
     final source = _source(value.id);
-    await _atomic.withRecordTransaction(primary, (transaction) async {
-      if (originalSource != null) {
-        await transaction.writeBytes(source, originalSource);
-      } else if (!await source.exists()) {
-        throw StateError(
-          'Original workflow source is required for a new record',
-        );
-      }
-      await transaction.writeJson(_graph(value.id), value.workingGraph);
-      await transaction.writeJson(primary, sidecar);
-    });
-    await storageIndex.updateAfterRecordWrite(
+    await storageIndex.commitRecordMutation<void>(
       collection: ComfyStorageIndex.workflows,
       id: value.id,
+      presentAfterCommit: true,
+      mutation: (commitIndex) =>
+          _atomic.withRecordTransaction(primary, (transaction) async {
+            if (originalSource != null) {
+              await transaction.writeBytes(source, originalSource);
+            } else {
+              if (!await source.exists()) {
+                throw StateError(
+                  'Original workflow source is required for a new record',
+                );
+              }
+              decodeStoredWorkflowDefinition(
+                sidecar: sidecar,
+                workingGraph: value.workingGraph,
+                sourceBytes: await transaction.readBytes(source),
+              );
+            }
+            await transaction.writeJson(_graph(value.id), value.workingGraph);
+            await transaction.writeJson(primary, sidecar);
+          }, afterCommit: commitIndex),
     );
   }
 
@@ -82,14 +105,16 @@ final class WorkflowStore implements RecordStore<ComfyWorkflowDefinition> {
   Future<void> delete(String id) async {
     validateRecordId(id);
     final primary = _sidecar(id);
-    await _atomic.withRecordTransaction(primary, (transaction) async {
-      await transaction.deleteFile(primary);
-      await transaction.deleteFile(_graph(id));
-      await transaction.deleteFile(_source(id));
-    });
-    await storageIndex.removeAfterRecordDelete(
+    await storageIndex.commitRecordMutation<void>(
       collection: ComfyStorageIndex.workflows,
       id: id,
+      presentAfterCommit: false,
+      mutation: (commitIndex) =>
+          _atomic.withRecordTransaction(primary, (transaction) async {
+            await transaction.deleteFile(primary);
+            await transaction.deleteFile(_graph(id));
+            await transaction.deleteFile(_source(id));
+          }, afterCommit: commitIndex),
     );
   }
 
@@ -110,19 +135,21 @@ final class WorkflowStore implements RecordStore<ComfyWorkflowDefinition> {
     try {
       return await _atomic.withRecordTransaction(primary, (transaction) async {
         final sidecar = await transaction.readJson(primary);
-        await transaction.readJson(_graph(id));
+        final graph = await transaction.readJson(_graph(id));
         final source = await transaction.readBytes(_source(id));
-        final definition = ComfyWorkflowDefinition.fromJson(sidecar);
+        final definition = decodeStoredWorkflowDefinition(
+          sidecar: sidecar,
+          workingGraph: graph,
+          sourceBytes: source,
+        );
         if (definition.id != id) {
           throw const FormatException('Record ID does not match its filename');
         }
         return _WorkflowRecord(definition, source);
       });
     } on Object catch (error) {
-      if (error is FileSystemException && !await primary.exists()) return null;
-      if (!isCorruptRecordError(error) && error is! FileSystemException) {
-        rethrow;
-      }
+      if (isMissingFileError(error) && !await primary.exists()) return null;
+      if (!isCorruptRecordError(error)) rethrow;
       await storageIndex.quarantine(primary, collection: 'workflows');
       await storageIndex.removeAfterRecordDelete(
         collection: ComfyStorageIndex.workflows,
