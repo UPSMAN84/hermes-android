@@ -49,25 +49,20 @@ final class CharacterGenerationContextStore
   @override
   Future<CharacterGenerationContext?> get(String id) async {
     validateRecordId(id);
+    await _atomic.recoverPendingTransactions();
     final record = _record(id);
     if (!await record.exists()) return null;
     try {
       return await _atomic.withRecordTransaction(record, (transaction) async {
-        final value = CharacterGenerationContext.fromJson(
-          await transaction.readJson(record),
+        final value = await decodeStoredCharacterContext(
+          json: await transaction.readJson(record),
+          id: id,
+          root: root,
+          transaction: transaction,
+          maxReferenceImageBytes: maxReferenceImageBytes,
         );
         if (value.sessionId != id) {
           throw const FormatException('Record ID does not match its filename');
-        }
-        final reference = value.referenceImagePath;
-        if (reference != null) {
-          final expected = _referenceImage(id);
-          if (!_sameAbsolutePath(File(reference), expected) ||
-              !await expected.exists()) {
-            throw const FormatException(
-              'Unsafe character reference image path',
-            );
-          }
         }
         return value;
       });
@@ -95,12 +90,13 @@ final class CharacterGenerationContextStore
       collection: ComfyStorageIndex.contexts,
       id: value.sessionId,
       presentAfterCommit: true,
-      mutation: (commitIndex) => _atomic.withRecordTransaction(record, (
+      mutation: (stageIndex) => _atomic.withRecordTransaction(record, (
         transaction,
       ) async {
         final CharacterGenerationContext saved;
+        String? referenceImageSha256;
         if (referenceImage != null) {
-          await transaction.copyFile(
+          referenceImageSha256 = await transaction.copyFile(
             referenceImage,
             ownedImage,
             maxBytes: maxReferenceImageBytes,
@@ -113,16 +109,24 @@ final class CharacterGenerationContextStore
               'Unsafe character reference image path',
             );
           }
+          referenceImageSha256 = await transaction.sha256File(
+            ownedImage,
+            maxBytes: maxReferenceImageBytes,
+          );
           saved = value.copyWith(referenceImagePath: ownedImage.absolute.path);
         } else {
           saved = value;
         }
-        await transaction.writeJson(record, saved.toJson());
+        await transaction.writeJson(record, {
+          ...saved.toJson(),
+          referenceImageSha256Key: ?referenceImageSha256,
+        });
         if (saved.referenceImagePath == null) {
           await transaction.deleteFile(ownedImage);
         }
+        await stageIndex(transaction);
         return saved;
-      }, afterCommit: commitIndex),
+      }),
     );
   }
 
@@ -135,11 +139,12 @@ final class CharacterGenerationContextStore
       collection: ComfyStorageIndex.contexts,
       id: id,
       presentAfterCommit: false,
-      mutation: (commitIndex) =>
+      mutation: (stageIndex) =>
           _atomic.withRecordTransaction(record, (transaction) async {
             await transaction.deleteFile(record);
             await transaction.deleteFile(image);
-          }, afterCommit: commitIndex),
+            await stageIndex(transaction);
+          }),
     );
   }
 

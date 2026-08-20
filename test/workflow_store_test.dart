@@ -193,6 +193,71 @@ void main() {
       },
     );
 
+    test(
+      'recovers abandoned workflow journals before decoding mixed files',
+      () async {
+        final oldSource = utf8.encode(validGraph);
+        final oldValue = definition(sourceBytes: oldSource);
+        await WorkflowStore(
+          root: temp,
+        ).save(oldValue, originalSource: oldSource);
+        final newSource = utf8.encode(
+          '{"2":{"class_type":"Known","inputs":{"text":"new"}}}',
+        );
+        final newValue = definition(
+          sourceBytes: newSource,
+          graph: {
+            '2': {
+              'class_type': 'Known',
+              'inputs': {'text': 'committed'},
+            },
+          },
+        );
+        final workflows = Directory(_join(temp.path, 'workflows'));
+        final index = File(_join(temp.path, 'index.json'));
+        final replacements = <File, List<int>?>{
+          File(_join(workflows.path, '${oldValue.id}.source.json')): newSource,
+          File(_join(workflows.path, '${oldValue.id}.json')): utf8.encode(
+            jsonEncode(newValue.workingGraph),
+          ),
+          File(_join(workflows.path, '${oldValue.id}.hermes.json')): utf8
+              .encode(jsonEncode(newValue.toJson())),
+          index: await index.readAsBytes(),
+        };
+
+        await _simulateAbandonedTransaction(
+          temp,
+          id: 'workflow-uncommitted',
+          replacements: replacements,
+          committed: false,
+        );
+
+        var reconstructed = WorkflowStore(root: temp);
+        expect(
+          (await reconstructed.get(oldValue.id))!.toJson(),
+          oldValue.toJson(),
+        );
+        expect(await reconstructed.getOriginalSource(oldValue.id), oldSource);
+        expect(_quarantinedFiles(temp), isEmpty);
+        expect(_transactionArtifacts(temp), isEmpty);
+
+        await _simulateAbandonedTransaction(
+          temp,
+          id: 'workflow-committed',
+          replacements: replacements,
+          committed: true,
+        );
+
+        reconstructed = WorkflowStore(root: temp);
+        expect(
+          (await reconstructed.get(newValue.id))!.toJson(),
+          newValue.toJson(),
+        );
+        expect(await reconstructed.getOriginalSource(newValue.id), newSource);
+        expect(_transactionArtifacts(temp), isEmpty);
+      },
+    );
+
     test('quarantines workflow source-hash and graph mismatches', () async {
       final store = WorkflowStore(root: temp);
       final graphSource = utf8.encode(validGraph);
@@ -406,6 +471,79 @@ void main() {
     );
 
     test(
+      'committed cleanup failures preserve save/delete consistency and recover',
+      () async {
+        final original = job(
+          id: 'job-cleanup',
+          state: GenerationJobState.queued,
+        );
+        await GenerationJobStore(root: temp).save(original);
+        final updated = job(
+          id: original.localId,
+          state: GenerationJobState.running,
+        );
+        final saveFileSystem = FaultInjectingAtomicStoreFileSystem(
+          failIndexBackupCleanup: true,
+        );
+
+        await GenerationJobStore(
+          root: temp,
+          fileSystem: saveFileSystem,
+        ).save(updated);
+
+        expect(
+          GenerationJob.fromJson(
+            _readJsonFile(
+              File(_join(temp.path, 'jobs', '${updated.localId}.json')),
+            ),
+          ).state,
+          GenerationJobState.running,
+        );
+        expect(
+          ComfyIndexSnapshot.fromJson(
+            _readJsonFile(File(_join(temp.path, 'index.json'))),
+          ).jobIds,
+          contains(updated.localId),
+        );
+        expect(_transactionArtifacts(temp), isNotEmpty);
+
+        expect(
+          (await GenerationJobStore(root: temp).get(updated.localId))!.state,
+          GenerationJobState.running,
+        );
+        expect(_transactionArtifacts(temp), isEmpty);
+
+        final deleteFileSystem = FaultInjectingAtomicStoreFileSystem(
+          failIndexBackupCleanup: true,
+        );
+        await GenerationJobStore(
+          root: temp,
+          fileSystem: deleteFileSystem,
+        ).delete(updated.localId);
+
+        expect(
+          File(
+            _join(temp.path, 'jobs', '${updated.localId}.json'),
+          ).existsSync(),
+          isFalse,
+        );
+        expect(
+          ComfyIndexSnapshot.fromJson(
+            _readJsonFile(File(_join(temp.path, 'index.json'))),
+          ).jobIds,
+          isNot(contains(updated.localId)),
+        );
+        expect(_transactionArtifacts(temp), isNotEmpty);
+
+        expect(
+          await GenerationJobStore(root: temp).get(updated.localId),
+          isNull,
+        );
+        expect(_transactionArtifacts(temp), isEmpty);
+      },
+    );
+
+    test(
       'lists every recoverable state including promptless submitting',
       () async {
         final store = GenerationJobStore(root: temp);
@@ -562,6 +700,88 @@ void main() {
         expect(_atomicDebris(temp), isEmpty, reason: 'promotion $failAt');
       }
     });
+
+    test('persists and validates reference image SHA-256 metadata', () async {
+      final source = File(_join(temp.path, 'hash-source.png'));
+      await source.writeAsBytes([1, 3, 3, 7]);
+      final store = CharacterGenerationContextStore(root: temp);
+
+      final saved = await store.save(context(), referenceImage: source);
+      final record = File(
+        _join(temp.path, 'character-contexts', '${saved.sessionId}.json'),
+      );
+      expect(
+        _readJsonFile(record)['referenceImageSha256'],
+        sha256.convert([1, 3, 3, 7]).toString(),
+      );
+
+      await File(saved.referenceImagePath!).writeAsBytes([9, 9, 9]);
+
+      expect(await store.get(saved.sessionId), isNull);
+      expect(await record.exists(), isFalse);
+      expect(_quarantinedFiles(temp), hasLength(1));
+    });
+
+    test(
+      'recovers abandoned character journals before image integrity decode',
+      () async {
+        final oldImageSource = File(_join(temp.path, 'journal-old.png'));
+        await oldImageSource.writeAsBytes([1, 2, 3]);
+        final oldValue = context(appearancePrompt: 'old appearance');
+        final store = CharacterGenerationContextStore(root: temp);
+        final oldSaved = await store.save(
+          oldValue,
+          referenceImage: oldImageSource,
+        );
+        final ownedImage = File(oldSaved.referenceImagePath!);
+        final newImageBytes = <int>[4, 5, 6];
+        final newSaved = context(
+          appearancePrompt: 'committed appearance',
+        ).copyWith(referenceImagePath: ownedImage.absolute.path);
+        final newRecord = <String, Object?>{
+          ...newSaved.toJson(),
+          'referenceImageSha256': sha256.convert(newImageBytes).toString(),
+        };
+        final record = File(
+          _join(temp.path, 'character-contexts', '${oldSaved.sessionId}.json'),
+        );
+        final index = File(_join(temp.path, 'index.json'));
+        final replacements = <File, List<int>?>{
+          ownedImage: newImageBytes,
+          record: utf8.encode(jsonEncode(newRecord)),
+          index: await index.readAsBytes(),
+        };
+
+        await _simulateAbandonedTransaction(
+          temp,
+          id: 'context-uncommitted',
+          replacements: replacements,
+          committed: false,
+        );
+
+        var reconstructed = CharacterGenerationContextStore(root: temp);
+        var loaded = await reconstructed.get(oldSaved.sessionId);
+        expect(loaded!.appearancePrompt, 'old appearance');
+        expect(await File(loaded.referenceImagePath!).readAsBytes(), [1, 2, 3]);
+        expect(_transactionArtifacts(temp), isEmpty);
+
+        await _simulateAbandonedTransaction(
+          temp,
+          id: 'context-committed',
+          replacements: replacements,
+          committed: true,
+        );
+
+        reconstructed = CharacterGenerationContextStore(root: temp);
+        loaded = await reconstructed.get(oldSaved.sessionId);
+        expect(loaded!.appearancePrompt, 'committed appearance');
+        expect(
+          await File(loaded.referenceImagePath!).readAsBytes(),
+          newImageBytes,
+        );
+        expect(_transactionArtifacts(temp), isEmpty);
+      },
+    );
   });
 }
 
@@ -580,9 +800,86 @@ List<File> _atomicDebris(Directory root) => root
     .listSync(recursive: true)
     .whereType<File>()
     .where(
-      (file) => file.path.contains('.tmp') || file.path.contains('.backup'),
+      (file) =>
+          file.path.contains('.tmp') ||
+          file.path.contains('.transaction-temp') ||
+          file.path.contains('.transaction-backup') ||
+          file.path.contains('.journal.json') ||
+          file.path.contains('.backup'),
     )
     .toList();
+
+List<FileSystemEntity> _transactionArtifacts(Directory root) {
+  final directory = Directory(_join(root.path, '.transactions'));
+  final artifacts = <FileSystemEntity>[];
+  if (directory.existsSync()) {
+    artifacts.addAll(directory.listSync(recursive: true));
+  }
+  artifacts.addAll(
+    root
+        .listSync(recursive: true)
+        .where(
+          (entity) =>
+              entity is File &&
+              (entity.path.contains('.transaction-backup') ||
+                  entity.path.contains('.transaction-temp')),
+        ),
+  );
+  return artifacts;
+}
+
+Map<String, Object?> _readJsonFile(File file) =>
+    (jsonDecode(file.readAsStringSync()) as Map).map(
+      (key, value) => MapEntry(key.toString(), value),
+    );
+
+Future<void> _simulateAbandonedTransaction(
+  Directory root, {
+  required String id,
+  required Map<File, List<int>?> replacements,
+  required bool committed,
+}) async {
+  final entries = <Map<String, Object?>>[];
+  for (final replacement in replacements.entries) {
+    final target = replacement.key;
+    final hadOriginal = await target.exists();
+    final backup = hadOriginal
+        ? File('${target.path}.$id.transaction-backup')
+        : null;
+    if (backup != null) await target.rename(backup.path);
+    final bytes = replacement.value;
+    if (bytes != null) {
+      await target.parent.create(recursive: true);
+      await target.writeAsBytes(bytes, flush: true);
+    }
+    entries.add({
+      'target': _relativeStoragePath(root, target),
+      'temporary': _relativeStoragePath(
+        root,
+        File('${target.path}.$id.transaction-temp'),
+      ),
+      'backup': backup == null ? null : _relativeStoragePath(root, backup),
+      'hadOriginal': hadOriginal,
+    });
+  }
+  final directory = Directory(_join(root.path, '.transactions'));
+  await directory.create(recursive: true);
+  final journal = File(_join(directory.path, '$id.journal.json'));
+  await journal.writeAsString(
+    jsonEncode({'schemaVersion': 1, 'transactionId': id, 'entries': entries}),
+    flush: true,
+  );
+  if (committed) {
+    await File('${journal.path}.committed').writeAsString(id, flush: true);
+  }
+}
+
+String _relativeStoragePath(Directory root, File file) {
+  final rootPath = root.absolute.path;
+  return file.absolute.path
+      .substring(rootPath.length + 1)
+      .replaceAll(Platform.pathSeparator, '/');
+}
 
 ComfyWorkflowDefinition definition({
   String id = 'workflow-1',
@@ -662,6 +959,7 @@ final class FaultInjectingAtomicStoreFileSystem
     this.failPromotionAt,
     String? failReadPath,
     this.gateIndexPromotion = false,
+    this.failIndexBackupCleanup = false,
   }) : failReadPath = failReadPath == null
            ? null
            : _canonicalPath(failReadPath);
@@ -669,11 +967,13 @@ final class FaultInjectingAtomicStoreFileSystem
   final int? failPromotionAt;
   final String? failReadPath;
   final bool gateIndexPromotion;
+  final bool failIndexBackupCleanup;
   final IoAtomicStoreFileSystem _delegate = IoAtomicStoreFileSystem();
   final Completer<void> indexPromotionEntered = Completer<void>();
   final Completer<void> _indexPromotionRelease = Completer<void>();
   int _promotionCount = 0;
   bool _gated = false;
+  bool _backupCleanupFailed = false;
 
   @override
   Future<Uint8List> readBytes(File file, {required int maxBytes}) {
@@ -705,6 +1005,22 @@ final class FaultInjectingAtomicStoreFileSystem
       await _indexPromotionRelease.future;
     }
     await _delegate.promote(temporary, target);
+  }
+
+  @override
+  Future<void> delete(File file) {
+    if (failIndexBackupCleanup &&
+        !_backupCleanupFailed &&
+        file.path.contains('index.json') &&
+        file.path.contains('.transaction-backup')) {
+      _backupCleanupFailed = true;
+      throw FileSystemException(
+        'Injected post-replacement cleanup failure',
+        file.path,
+        const OSError('Access denied', 5),
+      );
+    }
+    return _delegate.delete(file);
   }
 
   void releaseIndexPromotion() {

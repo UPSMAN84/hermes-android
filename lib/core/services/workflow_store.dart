@@ -79,7 +79,7 @@ final class WorkflowStore implements RecordStore<ComfyWorkflowDefinition> {
       collection: ComfyStorageIndex.workflows,
       id: value.id,
       presentAfterCommit: true,
-      mutation: (commitIndex) =>
+      mutation: (stageIndex) =>
           _atomic.withRecordTransaction(primary, (transaction) async {
             if (originalSource != null) {
               await transaction.writeBytes(source, originalSource);
@@ -97,7 +97,8 @@ final class WorkflowStore implements RecordStore<ComfyWorkflowDefinition> {
             }
             await transaction.writeJson(_graph(value.id), value.workingGraph);
             await transaction.writeJson(primary, sidecar);
-          }, afterCommit: commitIndex),
+            await stageIndex(transaction);
+          }),
     );
   }
 
@@ -109,12 +110,13 @@ final class WorkflowStore implements RecordStore<ComfyWorkflowDefinition> {
       collection: ComfyStorageIndex.workflows,
       id: id,
       presentAfterCommit: false,
-      mutation: (commitIndex) =>
+      mutation: (stageIndex) =>
           _atomic.withRecordTransaction(primary, (transaction) async {
             await transaction.deleteFile(primary);
             await transaction.deleteFile(_graph(id));
             await transaction.deleteFile(_source(id));
-          }, afterCommit: commitIndex),
+            await stageIndex(transaction);
+          }),
     );
   }
 
@@ -130,6 +132,7 @@ final class WorkflowStore implements RecordStore<ComfyWorkflowDefinition> {
 
   Future<_WorkflowRecord?> _load(String id) async {
     validateRecordId(id);
+    await _atomic.recoverPendingTransactions();
     final primary = _sidecar(id);
     if (!await primary.exists()) return null;
     try {

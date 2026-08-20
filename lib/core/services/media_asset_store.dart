@@ -46,6 +46,7 @@ final class MediaAssetStore implements RecordStore<MediaAsset> {
   @override
   Future<MediaAsset?> get(String id) async {
     validateRecordId(id);
+    await _atomic.recoverPendingTransactions();
     final record = _record(id);
     if (!await record.exists()) return null;
     try {
@@ -75,11 +76,11 @@ final class MediaAssetStore implements RecordStore<MediaAsset> {
       collection: ComfyStorageIndex.media,
       id: value.id,
       presentAfterCommit: true,
-      mutation: (commitIndex) => _atomic.withRecordTransaction(
-        record,
-        (transaction) => transaction.writeJson(record, value.toJson()),
-        afterCommit: commitIndex,
-      ),
+      mutation: (stageIndex) =>
+          _atomic.withRecordTransaction(record, (transaction) async {
+            await transaction.writeJson(record, value.toJson());
+            await stageIndex(transaction);
+          }),
     );
   }
 
@@ -111,11 +112,11 @@ final class MediaAssetStore implements RecordStore<MediaAsset> {
       collection: ComfyStorageIndex.media,
       id: id,
       presentAfterCommit: false,
-      mutation: (commitIndex) => _atomic.withRecordTransaction(
-        record,
-        (transaction) => transaction.deleteFile(record),
-        afterCommit: commitIndex,
-      ),
+      mutation: (stageIndex) =>
+          _atomic.withRecordTransaction(record, (transaction) async {
+            await transaction.deleteFile(record);
+            await stageIndex(transaction);
+          }),
     );
   }
 

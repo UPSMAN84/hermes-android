@@ -58,6 +58,7 @@ final class GenerationJobStore implements RecordStore<GenerationJob> {
   @override
   Future<GenerationJob?> get(String id) async {
     validateRecordId(id);
+    await _atomic.recoverPendingTransactions();
     final record = _record(id);
     if (!await record.exists()) return null;
     try {
@@ -86,11 +87,11 @@ final class GenerationJobStore implements RecordStore<GenerationJob> {
       collection: ComfyStorageIndex.jobs,
       id: value.localId,
       presentAfterCommit: true,
-      mutation: (commitIndex) => _atomic.withRecordTransaction(
-        record,
-        (transaction) => transaction.writeJson(record, value.toJson()),
-        afterCommit: commitIndex,
-      ),
+      mutation: (stageIndex) =>
+          _atomic.withRecordTransaction(record, (transaction) async {
+            await transaction.writeJson(record, value.toJson());
+            await stageIndex(transaction);
+          }),
     );
   }
 
@@ -102,11 +103,11 @@ final class GenerationJobStore implements RecordStore<GenerationJob> {
       collection: ComfyStorageIndex.jobs,
       id: id,
       presentAfterCommit: false,
-      mutation: (commitIndex) => _atomic.withRecordTransaction(
-        record,
-        (transaction) => transaction.deleteFile(record),
-        afterCommit: commitIndex,
-      ),
+      mutation: (stageIndex) =>
+          _atomic.withRecordTransaction(record, (transaction) async {
+            await transaction.deleteFile(record);
+            await stageIndex(transaction);
+          }),
     );
   }
 
