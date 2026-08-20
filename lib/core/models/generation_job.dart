@@ -1,4 +1,6 @@
 import 'dart:collection';
+import 'dart:io';
+import 'dart:typed_data';
 
 import 'comfy_workflow.dart';
 
@@ -16,6 +18,17 @@ enum GenerationJobState {
 }
 
 final class GenerationRequest {
+  /// [submittedValues] must never contain a [File] or raw binary bytes -- it
+  /// is persisted verbatim onto the created [GenerationJob] record. Reference
+  /// images (a file bound to a `file`-typed binding, keyed by binding id) are
+  /// supplied out of band through [referenceImages] instead; the repository
+  /// uploads them and substitutes the server-returned filename -- a plain
+  /// string -- before the value is ever persisted.
+  ///
+  /// [useCharacterContext] is explicit rather than inferred from
+  /// [sourceContextId] alone: a request can carry a context id for
+  /// provenance (so the job/media record can link back to the character)
+  /// without asking the repository to prefix the prompt or attach the avatar.
   GenerationRequest({
     required this.workflowId,
     required this.kind,
@@ -23,7 +36,10 @@ final class GenerationRequest {
     this.sourceSessionId,
     this.sourceMessageId,
     this.sourceContextId,
-  }) : submittedValues = _immutableObject(submittedValues);
+    this.useCharacterContext = false,
+    Map<String, File> referenceImages = const {},
+  }) : submittedValues = _immutableObject(submittedValues),
+       referenceImages = Map.unmodifiable(referenceImages);
 
   final String workflowId;
   final ComfyMediaKind kind;
@@ -31,6 +47,8 @@ final class GenerationRequest {
   final String? sourceSessionId;
   final String? sourceMessageId;
   final String? sourceContextId;
+  final bool useCharacterContext;
+  final Map<String, File> referenceImages;
 
   Map<String, Object?> toJson() => {
     'workflowId': workflowId,
@@ -39,8 +57,12 @@ final class GenerationRequest {
     'sourceSessionId': sourceSessionId,
     'sourceMessageId': sourceMessageId,
     'sourceContextId': sourceContextId,
+    'useCharacterContext': useCharacterContext,
   };
 
+  /// Reference images are process-local file handles and are never
+  /// serialized; a request restored from JSON always has an empty
+  /// [referenceImages] map.
   factory GenerationRequest.fromJson(Map<String, Object?> json) =>
       GenerationRequest(
         workflowId: _string(json['workflowId']),
@@ -53,6 +75,7 @@ final class GenerationRequest {
         sourceSessionId: _nullableString(json['sourceSessionId']),
         sourceMessageId: _nullableString(json['sourceMessageId']),
         sourceContextId: _nullableString(json['sourceContextId']),
+        useCharacterContext: json['useCharacterContext'] == true,
       );
 }
 
@@ -309,6 +332,28 @@ final class RestoreWithoutPromptId extends GenerationEvent {
   const RestoreWithoutPromptId();
 }
 
+final class CancelRequested extends GenerationEvent {
+  const CancelRequested();
+}
+
+final class SubmissionFailed extends GenerationEvent {
+  factory SubmissionFailed(
+    String message, {
+    Map<String, Object?> nodeErrors = const {},
+  }) => SubmissionFailed._(message, _immutableObject(nodeErrors));
+
+  const SubmissionFailed._(this.message, this.nodeErrors);
+
+  final String message;
+  final Map<String, Object?> nodeErrors;
+}
+
+final class ExecutionOutputsObserved extends GenerationEvent {
+  const ExecutionOutputsObserved(this.outputs);
+
+  final List<ComfyOutputRef> outputs;
+}
+
 GenerationJob reduceGenerationJob(
   GenerationJob job,
   GenerationEvent event,
@@ -510,7 +555,60 @@ GenerationJob reduceGenerationJob(
         return job;
       }
       return job.copyWith(state: GenerationJobState.uncertain, updatedAt: at);
+    case CancelRequested():
+      if (!const {
+        GenerationJobState.queued,
+        GenerationJobState.running,
+        GenerationJobState.reconciling,
+      }.contains(job.state)) {
+        return job;
+      }
+      return job.copyWith(state: GenerationJobState.cancelling, updatedAt: at);
+    case SubmissionFailed(:final message, :final nodeErrors):
+      if (job.state != GenerationJobState.submitting) return job;
+      return job.copyWith(
+        state: GenerationJobState.failed,
+        error: message,
+        nodeErrors: nodeErrors,
+        completedAt: at,
+        updatedAt: at,
+      );
+    case ExecutionOutputsObserved(:final outputs):
+      if (!const {
+        GenerationJobState.submitting,
+        GenerationJobState.queued,
+        GenerationJobState.running,
+        GenerationJobState.cancelling,
+        GenerationJobState.reconciling,
+      }.contains(job.state)) {
+        return job;
+      }
+      if (outputs.isEmpty) return job;
+      return job.copyWith(
+        state: job.state == GenerationJobState.cancelling
+            ? GenerationJobState.cancelling
+            : GenerationJobState.running,
+        outputs: _mergeOutputs(job.outputs, outputs),
+        startedAt: job.startedAt ?? at,
+        updatedAt: at,
+      );
   }
+}
+
+List<ComfyOutputRef> _mergeOutputs(
+  List<ComfyOutputRef> existing,
+  List<ComfyOutputRef> incoming,
+) {
+  final seen = <String>{
+    for (final output in existing)
+      '${output.type} ${output.subfolder} ${output.filename}',
+  };
+  final merged = List<ComfyOutputRef>.of(existing);
+  for (final output in incoming) {
+    final key = '${output.type} ${output.subfolder} ${output.filename}';
+    if (seen.add(key)) merged.add(output);
+  }
+  return List.unmodifiable(merged);
 }
 
 bool _canReceiveExecutionTerminal(GenerationJobState state) => const {
@@ -532,6 +630,13 @@ JsonObject _immutableObject(Map<Object?, Object?> source) =>
     );
 
 Object? _immutableJsonValue(Object? value) {
+  if (value is File || value is Uint8List || value is ByteData) {
+    throw ArgumentError.value(
+      value,
+      'value',
+      'submittedValues/nodeErrors must be JSON-safe: no File or raw bytes',
+    );
+  }
   if (value is Map) return _immutableObject(value);
   if (value is List) {
     return UnmodifiableListView(value.map(_immutableJsonValue).toList());

@@ -1,3 +1,6 @@
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/models/character.dart';
 import 'package:hermes_android/core/models/character_generation_context.dart';
@@ -194,6 +197,8 @@ void main() {
         const HistoryReconciled(completed: false),
         HistoryReconciled(completed: true, outputs: [outputRef()]),
         const QueueRemovalConfirmed(),
+        const CancelRequested(),
+        ExecutionOutputsObserved([outputRef()]),
       ];
       for (final event in staleEvents) {
         expect(
@@ -257,6 +262,108 @@ void main() {
         expect(reduced.promptId, isNull);
       }
     });
+
+    test('cancel is requested only once a prompt is known', () {
+      final queued = job(state: GenerationJobState.queued);
+      final cancelling = reduceGenerationJob(
+        queued,
+        const CancelRequested(),
+        later(),
+      );
+      expect(cancelling.state, GenerationJobState.cancelling);
+
+      final running = job(state: GenerationJobState.running);
+      expect(
+        reduceGenerationJob(running, const CancelRequested(), later()).state,
+        GenerationJobState.cancelling,
+      );
+
+      final reconciling = job(state: GenerationJobState.reconciling);
+      expect(
+        reduceGenerationJob(
+          reconciling,
+          const CancelRequested(),
+          later(),
+        ).state,
+        GenerationJobState.cancelling,
+      );
+
+      final submitting = job(
+        state: GenerationJobState.submitting,
+        promptId: null,
+      );
+      expect(
+        reduceGenerationJob(
+          submitting,
+          const CancelRequested(),
+          later(),
+        ).state,
+        GenerationJobState.submitting,
+      );
+    });
+
+    test('a definite submission failure fails the job outright', () {
+      final submitting = job(
+        state: GenerationJobState.submitting,
+        promptId: null,
+      );
+      final failed = reduceGenerationJob(
+        submitting,
+        SubmissionFailed('graph validation failed', nodeErrors: {'12': 'x'}),
+        later(),
+      );
+      expect(failed.state, GenerationJobState.failed);
+      expect(failed.error, 'graph validation failed');
+      expect(failed.nodeErrors, {'12': 'x'});
+
+      final queued = job(state: GenerationJobState.queued);
+      expect(
+        reduceGenerationJob(
+          queued,
+          SubmissionFailed('too late'),
+          later(),
+        ).state,
+        GenerationJobState.queued,
+      );
+    });
+
+    test(
+      'partial executed outputs accumulate without becoming terminal',
+      () {
+        final queued = job(state: GenerationJobState.queued);
+        final firstSeen = reduceGenerationJob(
+          queued,
+          ExecutionOutputsObserved([outputRef()]),
+          later(),
+        );
+        expect(firstSeen.state, GenerationJobState.running);
+        expect(firstSeen.outputs, hasLength(1));
+
+        final second = ComfyOutputRef(
+          filename: 'second.png',
+          subfolder: 'images',
+          type: 'output',
+        );
+        final accumulated = reduceGenerationJob(
+          firstSeen,
+          ExecutionOutputsObserved([outputRef(), second]),
+          later(),
+        );
+        expect(accumulated.outputs, hasLength(2));
+
+        final cancelling = job(
+          state: GenerationJobState.cancelling,
+          outputs: [outputRef()],
+        );
+        final stillCancelling = reduceGenerationJob(
+          cancelling,
+          ExecutionOutputsObserved([second]),
+          later(),
+        );
+        expect(stillCancelling.state, GenerationJobState.cancelling);
+        expect(stillCancelling.outputs, hasLength(2));
+      },
+    );
 
     test('nested node errors are immutable after reduction', () {
       final messages = <Object?>['original'];
@@ -368,6 +475,70 @@ void main() {
       expect(
         GenerationRequest.fromJson(request.toJson()).toJson(),
         request.toJson(),
+      );
+    });
+
+    test(
+      'reference images never round-trip through JSON and context use is explicit',
+      () {
+        final withImage = GenerationRequest(
+          workflowId: 'workflow-1',
+          kind: ComfyMediaKind.image,
+          submittedValues: const {'prompt': 'first'},
+          sourceContextId: 'context-1',
+          useCharacterContext: true,
+          referenceImages: {'node1_image': File('avatar.png')},
+        );
+        expect(withImage.referenceImages, hasLength(1));
+        expect(withImage.toJson()['useCharacterContext'], isTrue);
+        expect(withImage.toJson().containsKey('referenceImages'), isFalse);
+
+        final restored = GenerationRequest.fromJson(withImage.toJson());
+        expect(restored.referenceImages, isEmpty);
+        expect(restored.useCharacterContext, isTrue);
+
+        final withContextIdOnly = GenerationRequest(
+          workflowId: 'workflow-1',
+          kind: ComfyMediaKind.image,
+          submittedValues: const {},
+          sourceContextId: 'context-1',
+        );
+        expect(withContextIdOnly.useCharacterContext, isFalse);
+      },
+    );
+
+    test('a File or raw bytes accidentally placed in submittedValues is rejected', () {
+      expect(
+        () => GenerationRequest(
+          workflowId: 'workflow-1',
+          kind: ComfyMediaKind.image,
+          submittedValues: {'image': File('leaked.png')},
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => GenerationRequest(
+          workflowId: 'workflow-1',
+          kind: ComfyMediaKind.image,
+          submittedValues: {
+            'nested': {'bytes': Uint8List(4)},
+          },
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => GenerationJob(
+          localId: 'job-1',
+          workflowId: 'workflow-1',
+          kind: ComfyMediaKind.image,
+          state: GenerationJobState.draft,
+          endpointFingerprint: 'x',
+          endpointSnapshot: 'http://host:8188',
+          submittedValues: {'image': File('leaked.png')},
+          createdAt: created(),
+          updatedAt: created(),
+        ),
+        throwsArgumentError,
       );
     });
   });
