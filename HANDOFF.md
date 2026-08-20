@@ -1,4 +1,138 @@
-# Handoff — Codex Deep Pipeline Audit Fix-Through
+# Handoff — ComfyUI generation/workflows (current, 2026-08-20)
+
+## Stop point
+
+- User requested stopping after the ComfyUI protocol section. Tasks 1-7 of 13 are implemented, reviewed, and committed. Task 8 has **not** started.
+- Branch: `docs/comfyui-generation-design`
+- Feature head before this handoff edit: `f3a028c`
+- Latest verification: `flutter test` = 331 passed, 2 capability skips; `flutter analyze` = clean.
+- Verification is repository-only. No live ComfyUI, reverse proxy, Android device, or real large-transfer run yet.
+
+## Authoritative files
+
+- Design: `docs/superpowers/specs/2026-08-20-comfyui-generation-workflows-design.md`
+- Plan: `docs/superpowers/plans/2026-08-20-comfyui-generation-workflows.md`
+- Execution ledger: `.superpowers/sdd/2026-08-20-comfyui-generation-workflows/progress.md`
+- Task reports/briefs: `.superpowers/sdd/2026-08-20-comfyui-generation-workflows/`
+
+## Completed
+
+### Task 1 — Endpoint and output references
+
+- Strict configured-endpoint parsing/migration; wildcard `0.0.0.0` becomes unconfigured.
+- Reverse-proxy-safe HTTP/WS routes and safe `ComfyOutputRef` validation/view URIs.
+- Main files: `lib/core/models/comfy_workflow.dart`, `lib/core/services/comfyui.dart`, tests.
+- Commits: `bb8ce80`, `9b93eef`.
+
+### Task 2 — Workflow codec and bindings
+
+- Byte-preserving source import, editable working graph, bindings, local/server validation model, fingerprints, safe export/sidecar behavior.
+- Main files: `lib/core/models/comfy_workflow.dart`, `lib/core/services/comfy_workflow_codec.dart`, tests.
+- Commits: `4e672b1`, `beb843b`, `21a5ca3`.
+
+### Task 3 — Durable domain models and reducer
+
+- Generation requests/jobs/states/progress/events, media assets, and character-generation contexts with handwritten JSON.
+- Reducer protects terminal races and restore/no-retry behavior.
+- Main files: `lib/core/models/generation_job.dart`, `media_asset.dart`, `character_generation_context.dart`, tests.
+- Commits: `758fc84`, `0b796db`.
+
+### Task 4 — Atomic stores
+
+- App-support JSON stores for workflows, jobs, media, contexts, and one shared index.
+- Per-record locks, unique temp files, rollback/journals, crash recovery, quarantine, limits, path/hash validation, legacy migration.
+- Main files: `lib/core/services/atomic_json_store.dart`, `comfy_storage_index.dart`, `workflow_store.dart`, `generation_job_store.dart`, `media_asset_store.dart`, `character_generation_context_store.dart`, tests.
+- Commits: `621f3d0`, `d530f8f`, `c208e95`, `14d7f3c`.
+
+### Task 5 — Streamed media cache/export
+
+- Counted streaming downloads; 50 MiB automatic image cap; videos stream-first; 512 MiB export confirmation boundary.
+- Atomic staging/promotion, coalescing, shared-root mutation coordination, cleanup ownership, bounded shutdown, cache injection through gallery/chat call sites.
+- Main files: `lib/core/services/media_cache_service.dart`, `media_export_service.dart`, related chat/gallery widgets/tests.
+- Commits: `2033140`, `2b7cb98`, `25714f8`, `133d628`, `0849b4f`, `553fc98`.
+
+### Task 6 — Bounded ComfyUI HTTP client
+
+- Typed `/system_stats`, `/object_info`, `/upload/image`, `/prompt`, `/queue`, `/interrupt`, `/history`, `/view`, frontend URI support.
+- Proxy-safe routes; 10-second header timeout; per-chunk 30-second idle timeout; 32 MiB JSON cap; 25 MiB validated image upload.
+- `/prompt` sends once. Unusable 2xx results are uncertain; accepted partial branches retain `prompt_id + node_errors`; non-2xx errors stay typed.
+- Main files: `lib/core/services/comfyui_client.dart`, `test/comfyui_client_test.dart`.
+- Commits: `c0519f1`, `027dde9`, `cb886ba`.
+
+### Task 7 — Typed ComfyUI WebSocket
+
+- `dart:io` injectable socket connector/transport plus `ComfyUiSocketFactory` for Task 8.
+- Typed status/start/cached/progress/executing/executed/success/error/interrupted/lost events.
+- Prompt filtering, legacy/current status shapes, safe output refs, 2 MiB text bound, exact terminal/loss behavior, prompt cancellation and cleanup.
+- Main files: `lib/core/services/comfyui_socket.dart`, `test/comfyui_socket_test.dart`.
+- Commits: `8ba75bd`, `f3a028c`.
+
+## Deferred findings
+
+- Task 4: store `get` performs an unlocked `exists()` pre-read; an in-process promotion can transiently look absent. Reassess in final review.
+- Task 5: path mutation is safe for the current single-process Android app-private cache model, but a hostile same-UID/cross-process actor could race an ancestor swap after validation. Stable/no-follow mutation is needed if writers broaden.
+- Task 5: a custom cleanup-global legacy downloader injected into `MediaCacheService` is not owned/drained. Production uses the scoped downloader; reject/document or add explicit ownership in final review.
+- Two Windows tests skip when symlink creation privileges are unavailable.
+
+## Remaining work
+
+### Task 8 — Generation repository/host
+
+Create `generation_repository.dart`, `generation_repository_host.dart`, foreground lease adapter, and repository tests. Required behavior:
+
+- One app-scoped repository and shared storage index; replaying workflow/job/media/context streams.
+- Active endpoint only for new jobs; persisted endpoint snapshot for recovery/media.
+- Persist `submitting` before upload/POST; never resubmit restored work; history-first then queue reconciliation.
+- One socket observer per prompt; serialize socket/cancel/reconcile mutations per job; persist before publish.
+- Queue delete targets only queued prompt; running interrupt requires confirmation; terminal result wins cancellation races.
+- Balance one shared foreground lease; disposal must cancel observers, await work, release once, close clients/streams.
+- Repair succeeded-job media/workflow side effects on restart.
+
+Resolve these Task 8 contract gaps with RED tests before implementation:
+
+- Add reducer events for `CancelRequested`, definite `SubmissionFailed`, and partial `ExecutionOutputsObserved`.
+- Define safe request input-file/reference-image semantics; never persist `File` or raw 25 MiB bytes in `submittedValues`.
+- Define explicit context-enabled/disabled semantics instead of inferring solely from `sourceContextId`.
+- Define endpoint/object-info fingerprint fallback when server validation is missing/stale.
+- Define media kind/content-type classification for arbitrary history outputs.
+
+### Task 9 — Settings and workflow management
+
+- Strict ComfyUI settings/test/open/copy fallback, HTTP warnings, workflow import/duplicate/edit/bind/validate/export/delete, trust-by-content-hash.
+- Add direct `file_picker` and `url_launcher` dependencies if still required; `crypto` is already direct.
+
+### Task 10 — Create UI
+
+- Drawer `Create` entry and `CreateScreen` tabs: `Image`, `Video`, `Workflows`.
+- Binding-driven forms, job queue/status/history, cancel/retry/save/share, mobile-safe workflow editing.
+
+### Task 11 — Character-chat integration
+
+- Open Create from chat with editable character/context prompt snapshot; no automatic send.
+- Persist copied reference image; support generated-image `Discuss` back into chat.
+
+### Task 12 — Global Media
+
+- Replace transcript-only image gallery with repository-backed All/Image/Video library.
+- Preserve endpoint snapshots, source-chat jump when known, local-only removal, cache clearing, video lazy loading.
+
+### Task 13 — Protocol/device/docs/final gates
+
+- VM fake ComfyUI HTTP+WebSocket protocol server.
+- Android restart/reconciliation flow; real ComfyUI/reverse proxy; image/video generation, save/share/discuss; foreground notification/cancel.
+- `flutter analyze`, full tests, debug APK/device checks, final scoped review of deferred findings.
+
+## Resume
+
+1. `git status --short` and `git branch --show-current`; preserve user changes.
+2. Read the design, plan, ledger, and `.superpowers/sdd/2026-08-20-comfyui-generation-workflows/task-8-brief.md`.
+3. Run `C:\src\flutter\bin\flutter.bat test` and `C:\src\flutter\bin\flutter.bat analyze`.
+4. Start Task 8 with RED repository/reducer tests; do not begin UI before repository/reconciliation is reviewed clean.
+5. Keep live/device claims separate from repository test claims.
+
+---
+
+# Prior handoff — Codex Deep Pipeline Audit Fix-Through
 
 **Source document:** `C:\Users\charl\Desktop\hermes-deep-pipeline-audit-2026-08-19.md` (external audit, method described as fresh inspection + disposable emulator/mock-server tests + release build). Treat every claim in it as **unverified until checked against actual code in this repo** — verify first, then fix. One claim already double-checked this session ("replace media polls with SSE events") turned out to be a false positive from a *different*, less careful pass; this document itself is more careful (explicitly credits the SSE-filename guard as already correct), but individual line numbers can still drift as the file changes — re-grep before trusting a cited line number.
 
