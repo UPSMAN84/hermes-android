@@ -650,6 +650,68 @@ void main() {
     );
 
     test(
+      'two cache instances coordinate injected same-metadata promotion',
+      () async {
+        final scanSnapshot = Completer<void>();
+        final releaseScan = Completer<void>();
+        final operations = _FaultInjectingFileOperations(
+          afterListGate: releaseScan.future,
+          afterListGateOnCount: 2,
+          onListSnapshot: (_) => scanSnapshot.complete(),
+        );
+        final cache1 = MediaCacheService(
+          root: temp,
+          httpClient: _FixtureClient(
+            (_) => _response(
+              chunks: [
+                Uint8List.fromList([1, 1, 1, 1]),
+              ],
+            ),
+          ),
+          fileOperations: operations,
+          maxCacheBytes: 4,
+          maxAge: Duration.zero,
+        );
+        final cache2 = MediaCacheService(
+          root: temp,
+          downloadService: _InjectedDownloadService(
+            bytes: const [2, 2, 2, 2],
+            modified: DateTime(1990),
+          ),
+          fileOperations: operations,
+          maxCacheBytes: 512 * 1024 * 1024,
+          maxAge: Duration.zero,
+        );
+        final uri = Uri.parse('http://host/view?filename=target.png');
+        final target = await cache1.cache(uri);
+        await cache1.drainMaintenance();
+        await target!.setLastModified(DateTime(1990));
+        final pressure = File('${temp.path}${Platform.pathSeparator}pressure');
+        await pressure.writeAsBytes([3, 3, 3, 3]);
+        await pressure.setLastModified(DateTime(2000));
+
+        final maintenance = cache1.drainMaintenance();
+        try {
+          await scanSnapshot.future;
+          final refreshed = await cache2.cache(uri);
+          expect(await refreshed!.readAsBytes(), [2, 2, 2, 2]);
+          expect(await refreshed.lastModified(), DateTime(1990));
+        } finally {
+          if (!releaseScan.isCompleted) releaseScan.complete();
+        }
+        await maintenance;
+        await Future.wait([
+          cache1.drainMaintenance(),
+          cache2.drainMaintenance(),
+        ]);
+
+        expect(await target.exists(), isTrue);
+        expect(await target.readAsBytes(), [2, 2, 2, 2]);
+        expect(await pressure.exists(), isFalse);
+      },
+    );
+
+    test(
       'repeated complete cache hits do not schedule maintenance scans',
       () async {
         final operations = _FaultInjectingFileOperations();
@@ -772,6 +834,107 @@ void main() {
         expect(_files(temp), isEmpty);
       },
     );
+
+    test(
+      'close waits for active failure before draining late partial cleanup',
+      () async {
+        final release = Completer<void>();
+        var failedOnce = false;
+        final operations = _FaultInjectingFileOperations(
+          failDelete: (file) {
+            if (!failedOnce && file.path.endsWith('.part')) {
+              failedOnce = true;
+              return true;
+            }
+            return false;
+          },
+        );
+        final client = _FixtureClient(
+          (_) => http.StreamedResponse(
+            (() async* {
+              await release.future;
+              yield [1, 2];
+              throw StateError('stream failed');
+            })(),
+            200,
+          ),
+        );
+        final service = MediaExportService(
+          root: temp,
+          downloadService: DefaultMediaDownloadService(
+            httpClient: client,
+            fileOperations: operations,
+          ),
+          shareFile: (_) async {},
+        );
+        final export = service.shareRemote(
+          Uri.parse('http://host/view?filename=broken.png'),
+          confirmAfterHeaders: (_) async => true,
+        );
+        await _waitUntil(() => client.sendCount == 1);
+        final exportExpectation = expectLater(
+          export,
+          throwsA(isA<StateError>()),
+        );
+        var closeFinished = false;
+        final close = service.close().whenComplete(() => closeFinished = true);
+
+        await Future<void>.delayed(Duration.zero);
+        final finishedBeforeFailure = closeFinished;
+        release.complete();
+        await exportExpectation;
+        await close;
+
+        expect(finishedBeforeFailure, isFalse);
+        expect(
+          operations.deleteAttempts
+              .where((path) => path.endsWith('.part'))
+              .length,
+          2,
+        );
+        expect(_partFiles(temp), isEmpty);
+      },
+    );
+
+    test('close rejects exports started after shutdown begins', () async {
+      final release = Completer<void>();
+      final firstUri = Uri.parse('http://host/view?filename=first.png');
+      final client = _FixtureClient(
+        (request) => _response(
+          chunks: [
+            Uint8List.fromList([1, 2]),
+          ],
+          beforeChunks: request.url == firstUri ? release.future : null,
+        ),
+      );
+      final service = MediaExportService(
+        root: temp,
+        downloadService: DefaultMediaDownloadService(httpClient: client),
+        shareFile: (_) async {},
+      );
+      final first = service.shareRemote(
+        firstUri,
+        confirmAfterHeaders: (_) async => true,
+      );
+      await _waitUntil(() => client.sendCount == 1);
+      final close = service.close();
+
+      try {
+        await expectLater(
+          service.shareRemote(
+            Uri.parse('http://host/view?filename=second.png'),
+            confirmAfterHeaders: (_) async => true,
+          ),
+          throwsA(isA<StateError>()),
+        );
+      } finally {
+        if (!release.isCompleted) release.complete();
+        await first;
+        await close;
+      }
+
+      expect(client.sendCount, 1);
+    });
 
     test('declines an unknown-size save before reading chunks', () async {
       final body = _CancellableResponseBody([
@@ -1053,6 +1216,39 @@ final class _HugeChunk extends ListBase<int> {
   @override
   void operator []=(int index, int value) =>
       throw UnsupportedError('read-only fake chunk');
+}
+
+final class _InjectedDownloadService implements MediaDownloadPort {
+  const _InjectedDownloadService({required this.bytes, required this.modified});
+
+  final List<int> bytes;
+  final DateTime modified;
+
+  @override
+  Future<File> download(
+    Uri uri, {
+    required File destination,
+    required int maxBytes,
+    Map<String, String> headers = const {},
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) async {
+    if (bytes.length > maxBytes) throw MediaDownloadLimitException(maxBytes);
+    final confirm = confirmAfterHeaders;
+    if (confirm != null &&
+        !await confirm(
+          MediaDownloadInfo(
+            statusCode: 200,
+            contentType: 'image/png',
+            declaredBytes: bytes.length,
+          ),
+        )) {
+      throw const MediaDownloadDeclinedException();
+    }
+    await destination.parent.create(recursive: true);
+    await destination.writeAsBytes(bytes);
+    await destination.setLastModified(modified);
+    return destination;
+  }
 }
 
 final class _FaultInjectingFileOperations implements MediaFileOperations {

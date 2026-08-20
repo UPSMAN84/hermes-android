@@ -5,11 +5,36 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 final http.Client _appMediaHttpClient = http.Client();
-final _FileMutationGate _appMediaFileMutationGate = _FileMutationGate();
+final MediaCacheMutationCoordinator _appMediaMutationCoordinator =
+    MediaCacheMutationCoordinator();
 final MediaDownloadPort appMediaDownloadService = DefaultMediaDownloadService._(
   httpClient: _appMediaHttpClient,
-  mutationGate: _appMediaFileMutationGate,
+  mutationCoordinator: _appMediaMutationCoordinator,
 );
+
+final Map<String, WeakReference<MediaCacheMutationCoordinator>>
+_mediaCacheMutationCoordinators = {};
+
+MediaCacheMutationCoordinator _coordinatorForRoot(Directory root) {
+  _mediaCacheMutationCoordinators.removeWhere(
+    (_, reference) => reference.target == null,
+  );
+  var key = root.absolute.uri.normalizePath().toFilePath(
+    windows: Platform.isWindows,
+  );
+  if (Directory(key).parent.path != key &&
+      key.endsWith(Platform.pathSeparator)) {
+    key = key.substring(0, key.length - 1);
+  }
+  if (Platform.isWindows) key = key.toLowerCase();
+
+  final existing = _mediaCacheMutationCoordinators[key]?.target;
+  if (existing != null) return existing;
+
+  final coordinator = MediaCacheMutationCoordinator();
+  _mediaCacheMutationCoordinators[key] = WeakReference(coordinator);
+  return coordinator;
+}
 
 final class MediaDownloadLimitException implements Exception {
   const MediaDownloadLimitException(this.limitBytes);
@@ -50,6 +75,8 @@ abstract interface class MediaDownloadPort {
 }
 
 abstract interface class MediaDownloadCleanupPort {
+  bool get hasPendingCleanup;
+
   Future<void> drainCleanup();
 }
 
@@ -89,12 +116,12 @@ final class DefaultMediaDownloadService
   }) => DefaultMediaDownloadService._(
     httpClient: httpClient,
     fileOperations: fileOperations,
-    mutationGate: _FileMutationGate(),
+    mutationCoordinator: MediaCacheMutationCoordinator(),
   );
 
   DefaultMediaDownloadService._({
     required http.Client httpClient,
-    required _FileMutationGate mutationGate,
+    required MediaCacheMutationCoordinator mutationCoordinator,
     MediaFileOperations fileOperations = const DefaultMediaFileOperations(),
   })
     // ignore: prefer_initializing_formals
@@ -102,15 +129,18 @@ final class DefaultMediaDownloadService
        // ignore: prefer_initializing_formals
        _fileOperations = fileOperations,
        // ignore: prefer_initializing_formals
-       _mutationGate = mutationGate;
+       _mutationCoordinator = mutationCoordinator;
 
   final http.Client _httpClient;
   final MediaFileOperations _fileOperations;
-  final _FileMutationGate _mutationGate;
+  final MediaCacheMutationCoordinator _mutationCoordinator;
   final Set<String> _pendingPartialCleanup = {};
   Future<void>? _cleanupFuture;
 
   static int _temporaryFileSequence = 0;
+
+  @override
+  bool get hasPendingCleanup => _pendingPartialCleanup.isNotEmpty;
 
   @override
   Future<File> download(
@@ -257,27 +287,27 @@ final class DefaultMediaDownloadService
   }
 
   Future<File> _promote(File part, File destination) =>
-      _mutationGate.run(() async {
+      _mutationCoordinator._run(() async {
         File? old;
         if (await destination.exists()) {
           old = _uniqueSibling(destination, 'old');
           await _fileOperations.rename(destination, old.path);
-          _mutationGate.markChanged(destination.path);
+          _mutationCoordinator._markChanged(destination.path);
         }
 
         try {
           await _fileOperations.rename(part, destination.path);
-          _mutationGate.markChanged(destination.path);
+          _mutationCoordinator._markChanged(destination.path);
         } catch (_) {
           if (old != null && await old.exists()) {
             if (await destination.exists()) {
               try {
                 await _fileOperations.delete(destination);
-                _mutationGate.markChanged(destination.path);
+                _mutationCoordinator._markChanged(destination.path);
               } catch (_) {}
             }
             await _fileOperations.rename(old, destination.path);
-            _mutationGate.markChanged(destination.path);
+            _mutationCoordinator._markChanged(destination.path);
           }
           rethrow;
         }
@@ -301,8 +331,9 @@ final class MediaCacheService implements MediaCachePort {
     Duration maxAge = const Duration(days: 30),
     DateTime Function()? clock,
     MediaFileOperations fileOperations = const DefaultMediaFileOperations(),
+    MediaCacheMutationCoordinator? mutationCoordinator,
   }) {
-    final mutationGate = _FileMutationGate();
+    final coordinator = mutationCoordinator ?? _coordinatorForRoot(root);
     return MediaCacheService._(
       root: Future<Directory>.value(root),
       maxImageBytes: maxImageBytes,
@@ -314,10 +345,10 @@ final class MediaCacheService implements MediaCachePort {
           DefaultMediaDownloadService._(
             httpClient: httpClient ?? http.Client(),
             fileOperations: fileOperations,
-            mutationGate: mutationGate,
+            mutationCoordinator: coordinator,
           ),
       clock: clock ?? DateTime.now,
-      mutationGate: mutationGate,
+      mutationCoordinator: coordinator,
     );
   }
 
@@ -329,7 +360,7 @@ final class MediaCacheService implements MediaCachePort {
     required MediaFileOperations fileOperations,
     required MediaDownloadPort downloadService,
     required DateTime Function() clock,
-    required _FileMutationGate mutationGate,
+    required MediaCacheMutationCoordinator mutationCoordinator,
   })
     // ignore: prefer_initializing_formals
     : _root = root,
@@ -340,7 +371,7 @@ final class MediaCacheService implements MediaCachePort {
        // ignore: prefer_initializing_formals
        _clock = clock,
        // ignore: prefer_initializing_formals
-       _mutationGate = mutationGate;
+       _mutationCoordinator = mutationCoordinator;
 
   MediaCacheService._appDefault()
     : _root = _applicationCacheRoot(),
@@ -350,7 +381,7 @@ final class MediaCacheService implements MediaCachePort {
       _fileOperations = const DefaultMediaFileOperations(),
       _downloadService = appMediaDownloadService,
       _clock = DateTime.now,
-      _mutationGate = _appMediaFileMutationGate;
+      _mutationCoordinator = _appMediaMutationCoordinator;
 
   final Future<Directory> _root;
   final int maxImageBytes;
@@ -359,7 +390,7 @@ final class MediaCacheService implements MediaCachePort {
   final MediaFileOperations _fileOperations;
   final MediaDownloadPort _downloadService;
   final DateTime Function() _clock;
-  final _FileMutationGate _mutationGate;
+  final MediaCacheMutationCoordinator _mutationCoordinator;
   final Map<String, Future<File>> _inFlight = {};
   Future<void>? _maintenanceFuture;
   bool _maintenanceRequested = false;
@@ -414,10 +445,16 @@ final class MediaCacheService implements MediaCachePort {
       if (age < maxAge) return destination;
     }
 
+    final staging = DefaultMediaDownloadService._uniqueSibling(
+      destination,
+      'part',
+    );
+    _mutationCoordinator._registerTemporary(staging.path);
+    File? produced;
     try {
-      final downloaded = await _downloadService.download(
+      produced = await _downloadService.download(
         uri,
-        destination: destination,
+        destination: staging,
         maxBytes: maxImageBytes,
         headers: headers,
         confirmAfterHeaders: requireImage
@@ -427,15 +464,66 @@ final class MediaCacheService implements MediaCachePort {
               }
             : null,
       );
-      return downloaded;
+      return await _promoteToCanonical(produced, destination);
     } catch (_) {
       if (staleIsComplete && await _isComplete(destination)) {
         return destination;
       }
       rethrow;
     } finally {
+      _mutationCoordinator._unregisterTemporary(staging.path);
+      final temporaryPaths = <String>{
+        staging.path,
+        if (produced != null && produced.path != destination.path)
+          produced.path,
+      };
+      for (final path in temporaryPaths) {
+        try {
+          final temporary = File(path);
+          if (await temporary.exists()) {
+            await _fileOperations.delete(temporary);
+          }
+        } catch (_) {}
+      }
       _scheduleMaintenance();
     }
+  }
+
+  Future<File> _promoteToCanonical(File source, File destination) {
+    if (source.path == destination.path) return Future<File>.value(destination);
+
+    return _mutationCoordinator._run(() async {
+      File? old;
+      if (await destination.exists()) {
+        old = DefaultMediaDownloadService._uniqueSibling(destination, 'old');
+        await _fileOperations.rename(destination, old.path);
+        _mutationCoordinator._markChanged(destination.path);
+      }
+
+      try {
+        await _fileOperations.rename(source, destination.path);
+        _mutationCoordinator._markChanged(destination.path);
+      } catch (_) {
+        if (old != null && await old.exists()) {
+          if (await destination.exists()) {
+            try {
+              await _fileOperations.delete(destination);
+              _mutationCoordinator._markChanged(destination.path);
+            } catch (_) {}
+          }
+          await _fileOperations.rename(old, destination.path);
+          _mutationCoordinator._markChanged(destination.path);
+        }
+        rethrow;
+      }
+
+      if (old != null && await old.exists()) {
+        try {
+          await _fileOperations.delete(old);
+        } catch (_) {}
+      }
+      return destination;
+    });
   }
 
   @override
@@ -448,10 +536,10 @@ final class MediaCacheService implements MediaCachePort {
     }
 
     final file = await _fileForUri(uri);
-    await _mutationGate.run(() async {
+    await _mutationCoordinator._run(() async {
       if (await file.exists()) {
         await _fileOperations.delete(file);
-        _mutationGate.markDeleted(file.path);
+        _mutationCoordinator._markDeleted(file.path);
       }
     });
   }
@@ -550,10 +638,18 @@ final class MediaCacheService implements MediaCachePort {
         if (entity.path.endsWith('.part')) {
           var deleted = false;
           if (_inFlight.isEmpty) {
-            try {
-              await _fileOperations.delete(entity);
-              deleted = true;
-            } catch (_) {}
+            deleted = await _mutationCoordinator._run(() async {
+              if (_inFlight.isNotEmpty ||
+                  _mutationCoordinator._isTemporaryActive(entity.path)) {
+                return false;
+              }
+              try {
+                await _fileOperations.delete(entity);
+                return true;
+              } catch (_) {
+                return false;
+              }
+            });
           }
           if (!deleted) totalBytes += await _safeLength(entity);
           continue;
@@ -587,14 +683,14 @@ final class MediaCacheService implements MediaCachePort {
   }
 
   Future<_CacheEntry?> _snapshotCanonical(File file) =>
-      _mutationGate.run(() async {
+      _mutationCoordinator._run(() async {
         try {
           final stat = await file.stat();
           return _CacheEntry(
             file: file,
             modified: stat.modified,
             size: stat.size,
-            generation: _mutationGate.generation(file.path),
+            generation: _mutationCoordinator._generation(file.path),
           );
         } catch (_) {
           return null;
@@ -605,7 +701,7 @@ final class MediaCacheService implements MediaCachePort {
     final canonical = _canonicalForOld(old);
     if (canonical == null) return (size: await _safeLength(old), entry: null);
 
-    return _mutationGate.run(() async {
+    return _mutationCoordinator._run(() async {
       if (await _safeExists(canonical)) {
         try {
           await _fileOperations.delete(old);
@@ -617,7 +713,7 @@ final class MediaCacheService implements MediaCachePort {
 
       try {
         final restored = await _fileOperations.rename(old, canonical.path);
-        _mutationGate.markChanged(canonical.path);
+        _mutationCoordinator._markChanged(canonical.path);
         final stat = await restored.stat();
         return (
           size: stat.size,
@@ -625,7 +721,7 @@ final class MediaCacheService implements MediaCachePort {
             file: restored,
             modified: stat.modified,
             size: stat.size,
-            generation: _mutationGate.generation(restored.path),
+            generation: _mutationCoordinator._generation(restored.path),
           ),
         );
       } catch (_) {
@@ -635,8 +731,9 @@ final class MediaCacheService implements MediaCachePort {
   }
 
   Future<_EvictionOutcome> _evictIfUnchanged(_CacheEntry entry) =>
-      _mutationGate.run(() async {
-        if (_mutationGate.generation(entry.file.path) != entry.generation) {
+      _mutationCoordinator._run(() async {
+        if (_mutationCoordinator._generation(entry.file.path) !=
+            entry.generation) {
           return _EvictionOutcome.changed;
         }
 
@@ -646,7 +743,7 @@ final class MediaCacheService implements MediaCachePort {
             return _EvictionOutcome.changed;
           }
           await _fileOperations.delete(entry.file);
-          _mutationGate.markDeleted(entry.file.path);
+          _mutationCoordinator._markDeleted(entry.file.path);
           return _EvictionOutcome.deleted;
         } catch (_) {
           return _EvictionOutcome.failed;
@@ -692,12 +789,13 @@ final class _CacheEntry {
 
 enum _EvictionOutcome { deleted, changed, failed }
 
-final class _FileMutationGate {
+final class MediaCacheMutationCoordinator {
   Future<void> _tail = Future<void>.value();
   final Map<String, int> _generations = {};
+  final Set<String> _activeTemporaryPaths = {};
   int _nextGeneration = 0;
 
-  Future<T> run<T>(Future<T> Function() action) {
+  Future<T> _run<T>(Future<T> Function() action) {
     final previous = _tail;
     final released = Completer<void>();
     _tail = released.future;
@@ -710,13 +808,28 @@ final class _FileMutationGate {
     });
   }
 
-  int generation(String path) => _generations[path] ?? 0;
+  int _generation(String path) => _generations[path] ?? 0;
 
-  void markDeleted(String path) {
+  void _markDeleted(String path) {
     _generations.remove(path);
   }
 
-  void markChanged(String path) {
+  void _markChanged(String path) {
     _generations[path] = ++_nextGeneration;
+  }
+
+  void _registerTemporary(String path) {
+    _activeTemporaryPaths.add(path);
+  }
+
+  void _unregisterTemporary(String path) {
+    _activeTemporaryPaths.remove(path);
+  }
+
+  bool _isTemporaryActive(String path) {
+    for (final activePath in _activeTemporaryPaths) {
+      if (path == activePath || path.startsWith('$activePath.')) return true;
+    }
+    return false;
   }
 }

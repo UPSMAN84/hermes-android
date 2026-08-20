@@ -130,3 +130,42 @@ Deterministic fixtures cover non-2xx, declared-over, missing/lying length, conte
 - Repository-only verification; no live gateway/device or real multi-GiB transfer.
 - Missing libmpv remains a graceful Windows test log.
 - Full suite retained the expected Windows symlink privilege skip.
+
+# Review round 3 (2026-08-20)
+
+## RED/GREEN
+
+- RED focused media: 29 passed and exactly 3 intended regressions failed. A second same-root cache with an injected identical-metadata replacement lost the fresh canonical file; close finished before a late stream/delete failure registered cleanup; and a new export was admitted after close began.
+- GREEN focused media: 32/32 passed.
+- GREEN focused gallery/chat: 27/27 passed.
+- Touched Dart analyzer: three files, no issues.
+- Final full Flutter test: 274 passed, 1 skipped for Windows symlink privilege.
+
+## Concurrency interleavings
+
+- Same-root cache instances acquire one normalized-root MediaCacheMutationCoordinator from a weak registry; callers may explicitly inject a coordinator.
+- Every cache downloader now receives a unique registered staging path. HTTP and body streaming remain independent and outside the FIFO coordinator.
+- Cache-owned promotion, rollback, removal, recovery, snapshot, and eviction are serialized by the root coordinator regardless of the injected downloader.
+- The deterministic overlap snapshots old generation/stat, promotes equal-size/equal-mtime fresh bytes through a second cache, then revalidation observes the generation change, preserves fresh target bytes, and evicts pressure.
+- Registered staging paths and nested downloader partials are protected from maintenance in other cache instances.
+- Export close sets admission closed synchronously, awaits an identity-tracked stable set of active share/save futures, then performs at most three cleanup passes. Persistent cleanup failure surfaces instead of spinning.
+
+## Tests
+
+- Added two-cache-instance injected-downloader overlap coverage with identical size and mtime.
+- Added close-before-body-failure coverage proving close waits, retries the late partial deletion, and leaves no temp.
+- Added shutdown-admission coverage proving a second export is rejected and no second HTTP send occurs.
+- Existing coalescing, independent URI streaming, rollback, bounds, video stream-first, gallery injection, and disposal tests remain green.
+
+## Files
+
+- lib/core/services/media_cache_service.dart
+- lib/core/services/media_export_service.dart
+- test/media_cache_service_test.dart
+- .superpowers/sdd/2026-08-20-comfyui-generation-workflows/task-5-report.md
+
+## Concerns
+
+- Repository-only verification; no live gateway/device or real multi-GiB transfer.
+- Missing libmpv remains a graceful Windows test log.
+- Full suite retained the expected Windows symlink privilege skip.

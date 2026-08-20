@@ -1,6 +1,7 @@
 // Share / save-to-gallery for generated media (images and video clips).
 // Both bubble types (chat_screen.dart's _ImageBubble/_VideoBubble) and the
 // media gallery route through this so the two entry points can't drift.
+import 'dart:async';
 import 'dart:io';
 
 import 'package:gal/gal.dart';
@@ -37,6 +38,9 @@ class MediaExportService {
   final Future<void> Function(File) _shareFile;
   final Future<String?> Function(File, {required bool isVideo}) _saveFile;
   final int maxDownloadBytes;
+  final Set<Future<dynamic>> _activeExports = Set<Future<dynamic>>.identity();
+  bool _closing = false;
+  Future<void>? _closeFuture;
 
   /// Opens the system share sheet for [file].
   static Future<void> share(File file) async {
@@ -91,6 +95,25 @@ class MediaExportService {
     Uri uri, {
     Map<String, String> headers = const {},
     Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) {
+    if (_closing) {
+      return Future<void>.error(
+        StateError('MediaExportService is closing; cannot start sharing.'),
+      );
+    }
+    return _track(
+      _shareRemote(
+        uri,
+        headers: headers,
+        confirmAfterHeaders: confirmAfterHeaders,
+      ),
+    );
+  }
+
+  Future<void> _shareRemote(
+    Uri uri, {
+    required Map<String, String> headers,
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
   }) async {
     final destination = await _destinationFor(uri);
     try {
@@ -111,6 +134,27 @@ class MediaExportService {
     Uri uri, {
     required bool isVideo,
     Map<String, String> headers = const {},
+    Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
+  }) {
+    if (_closing) {
+      return Future<String?>.error(
+        StateError('MediaExportService is closing; cannot start saving.'),
+      );
+    }
+    return _track(
+      _saveRemote(
+        uri,
+        isVideo: isVideo,
+        headers: headers,
+        confirmAfterHeaders: confirmAfterHeaders,
+      ),
+    );
+  }
+
+  Future<String?> _saveRemote(
+    Uri uri, {
+    required bool isVideo,
+    required Map<String, String> headers,
     Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
   }) async {
     final destination = await _destinationFor(uri);
@@ -137,7 +181,45 @@ class MediaExportService {
     return Future<void>.value();
   }
 
-  Future<void> close() => drainCleanup();
+  Future<void> close() {
+    final active = _closeFuture;
+    if (active != null) return active;
+
+    _closing = true;
+    final operation = _close();
+    _closeFuture = operation;
+    return operation;
+  }
+
+  Future<void> _close() async {
+    while (_activeExports.isNotEmpty) {
+      final active = _activeExports.toList(growable: false);
+      await Future.wait<void>(
+        active.map((future) => future.then<void>((_) {}, onError: (_) {})),
+      );
+    }
+
+    final downloadService = _downloadService;
+    if (downloadService is! MediaDownloadCleanupPort) return;
+    final cleanupService = downloadService as MediaDownloadCleanupPort;
+    for (var pass = 0; pass < 3; pass++) {
+      await cleanupService.drainCleanup();
+      if (!cleanupService.hasPendingCleanup) return;
+      if (pass < 2) await Future<void>.delayed(Duration.zero);
+    }
+    throw StateError(
+      'MediaExportService still has pending download cleanup after 3 passes.',
+    );
+  }
+
+  Future<T> _track<T>(Future<T> operation) {
+    late final Future<T> tracked;
+    tracked = operation.whenComplete(() {
+      _activeExports.remove(tracked);
+    });
+    _activeExports.add(tracked);
+    return tracked;
+  }
 
   Future<bool> Function(MediaDownloadInfo) _confirmation(
     Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
