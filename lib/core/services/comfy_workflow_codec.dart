@@ -3,6 +3,18 @@ import 'dart:convert';
 import 'package:crypto/crypto.dart';
 import 'package:hermes_android/core/models/comfy_workflow.dart';
 
+final class WorkflowDraftResult {
+  const WorkflowDraftResult({
+    required this.graph,
+    required this.accepted,
+    this.error,
+  });
+
+  final JsonObject graph;
+  final bool accepted;
+  final String? error;
+}
+
 abstract final class ComfyWorkflowCodec {
   static const int maxSourceBytes = 5 * 1024 * 1024;
 
@@ -33,6 +45,23 @@ abstract final class ComfyWorkflowCodec {
       sourceHash: sha256.convert(sourceBytes).toString(),
       sourceFileName: sourceFileName,
     );
+  }
+
+  static WorkflowDraftResult applyDraft({
+    required JsonObject savedGraph,
+    required List<int> draftBytes,
+  }) {
+    _requireGraphShape(savedGraph);
+    try {
+      final imported = decode(draftBytes, sourceFileName: 'draft.json');
+      return WorkflowDraftResult(graph: imported.graph, accepted: true);
+    } on FormatException catch (error) {
+      return WorkflowDraftResult(
+        graph: savedGraph,
+        accepted: false,
+        error: error.message.toString(),
+      );
+    }
   }
 
   static JsonObject applyBindings(
@@ -323,6 +352,10 @@ abstract final class ComfyWorkflowCodec {
     return normalized.contains('model') ||
         normalized.contains('checkpoint') ||
         normalized.contains('ckpt') ||
+        normalized.contains('unet') ||
+        normalized.contains('clip') ||
+        normalized.contains('control_net') ||
+        normalized.contains('controlnet') ||
         normalized.contains('lora') ||
         normalized.contains('vae');
   }

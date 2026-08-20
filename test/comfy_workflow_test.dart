@@ -52,23 +52,54 @@ void main() {
       }
     });
 
-    test('invalid raw draft cannot replace the last valid graph', () {
+    test('rejected raw draft returns the unchanged saved graph', () {
       final saved = ComfyWorkflowCodec.decode(
-        utf8.encode('{"1":{"class_type":"X","inputs":{}}}'),
+        utf8.encode(
+          '{"1":{"class_type":"X","inputs":{"text":"saved"},"unknown":17}}',
+        ),
         sourceFileName: 'saved.json',
       ).graph;
 
-      expect(
-        () => ComfyWorkflowCodec.decode(
-          utf8.encode('{"1":{"class_type":"X"}}'),
-          sourceFileName: 'draft.json',
-        ),
-        throwsFormatException,
+      final result = ComfyWorkflowCodec.applyDraft(
+        savedGraph: saved,
+        draftBytes: utf8.encode('{"1":{"class_type":"X"}}'),
       );
+
+      expect(result.accepted, isFalse);
+      expect(result.error, isNotNull);
+      expect(identical(result.graph, saved), isTrue);
       expect(saved, {
-        '1': {'class_type': 'X', 'inputs': <String, dynamic>{}},
+        '1': {
+          'class_type': 'X',
+          'inputs': {'text': 'saved'},
+          'unknown': 17,
+        },
       });
     });
+
+    test(
+      'valid raw draft returns a replacement without mutating saved graph',
+      () {
+        final saved = ComfyWorkflowCodec.decode(
+          utf8.encode('{"1":{"class_type":"X","inputs":{"text":"saved"}}}'),
+          sourceFileName: 'saved.json',
+        ).graph;
+
+        final result = ComfyWorkflowCodec.applyDraft(
+          savedGraph: saved,
+          draftBytes: utf8.encode(
+            '{"1":{"class_type":"X","inputs":{"text":"draft"},"unknown":9}}',
+          ),
+        );
+
+        expect(result.accepted, isTrue);
+        expect(result.error, isNull);
+        expect(identical(result.graph, saved), isFalse);
+        expect(result.graph['1']['inputs']['text'], 'draft');
+        expect(result.graph['1']['unknown'], 9);
+        expect(saved['1']['inputs']['text'], 'saved');
+      },
+    );
   });
 
   group('bindings', () {
@@ -131,25 +162,35 @@ void main() {
       expect(graph['1']['inputs']['text'], 'old');
     });
 
-    test('edited graph export preserves unknown fields and no sidecar data', () {
-      final imported = ComfyWorkflowCodec.decode(
-        utf8.encode(
-          '{"1":{"class_type":"X","inputs":{"text":"old"},"unknown":17},"_meta":{"v":9}}',
-        ),
-        sourceFileName: 'workflow.json',
-      );
-      final edited = ComfyWorkflowCodec.applyBindings(
-        imported.graph,
-        [fixtureBinding()],
-        {'prompt': 'new'},
-      );
-      final exported = jsonDecode(jsonEncode(edited)) as Map<String, dynamic>;
+    test(
+      'legitimate bindings field survives while Hermes bindings stay separate',
+      () {
+        final imported = ComfyWorkflowCodec.decode(
+          utf8.encode(
+            '{"1":{"class_type":"X","inputs":{"text":"old"},"bindings":{"custom":true},"unknown":17},"_meta":{"v":9}}',
+          ),
+          sourceFileName: 'workflow.json',
+        );
+        final edited = ComfyWorkflowCodec.applyBindings(
+          imported.graph,
+          [fixtureBinding()],
+          {'prompt': 'new'},
+        );
+        final exported = jsonDecode(jsonEncode(edited)) as Map<String, dynamic>;
 
-      expect(exported['1']['unknown'], 17);
-      expect(exported['_meta'], {'v': 9});
-      expect(exported['1']['inputs']['text'], 'new');
-      expect(jsonEncode(exported), isNot(contains('"bindings"')));
-    });
+        expect(exported['1']['unknown'], 17);
+        expect(exported['_meta'], {'v': 9});
+        expect(exported['1']['inputs']['text'], 'new');
+        expect(exported['1']['bindings'], {'custom': true});
+
+        final definition = fixtureDefinition(
+          graph: edited,
+          bindings: [fixtureBinding()],
+        );
+        expect(definition.workingGraph['1']['bindings'], {'custom': true});
+        expect(definition.bindings.single.id, 'prompt');
+      },
+    );
   });
 
   group('model JSON', () {
@@ -320,6 +361,52 @@ void main() {
         );
       },
     );
+
+    test('schema-enumerated common model inputs report missing choices', () {
+      for (final inputName in [
+        'model_name',
+        'unet_name',
+        'clip_name',
+        'control_net_name',
+      ]) {
+        final result = ComfyWorkflowCodec.validateObjectInfo(
+          definition: fixtureDefinition(
+            graph: {
+              '1': {
+                'class_type': 'Loader',
+                'inputs': {inputName: 'missing.safetensors'},
+              },
+            },
+            bindings: const [],
+          ),
+          endpoint: ComfyEndpoint.parse('http://host:8188'),
+          objectInfo: {
+            'Loader': {
+              'input': {
+                'required': {
+                  inputName: [
+                    ['present.safetensors'],
+                    <String, dynamic>{},
+                  ],
+                },
+              },
+            },
+          },
+        );
+
+        expect(
+          result.issues
+              .where(
+                (issue) =>
+                    issue.code == 'missing_model' &&
+                    issue.inputName == inputName,
+              )
+              .length,
+          1,
+          reason: inputName,
+        );
+      }
+    });
 
     test('endpoint and object-info changes invalidate the fingerprint', () {
       final definition = fixtureDefinition();
