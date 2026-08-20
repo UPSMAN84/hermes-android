@@ -720,7 +720,11 @@ String _validateImageUpload(
       'Extension is unsupported or does not match the image bytes',
     );
   }
-  return extension == 'jpg' ? 'jpeg' : extension;
+  return switch (extension) {
+    'jpg' => 'jpeg',
+    'tif' => 'tiff',
+    _ => extension,
+  };
 }
 
 bool _startsWith(Uint8List bytes, List<int> signature) =>

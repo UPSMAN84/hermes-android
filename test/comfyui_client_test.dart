@@ -109,6 +109,29 @@ void main() {
       expect(request.files.single.contentType.toString(), 'image/jpeg');
     });
 
+    test('upload maps tif and tiff files to image/tiff', () async {
+      for (final extension in ['tif', 'tiff']) {
+        final client = _RecordingClient(
+          (_, _) => _jsonResponse({
+            'name': 'server.$extension',
+            'subfolder': 'uploads',
+            'type': 'input',
+          }),
+        );
+
+        await _comfy(
+          client,
+        ).uploadImage(_tiffBytes, fileName: 'local.$extension');
+
+        final request = client.requests.single.request as http.MultipartRequest;
+        expect(
+          request.files.single.contentType.toString(),
+          'image/tiff',
+          reason: '.$extension must use the registered TIFF media subtype',
+        );
+      }
+    });
+
     test('upload rejects unsafe filenames before network IO', () async {
       final client = _RecordingClient(
         (_, _) => _jsonResponse(<String, Object?>{}),
@@ -677,6 +700,8 @@ final Uint8List _pngBytes = Uint8List.fromList(const [
 ]);
 
 final Uint8List _jpegBytes = Uint8List.fromList(const [0xff, 0xd8, 0xff, 0xd9]);
+
+final Uint8List _tiffBytes = Uint8List.fromList(const [0x49, 0x49, 0x2a, 0x00]);
 
 http.StreamedResponse _jsonResponse(Object? value, {int statusCode = 200}) {
   final body = utf8.encode(jsonEncode(value));
