@@ -2,11 +2,11 @@
 
 ## Stop point
 
-- User requested stopping after the ComfyUI protocol section. Tasks 1-7 of 13 are implemented, reviewed, and committed. Task 8 has **not** started.
+- **All 13 tasks of the ComfyUI generation/workflows plan are implemented and committed.** The feature (endpoint/protocol layer, workflow import/bindings, durable repository, settings/workflow-library UI, Create screen, chat integration, global Media library, and protocol/integration test coverage + docs) is done.
 - Branch: `docs/comfyui-generation-design`
-- Feature head before this handoff edit: `f3a028c`
-- Latest verification: `flutter test` = 331 passed, 2 capability skips; `flutter analyze` = clean.
-- Verification is repository-only. No live ComfyUI, reverse proxy, Android device, or real large-transfer run yet.
+- Feature head after Task 13: `eb25459`
+- Latest verification: `flutter test` = 416 passed, 2 capability skips; `flutter analyze` = clean; `flutter build apk --debug` = succeeded.
+- Verification is repository-only plus one VM-level real loopback protocol test (`test/comfyui_protocol_fake_server_test.dart`). **Not verified**: the device integration test (`integration_test/comfyui_generation_app_test.dart`) and the live-verification script (`tool/run_comfyui_live_verification.ps1`) — both written and statically checked (`flutter analyze` clean, PowerShell AST parse clean) but never executed, because no adb/emulator/phone and no live ComfyUI server/workflow files were available in the environment that authored them. Run both before treating the feature as device-verified.
 
 ## Authoritative files
 
@@ -74,61 +74,53 @@
 - Task 5: a custom cleanup-global legacy downloader injected into `MediaCacheService` is not owned/drained. Production uses the scoped downloader; reject/document or add explicit ownership in final review.
 - Two Windows tests skip when symlink creation privileges are unavailable.
 
-## Remaining work
-
 ### Task 8 — Generation repository/host
 
-Create `generation_repository.dart`, `generation_repository_host.dart`, foreground lease adapter, and repository tests. Required behavior:
-
-- One app-scoped repository and shared storage index; replaying workflow/job/media/context streams.
-- Active endpoint only for new jobs; persisted endpoint snapshot for recovery/media.
-- Persist `submitting` before upload/POST; never resubmit restored work; history-first then queue reconciliation.
-- One socket observer per prompt; serialize socket/cancel/reconcile mutations per job; persist before publish.
-- Queue delete targets only queued prompt; running interrupt requires confirmation; terminal result wins cancellation races.
-- Balance one shared foreground lease; disposal must cancel observers, await work, release once, close clients/streams.
-- Repair succeeded-job media/workflow side effects on restart.
-
-Resolve these Task 8 contract gaps with RED tests before implementation:
-
-- Add reducer events for `CancelRequested`, definite `SubmissionFailed`, and partial `ExecutionOutputsObserved`.
-- Define safe request input-file/reference-image semantics; never persist `File` or raw 25 MiB bytes in `submittedValues`.
-- Define explicit context-enabled/disabled semantics instead of inferring solely from `sourceContextId`.
-- Define endpoint/object-info fingerprint fallback when server validation is missing/stale.
-- Define media kind/content-type classification for arbitrary history outputs.
+- `GenerationRepository`/`DefaultGenerationRepository`: one app-scoped repository, replaying workflow/job/media/character-context streams; persisted `submitting` before POST, history-first-then-queue reconciliation, one socket observer per prompt, per-job locking, balanced foreground lease, safe reference-image/`submittedValues` handling (never persists `File`/raw bytes).
+- Main files: `lib/core/services/generation_repository.dart`, `generation_repository_host.dart`, `background_activity_service.dart`; `test/generation_repository_test.dart` (21 tests).
+- Commits: `4018aa3`, `0ab7526`.
 
 ### Task 9 — Settings and workflow management
 
-- Strict ComfyUI settings/test/open/copy fallback, HTTP warnings, workflow import/duplicate/edit/bind/validate/export/delete, trust-by-content-hash.
-- Add direct `file_picker` and `url_launcher` dependencies if still required; `crypto` is already direct.
+- `ComfyEndpointSettings` (Settings screen): save/test-connection/open-frontend, plain-HTTP-to-unprovable-host acknowledgement gate (HTTPS and literal loopback/LAN/Tailscale-CGNAT ranges exempt).
+- `WorkflowLibraryTab`: import (file picker + clipboard paste), trust-by-content-hash confirmation before any workflow runs, binding review/edit, local/server validation, duplicate, export (source/working-graph/sidecar), delete.
+- Main files: `lib/core/services/workflow_document_port.dart`, `lib/core/widgets/workflow_library_tab.dart`, `lib/core/screens/settings_screen.dart`; `test/workflow_library_tab_test.dart` (15 tests).
+- Commits: `7ab1d53`.
 
 ### Task 10 — Create UI
 
-- Drawer `Create` entry and `CreateScreen` tabs: `Image`, `Video`, `Workflows`.
-- Binding-driven forms, job queue/status/history, cancel/retry/save/share, mobile-safe workflow editing.
+- `CreateScreen` (Image/Video/Workflows tabs), `GenerationForm` (binding-driven inputs; character-context toggle composes directly into the visible prompt, never double-sent), `GenerationJobCard` (state, cancel-with-shared-interrupt-confirmation, retry, save/share/discuss).
+- Main files: `lib/core/widgets/generation_job_card.dart`, `generation_form.dart`, `lib/core/screens/create_screen.dart`.
+- Commits: `97fdb85`.
 
 ### Task 11 — Character-chat integration
 
-- Open Create from chat with editable character/context prompt snapshot; no automatic send.
-- Persist copied reference image; support generated-image `Discuss` back into chat.
+- `Create` drawer entry; chat's **⋮ → Create media** opens `CreateScreen` with the character's appearance prefilled into the editable prompt (no auto-send); copied reference image persisted per session; `Discuss in chat` hands a generated image into the existing multimodal attachment pipeline.
+- Deliberate trade-off: `_handleDiscussImage`/`_saveCharacterGenerationContext`'s file cleanup use synchronous `dart:io` calls (bounded, one-off, not a hot path) — real async file I/O launched from a background task never resolves inside `TestWidgetsFlutterBinding`'s zone.
+- Main files: `lib/core/screens/chat_screen.dart`, `create_screen.dart`; `test/chat_screen_test.dart`.
+- Commits: `677bdd4`.
 
 ### Task 12 — Global Media
 
-- Replace transcript-only image gallery with repository-backed All/Image/Video library.
-- Preserve endpoint snapshots, source-chat jump when known, local-only removal, cache clearing, video lazy loading.
+- `GeneratedMediaView` (shared image/video presentation extracted from chat's old bubbles: stream-first video, one-player-per-screen `GeneratedVideoCoordinator`, save/share/discuss) and a repository-backed `MediaGalleryScreen` (All/Images/Videos filters, endpoint-unavailable fallback, source-message jump gated on both session+message id, local-only delete with explicit cache-clear choice).
+- Regression coverage added for the plan's stated invariants: cross-endpoint filename distinctness, a stale endpoint snapshot surviving a later config change, and `removeMedia` never issuing a server request.
+- Main files: `lib/core/widgets/generated_media_view.dart` (new), `lib/core/screens/media_gallery_screen.dart`, `chat_screen.dart`; `test/generated_media_view_test.dart` (new), `media_gallery_screen_test.dart`, `chat_screen_test.dart`, `generation_repository_test.dart`.
+- Commits: `b83ca3f`.
 
 ### Task 13 — Protocol/device/docs/final gates
 
-- VM fake ComfyUI HTTP+WebSocket protocol server.
-- Android restart/reconciliation flow; real ComfyUI/reverse proxy; image/video generation, save/share/discuss; foreground notification/cancel.
-- `flutter analyze`, full tests, debug APK/device checks, final scoped review of deferred findings.
+- `test/comfyui_protocol_fake_server_test.dart`: a real loopback HTTP+WebSocket ComfyUI stand-in (reverse-proxy prefix, multipart upload, prompt/queue/history/interrupt, execution events including socket loss) — proves `ComfyUiClient`/`ComfyUiSocket` against real transport, not just a scripted `http.Client`. **Run and passing.**
+- `integration_test/comfyui_generation_app_test.dart`: device-level test of the real repository/protocol/UI stack (Create → succeeded job → survives repository reopen → appears in global Media → Discuss-in-chat pop). **Written, `flutter analyze` clean, never executed — no device was available.**
+- `tool/run_comfyui_live_verification.ps1`: parameterized script against a real server + device, redacted JSON report, never installs nodes/mutates ComfyUI, never claims success without a returned history output. **Written, PowerShell-AST-parse clean, never executed — no live ComfyUI server/workflow files were available.**
+- README updated with the full ComfyUI generation user/dev docs section.
+- `flutter test` (416 passed), `flutter analyze` (clean), `flutter build apk --debug` (succeeded) all run in this environment.
+- Commits: `eb25459`.
 
-## Resume
+## Before shipping
 
-1. `git status --short` and `git branch --show-current`; preserve user changes.
-2. Read the design, plan, ledger, and `.superpowers/sdd/2026-08-20-comfyui-generation-workflows/task-8-brief.md`.
-3. Run `C:\src\flutter\bin\flutter.bat test` and `C:\src\flutter\bin\flutter.bat analyze`.
-4. Start Task 8 with RED repository/reducer tests; do not begin UI before repository/reconciliation is reviewed clean.
-5. Keep live/device claims separate from repository test claims.
+1. Run the device integration test on a real emulator/phone: `flutter test integration_test -d <device-id>`.
+2. Run the live-verification script against a real ComfyUI server with real API-format image/video workflow JSON files and a connected device.
+3. Only after both of those pass should this feature be described as device-verified rather than repository-verified.
 
 ---
 
