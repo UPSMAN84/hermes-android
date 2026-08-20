@@ -72,6 +72,15 @@ void main() {
     );
   });
 
+  test('rejects rooted and drive-qualified output subfolders', () {
+    for (final subfolder in ['/etc', '\\Windows', 'C:\\Windows']) {
+      expect(
+        () => ComfyOutputRef(filename: 'clip.mp4', subfolder: subfolder),
+        throwsFormatException,
+      );
+    }
+  });
+
   test('migrates only missing and wildcard placeholder values', () async {
     SharedPreferences.setMockInitialValues({});
     expect(

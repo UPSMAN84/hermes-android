@@ -58,6 +58,9 @@ final class ComfyOutputRef {
         filename.contains('/') ||
         filename.contains('\\') ||
         filename == '..' ||
+        subfolder.startsWith('/') ||
+        subfolder.startsWith('\\') ||
+        RegExp(r'^[A-Za-z]:').hasMatch(subfolder) ||
         subfolder.split(RegExp(r'[/\\]+')).any((part) => part == '..') ||
         !const {'input', 'output', 'temp'}.contains(type)) {
       throw const FormatException('Unsafe ComfyUI output reference');
