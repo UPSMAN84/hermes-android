@@ -47,6 +47,12 @@ void main() {
       expect(lost.outputs, isEmpty);
     });
 
+    test('socket loss while cancelling reconciles instead of cancelling', () {
+      final cancelling = job(state: GenerationJobState.cancelling);
+      final lost = reduceGenerationJob(cancelling, const SocketLost(), later());
+      expect(lost.state, GenerationJobState.reconciling);
+    });
+
     test('queue and history reconciliation select authoritative states', () {
       final reconciling = job(state: GenerationJobState.reconciling);
 
@@ -150,10 +156,7 @@ void main() {
 
       final failed = reduceGenerationJob(
         cancelling,
-        const ExecutionFailed(
-          'node failed',
-          nodeErrors: {'12': 'out of memory'},
-        ),
+        ExecutionFailed('node failed', nodeErrors: {'12': 'out of memory'}),
         later(),
       );
       expect(failed.state, GenerationJobState.failed);
@@ -184,7 +187,7 @@ void main() {
         const ExecutionStarted(),
         const ExecutionProgressed('12', 1, 2),
         ExecutionSucceeded([outputRef()]),
-        const ExecutionFailed('stale'),
+        ExecutionFailed('stale'),
         const ExecutionInterrupted(),
         const SocketLost(),
         const QueueReconciled(true),
@@ -223,6 +226,63 @@ void main() {
       expect(completed.state, GenerationJobState.succeeded);
       expect(completed.outputs, hasLength(1));
       expect(completed.outputs.single.filename, 'result.png');
+    });
+
+    test('empty completed history preserves outputs already observed', () {
+      final executed = job(
+        state: GenerationJobState.reconciling,
+        outputs: [outputRef()],
+      );
+      final completed = reduceGenerationJob(
+        executed,
+        const HistoryReconciled(completed: true),
+        later(),
+      );
+      expect(completed.state, GenerationJobState.succeeded);
+      expect(completed.outputs.single.filename, 'result.png');
+    });
+
+    test('blank accepted prompt ids are ignored', () {
+      final submitting = job(
+        state: GenerationJobState.submitting,
+        promptId: null,
+      );
+      for (final promptId in ['', '   ', '\t']) {
+        final reduced = reduceGenerationJob(
+          submitting,
+          PromptAccepted(promptId),
+          later(),
+        );
+        expect(reduced.state, GenerationJobState.submitting);
+        expect(reduced.promptId, isNull);
+      }
+    });
+
+    test('nested node errors are immutable after reduction', () {
+      final messages = <Object?>['original'];
+      final details = <String, Object?>{'messages': messages};
+      final errors = <String, Object?>{'12': details};
+      final event = ExecutionFailed('node failed', nodeErrors: errors);
+
+      messages[0] = 'mutated';
+      details['extra'] = true;
+      errors['13'] = 'late';
+
+      expect(event.nodeErrors, {
+        '12': {
+          'messages': ['original'],
+        },
+      });
+      final failed = reduceGenerationJob(
+        job(state: GenerationJobState.running),
+        event,
+        later(),
+      );
+      expect(failed.nodeErrors, {
+        '12': {
+          'messages': ['original'],
+        },
+      });
     });
   });
 
@@ -268,6 +328,29 @@ void main() {
       );
     });
 
+    test('blank legacy prompt ids restore as unknown', () {
+      for (final promptId in ['', '   ', '\t']) {
+        final json = job(
+          state: GenerationJobState.submitting,
+          promptId: null,
+        ).toJson()..['promptId'] = promptId;
+        final restored = GenerationJob.fromJson(json);
+        expect(restored.promptId, isNull);
+        expect(
+          reduceGenerationJob(
+            restored,
+            const RestoreWithoutPromptId(),
+            later(),
+          ).state,
+          GenerationJobState.uncertain,
+        );
+        expect(
+          reduceGenerationJob(restored, const SocketLost(), later()).state,
+          GenerationJobState.uncertain,
+        );
+      }
+    });
+
     test('generation request snapshots submitted values and source ids', () {
       final mutable = <String, Object?>{'prompt': 'first'};
       final request = GenerationRequest(
@@ -299,6 +382,22 @@ void main() {
       expect(
         normalized.identityKey,
         isNot(asset(endpoint: 'http://other:8188/comfy').identityKey),
+      );
+    });
+
+    test('identity includes filename, subfolder, and type independently', () {
+      final original = asset(endpoint: 'http://host:8188');
+      expect(
+        original.copyWith(filename: 'other.png').identityKey,
+        isNot(original.identityKey),
+      );
+      expect(
+        original.copyWith(subfolder: 'other').identityKey,
+        isNot(original.identityKey),
+      );
+      expect(
+        original.copyWith(type: 'temp').identityKey,
+        isNot(original.identityKey),
       );
     });
 
@@ -393,6 +492,17 @@ void main() {
         expect(context.toJson(), before);
       },
     );
+
+    test('null context returns the trimmed user prompt', () {
+      expect(
+        composeGenerationPrompt(
+          userPrompt: '  walking through rain  ',
+          context: null,
+          useContext: true,
+        ),
+        'walking through rain',
+      );
+    });
 
     test('JSON round trip preserves app-owned reference image path', () {
       final context = CharacterGenerationContext(

@@ -81,7 +81,7 @@ final class GenerationJob {
     DateTime? completedAt,
   }) : submittedValues = _immutableObject(submittedValues),
        outputs = List.unmodifiable(outputs),
-       nodeErrors = Map.unmodifiable(nodeErrors),
+       nodeErrors = _immutableObject(nodeErrors),
        createdAt = createdAt.toUtc(),
        updatedAt = updatedAt.toUtc(),
        startedAt = startedAt?.toUtc(),
@@ -207,7 +207,7 @@ final class GenerationJob {
       endpointFingerprint: _string(json['endpointFingerprint']),
       endpointSnapshot: _string(json['endpointSnapshot']),
       submittedValues: _jsonObject(json['submittedValues']),
-      promptId: _nullableString(json['promptId']),
+      promptId: _nullableNonBlankString(json['promptId']),
       progressValue: _nonNegativeInt(json['progressValue']),
       progressMax: _nonNegativeInt(json['progressMax']),
       currentNodeId: _nullableString(json['currentNodeId']),
@@ -258,7 +258,12 @@ final class ExecutionSucceeded extends GenerationEvent {
 }
 
 final class ExecutionFailed extends GenerationEvent {
-  const ExecutionFailed(this.message, {this.nodeErrors = const {}});
+  factory ExecutionFailed(
+    String message, {
+    Map<String, Object?> nodeErrors = const {},
+  }) => ExecutionFailed._(message, _immutableObject(nodeErrors));
+
+  const ExecutionFailed._(this.message, this.nodeErrors);
 
   final String message;
   final Map<String, Object?> nodeErrors;
@@ -324,6 +329,7 @@ GenerationJob reduceGenerationJob(
 
   switch (event) {
     case PromptAccepted(:final promptId):
+      if (promptId.trim().isEmpty) return job;
       if (job.state != GenerationJobState.submitting &&
           job.state != GenerationJobState.reconciling) {
         return job;
@@ -542,6 +548,9 @@ Map<String, Object?> _outputToJson(ComfyOutputRef output) => {
 String _string(Object? value) => value is String ? value : '';
 
 String? _nullableString(Object? value) => value is String ? value : null;
+
+String? _nullableNonBlankString(Object? value) =>
+    value is String && value.trim().isNotEmpty ? value : null;
 
 int _nonNegativeInt(Object? value) => value is int && value >= 0 ? value : 0;
 
