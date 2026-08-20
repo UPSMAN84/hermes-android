@@ -5,8 +5,10 @@ import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 
 final http.Client _appMediaHttpClient = http.Client();
-final MediaDownloadPort appMediaDownloadService = DefaultMediaDownloadService(
+final _FileMutationGate _appMediaFileMutationGate = _FileMutationGate();
+final MediaDownloadPort appMediaDownloadService = DefaultMediaDownloadService._(
   httpClient: _appMediaHttpClient,
+  mutationGate: _appMediaFileMutationGate,
 );
 
 final class MediaDownloadLimitException implements Exception {
@@ -47,6 +49,10 @@ abstract interface class MediaDownloadPort {
   });
 }
 
+abstract interface class MediaDownloadCleanupPort {
+  Future<void> drainCleanup();
+}
+
 abstract interface class MediaCachePort {
   Future<File?> cache(Uri uri, {Map<String, String> headers = const {}});
 
@@ -74,19 +80,35 @@ final class DefaultMediaFileOperations implements MediaFileOperations {
   Stream<FileSystemEntity> list(Directory directory) => directory.list();
 }
 
-final class DefaultMediaDownloadService implements MediaDownloadPort {
+final class DefaultMediaDownloadService
+    implements MediaDownloadPort, MediaDownloadCleanupPort {
   // Keep the public named httpClient parameter; storage remains private.
-  DefaultMediaDownloadService({
+  factory DefaultMediaDownloadService({
     required http.Client httpClient,
+    MediaFileOperations fileOperations = const DefaultMediaFileOperations(),
+  }) => DefaultMediaDownloadService._(
+    httpClient: httpClient,
+    fileOperations: fileOperations,
+    mutationGate: _FileMutationGate(),
+  );
+
+  DefaultMediaDownloadService._({
+    required http.Client httpClient,
+    required _FileMutationGate mutationGate,
     MediaFileOperations fileOperations = const DefaultMediaFileOperations(),
   })
     // ignore: prefer_initializing_formals
     : _httpClient = httpClient,
        // ignore: prefer_initializing_formals
-       _fileOperations = fileOperations;
+       _fileOperations = fileOperations,
+       // ignore: prefer_initializing_formals
+       _mutationGate = mutationGate;
 
   final http.Client _httpClient;
   final MediaFileOperations _fileOperations;
+  final _FileMutationGate _mutationGate;
+  final Set<String> _pendingPartialCleanup = {};
+  Future<void>? _cleanupFuture;
 
   static int _temporaryFileSequence = 0;
 
@@ -179,8 +201,38 @@ final class DefaultMediaDownloadService implements MediaDownloadPort {
         if (await part.exists()) {
           await _fileOperations.delete(part);
         }
-      } catch (_) {}
+      } catch (_) {
+        _pendingPartialCleanup.add(part.path);
+      }
       rethrow;
+    }
+  }
+
+  @override
+  Future<void> drainCleanup() {
+    final active = _cleanupFuture;
+    if (active != null) return active;
+
+    late final Future<void> operation;
+    operation = _drainCleanupPass().whenComplete(() {
+      if (identical(_cleanupFuture, operation)) _cleanupFuture = null;
+    });
+    _cleanupFuture = operation;
+    return operation;
+  }
+
+  Future<void> _drainCleanupPass() async {
+    final pending = _pendingPartialCleanup.toList(growable: false);
+    for (final path in pending) {
+      final part = File(path);
+      try {
+        if (!await part.exists()) {
+          _pendingPartialCleanup.remove(path);
+          continue;
+        }
+        await _fileOperations.delete(part);
+        _pendingPartialCleanup.remove(path);
+      } catch (_) {}
     }
   }
 
@@ -204,55 +256,91 @@ final class DefaultMediaDownloadService implements MediaDownloadPort {
     return File('${destination.path}.$timestamp.$sequence.$suffix');
   }
 
-  Future<File> _promote(File part, File destination) async {
-    File? old;
-    if (await destination.exists()) {
-      old = _uniqueSibling(destination, 'old');
-      await _fileOperations.rename(destination, old.path);
-    }
-
-    try {
-      await _fileOperations.rename(part, destination.path);
-    } catch (_) {
-      if (old != null && await old.exists()) {
+  Future<File> _promote(File part, File destination) =>
+      _mutationGate.run(() async {
+        File? old;
         if (await destination.exists()) {
+          old = _uniqueSibling(destination, 'old');
+          await _fileOperations.rename(destination, old.path);
+          _mutationGate.markChanged(destination.path);
+        }
+
+        try {
+          await _fileOperations.rename(part, destination.path);
+          _mutationGate.markChanged(destination.path);
+        } catch (_) {
+          if (old != null && await old.exists()) {
+            if (await destination.exists()) {
+              try {
+                await _fileOperations.delete(destination);
+                _mutationGate.markChanged(destination.path);
+              } catch (_) {}
+            }
+            await _fileOperations.rename(old, destination.path);
+            _mutationGate.markChanged(destination.path);
+          }
+          rethrow;
+        }
+
+        if (old != null && await old.exists()) {
           try {
-            await _fileOperations.delete(destination);
+            await _fileOperations.delete(old);
           } catch (_) {}
         }
-        await _fileOperations.rename(old, destination.path);
-      }
-      rethrow;
-    }
-
-    if (old != null && await old.exists()) {
-      try {
-        await _fileOperations.delete(old);
-      } catch (_) {}
-    }
-    return destination;
-  }
+        return destination;
+      });
 }
 
 final class MediaCacheService implements MediaCachePort {
-  MediaCacheService({
+  factory MediaCacheService({
     required Directory root,
     http.Client? httpClient,
     MediaDownloadPort? downloadService,
-    this.maxImageBytes = 50 * 1024 * 1024,
-    this.maxCacheBytes = 512 * 1024 * 1024,
-    this.maxAge = const Duration(days: 30),
+    int maxImageBytes = 50 * 1024 * 1024,
+    int maxCacheBytes = 512 * 1024 * 1024,
+    Duration maxAge = const Duration(days: 30),
     DateTime Function()? clock,
     MediaFileOperations fileOperations = const DefaultMediaFileOperations(),
-  }) : _root = Future<Directory>.value(root),
+  }) {
+    final mutationGate = _FileMutationGate();
+    return MediaCacheService._(
+      root: Future<Directory>.value(root),
+      maxImageBytes: maxImageBytes,
+      maxCacheBytes: maxCacheBytes,
+      maxAge: maxAge,
+      fileOperations: fileOperations,
+      downloadService:
+          downloadService ??
+          DefaultMediaDownloadService._(
+            httpClient: httpClient ?? http.Client(),
+            fileOperations: fileOperations,
+            mutationGate: mutationGate,
+          ),
+      clock: clock ?? DateTime.now,
+      mutationGate: mutationGate,
+    );
+  }
+
+  MediaCacheService._({
+    required Future<Directory> root,
+    required this.maxImageBytes,
+    required this.maxCacheBytes,
+    required this.maxAge,
+    required MediaFileOperations fileOperations,
+    required MediaDownloadPort downloadService,
+    required DateTime Function() clock,
+    required _FileMutationGate mutationGate,
+  })
+    // ignore: prefer_initializing_formals
+    : _root = root,
+       // ignore: prefer_initializing_formals
        _fileOperations = fileOperations,
-       _downloadService =
-           downloadService ??
-           DefaultMediaDownloadService(
-             httpClient: httpClient ?? http.Client(),
-             fileOperations: fileOperations,
-           ),
-       _clock = clock ?? DateTime.now;
+       // ignore: prefer_initializing_formals
+       _downloadService = downloadService,
+       // ignore: prefer_initializing_formals
+       _clock = clock,
+       // ignore: prefer_initializing_formals
+       _mutationGate = mutationGate;
 
   MediaCacheService._appDefault()
     : _root = _applicationCacheRoot(),
@@ -261,7 +349,8 @@ final class MediaCacheService implements MediaCachePort {
       maxAge = const Duration(days: 30),
       _fileOperations = const DefaultMediaFileOperations(),
       _downloadService = appMediaDownloadService,
-      _clock = DateTime.now;
+      _clock = DateTime.now,
+      _mutationGate = _appMediaFileMutationGate;
 
   final Future<Directory> _root;
   final int maxImageBytes;
@@ -270,6 +359,7 @@ final class MediaCacheService implements MediaCachePort {
   final MediaFileOperations _fileOperations;
   final MediaDownloadPort _downloadService;
   final DateTime Function() _clock;
+  final _FileMutationGate _mutationGate;
   final Map<String, Future<File>> _inFlight = {};
   Future<void>? _maintenanceFuture;
   bool _maintenanceRequested = false;
@@ -304,7 +394,6 @@ final class MediaCacheService implements MediaCachePort {
     operation = _cache(uri, headers: headers, requireImage: requireImage)
         .whenComplete(() {
           if (identical(_inFlight[key], operation)) _inFlight.remove(key);
-          _scheduleMaintenance();
         });
     _inFlight[key] = operation;
     return operation;
@@ -344,6 +433,8 @@ final class MediaCacheService implements MediaCachePort {
         return destination;
       }
       rethrow;
+    } finally {
+      _scheduleMaintenance();
     }
   }
 
@@ -357,7 +448,12 @@ final class MediaCacheService implements MediaCachePort {
     }
 
     final file = await _fileForUri(uri);
-    if (await file.exists()) await _fileOperations.delete(file);
+    await _mutationGate.run(() async {
+      if (await file.exists()) {
+        await _fileOperations.delete(file);
+        _mutationGate.markDeleted(file.path);
+      }
+    });
   }
 
   Future<void> drainMaintenance() async {
@@ -446,7 +542,7 @@ final class MediaCacheService implements MediaCachePort {
     try {
       final root = await _root;
       await root.create(recursive: true);
-      final entries = <({File file, DateTime modified, int size})>[];
+      final entries = <_CacheEntry>[];
       var totalBytes = 0;
       await for (final entity in _fileOperations.list(root)) {
         if (entity is! File) continue;
@@ -464,57 +560,98 @@ final class MediaCacheService implements MediaCachePort {
         }
 
         if (entity.path.endsWith('.old')) {
-          final canonical = _canonicalForOld(entity);
-          if (canonical == null) {
-            totalBytes += await _safeLength(entity);
-            continue;
-          }
-
-          if (await _safeExists(canonical)) {
-            try {
-              await _fileOperations.delete(entity);
-              continue;
-            } catch (_) {
-              totalBytes += await _safeLength(entity);
-              continue;
-            }
-          }
-
-          try {
-            final restored = await _fileOperations.rename(
-              entity,
-              canonical.path,
-            );
-            final stat = await restored.stat();
-            entries.add((
-              file: restored,
-              modified: stat.modified,
-              size: stat.size,
-            ));
-            totalBytes += stat.size;
-          } catch (_) {
-            totalBytes += await _safeLength(entity);
-          }
+          final recovered = await _recoverOrCleanOld(entity);
+          if (recovered.entry case final entry?) entries.add(entry);
+          totalBytes += recovered.size;
           continue;
         }
 
-        try {
-          final stat = await entity.stat();
-          entries.add((file: entity, modified: stat.modified, size: stat.size));
-          totalBytes += stat.size;
-        } catch (_) {}
+        final entry = await _snapshotCanonical(entity);
+        if (entry != null) {
+          entries.add(entry);
+          totalBytes += entry.size;
+        }
       }
 
       entries.sort((a, b) => a.modified.compareTo(b.modified));
       for (final entry in entries) {
         if (totalBytes <= maxCacheBytes) break;
-        try {
-          await _fileOperations.delete(entry.file);
+        final outcome = await _evictIfUnchanged(entry);
+        if (outcome == _EvictionOutcome.deleted) {
           totalBytes -= entry.size;
-        } catch (_) {}
+        } else if (outcome == _EvictionOutcome.changed) {
+          _maintenanceRequested = true;
+        }
       }
     } catch (_) {}
   }
+
+  Future<_CacheEntry?> _snapshotCanonical(File file) =>
+      _mutationGate.run(() async {
+        try {
+          final stat = await file.stat();
+          return _CacheEntry(
+            file: file,
+            modified: stat.modified,
+            size: stat.size,
+            generation: _mutationGate.generation(file.path),
+          );
+        } catch (_) {
+          return null;
+        }
+      });
+
+  Future<({int size, _CacheEntry? entry})> _recoverOrCleanOld(File old) async {
+    final canonical = _canonicalForOld(old);
+    if (canonical == null) return (size: await _safeLength(old), entry: null);
+
+    return _mutationGate.run(() async {
+      if (await _safeExists(canonical)) {
+        try {
+          await _fileOperations.delete(old);
+          return (size: 0, entry: null);
+        } catch (_) {
+          return (size: await _safeLength(old), entry: null);
+        }
+      }
+
+      try {
+        final restored = await _fileOperations.rename(old, canonical.path);
+        _mutationGate.markChanged(canonical.path);
+        final stat = await restored.stat();
+        return (
+          size: stat.size,
+          entry: _CacheEntry(
+            file: restored,
+            modified: stat.modified,
+            size: stat.size,
+            generation: _mutationGate.generation(restored.path),
+          ),
+        );
+      } catch (_) {
+        return (size: await _safeLength(old), entry: null);
+      }
+    });
+  }
+
+  Future<_EvictionOutcome> _evictIfUnchanged(_CacheEntry entry) =>
+      _mutationGate.run(() async {
+        if (_mutationGate.generation(entry.file.path) != entry.generation) {
+          return _EvictionOutcome.changed;
+        }
+
+        try {
+          final stat = await entry.file.stat();
+          if (stat.size != entry.size || stat.modified != entry.modified) {
+            return _EvictionOutcome.changed;
+          }
+          await _fileOperations.delete(entry.file);
+          _mutationGate.markDeleted(entry.file.path);
+          return _EvictionOutcome.deleted;
+        } catch (_) {
+          return _EvictionOutcome.failed;
+        }
+      });
 
   static File? _canonicalForOld(File old) {
     final match = RegExp(r'^(.*)\.\d+\.\d+\.old$').firstMatch(old.path);
@@ -536,5 +673,50 @@ final class MediaCacheService implements MediaCachePort {
     } catch (_) {
       return 0;
     }
+  }
+}
+
+final class _CacheEntry {
+  const _CacheEntry({
+    required this.file,
+    required this.modified,
+    required this.size,
+    required this.generation,
+  });
+
+  final File file;
+  final DateTime modified;
+  final int size;
+  final int generation;
+}
+
+enum _EvictionOutcome { deleted, changed, failed }
+
+final class _FileMutationGate {
+  Future<void> _tail = Future<void>.value();
+  final Map<String, int> _generations = {};
+  int _nextGeneration = 0;
+
+  Future<T> run<T>(Future<T> Function() action) {
+    final previous = _tail;
+    final released = Completer<void>();
+    _tail = released.future;
+    return previous.then((_) async {
+      try {
+        return await action();
+      } finally {
+        released.complete();
+      }
+    });
+  }
+
+  int generation(String path) => _generations[path] ?? 0;
+
+  void markDeleted(String path) {
+    _generations.remove(path);
+  }
+
+  void markChanged(String path) {
+    _generations[path] = ++_nextGeneration;
   }
 }

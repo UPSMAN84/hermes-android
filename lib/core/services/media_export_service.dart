@@ -128,6 +128,17 @@ class MediaExportService {
     }
   }
 
+  Future<void> drainCleanup() {
+    final downloadService = _downloadService;
+    if (downloadService is MediaDownloadCleanupPort) {
+      final cleanupService = downloadService as MediaDownloadCleanupPort;
+      return cleanupService.drainCleanup();
+    }
+    return Future<void>.value();
+  }
+
+  Future<void> close() => drainCleanup();
+
   Future<bool> Function(MediaDownloadInfo) _confirmation(
     Future<bool> Function(MediaDownloadInfo)? confirmAfterHeaders,
   ) {

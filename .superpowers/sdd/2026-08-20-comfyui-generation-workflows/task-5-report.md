@@ -90,3 +90,43 @@ Deterministic fixtures cover non-2xx, declared-over, missing/lying length, conte
 - Missing `libmpv` log remains graceful.
 - Popup regression uses direct rendered callback because Windows hit-test animation was nondeterministic.
 - One symlink privilege skip.
+
+# Review round 2 (2026-08-20)
+
+## RED/GREEN
+
+- RED 1: focused media test first failed to compile because export cleanup had no lifecycle drain/close seam.
+- RED 2 after the cleanup seam: 27 passed and exactly 2 intended regressions failed—the paused maintenance scan deleted freshly promoted bytes, and repeated complete hits increased scan count from 1 to 2.
+- GREEN focused media: 29/29 passed.
+- GREEN focused gallery/chat: 27/27 passed.
+- Touched Dart analyzer: three files, no issues.
+- Final full Flutter test: 271 passed, 1 skipped for Windows symlink privilege.
+
+## Concurrency interleavings
+
+- Maintenance snapshots canonical stat plus a per-path generation under the same FIFO gate used by default-service promotion.
+- In the deterministic overlap, scan snapshots old metadata, refresh promotes fresh bytes and advances the generation, then resumed eviction revalidates under the gate, skips the stale target, and evicts the unchanged pressure file.
+- Network/body streaming stays outside the gate, so different-URI downloads remain independent; only canonical promotion, rollback/restore, removal, and capacity deletion serialize.
+- Changed snapshots request one fresh maintenance pass; delete failures do not self-spin.
+- Fresh complete hits do not schedule maintenance. Download success/failure schedules deferred coalesced maintenance, while close remains an explicit drain.
+- Export partial cleanup is owned by the default downloader, coalesced by one drain future, and retried through MediaExportService.close.
+
+## Tests
+
+- Added a paused-list deterministic stale-snapshot regression proving fresh bytes survive and capacity remains bounded.
+- Added a repeated-hit scan counter proving ordinary cache hits perform no full list/sort.
+- Added injected first-delete failure coverage proving export close retries and leaves no .part file.
+- Existing same-URI coalescing, different-URI independence, 2 GiB cap, rollback, video stream-first, gallery injection, and disposal guards remain green.
+
+## Files
+
+- lib/core/services/media_cache_service.dart
+- lib/core/services/media_export_service.dart
+- test/media_cache_service_test.dart
+- .superpowers/sdd/2026-08-20-comfyui-generation-workflows/task-5-report.md
+
+## Concerns
+
+- Repository-only verification; no live gateway/device or real multi-GiB transfer.
+- Missing libmpv remains a graceful Windows test log.
+- Full suite retained the expected Windows symlink privilege skip.
