@@ -348,16 +348,20 @@ abstract final class ComfyWorkflowCodec {
   };
 
   static bool _looksLikeModelInput(String inputName) {
-    final normalized = inputName.toLowerCase();
-    return normalized.contains('model') ||
-        normalized.contains('checkpoint') ||
-        normalized.contains('ckpt') ||
-        normalized.contains('unet') ||
-        normalized.contains('clip') ||
-        normalized.contains('control_net') ||
-        normalized.contains('controlnet') ||
-        normalized.contains('lora') ||
-        normalized.contains('vae');
+    return const {
+      'model_name',
+      'checkpoint_name',
+      'ckpt_name',
+      'unet_name',
+      'clip_name',
+      'clip_name1',
+      'clip_name2',
+      'clip_name3',
+      'control_net_name',
+      'controlnet_name',
+      'lora_name',
+      'vae_name',
+    }.contains(inputName.toLowerCase());
   }
 
   static Object? _sortJson(Object? value) {

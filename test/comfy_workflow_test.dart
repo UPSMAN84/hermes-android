@@ -365,9 +365,17 @@ void main() {
     test('schema-enumerated common model inputs report missing choices', () {
       for (final inputName in [
         'model_name',
+        'checkpoint_name',
+        'ckpt_name',
         'unet_name',
         'clip_name',
+        'clip_name1',
+        'clip_name2',
+        'clip_name3',
         'control_net_name',
+        'controlnet_name',
+        'lora_name',
+        'vae_name',
       ]) {
         final result = ComfyWorkflowCodec.validateObjectInfo(
           definition: fixtureDefinition(
@@ -403,6 +411,69 @@ void main() {
               )
               .length,
           1,
+          reason: inputName,
+        );
+      }
+    });
+
+    test('non-selector enums use enum mismatch, not missing model', () {
+      for (final inputName in [
+        'model_type',
+        'checkpoint_mode',
+        'ckpt_mode',
+        'unet_mode',
+        'clip_mode',
+        'control_net_mode',
+        'controlnet_mode',
+        'lora_mode',
+        'vae_mode',
+      ]) {
+        final result = ComfyWorkflowCodec.validateObjectInfo(
+          definition: fixtureDefinition(
+            graph: {
+              '1': {
+                'class_type': 'ConfigNode',
+                'inputs': {inputName: 'unsupported'},
+              },
+            },
+            bindings: [
+              fixtureBinding(
+                id: inputName,
+                inputName: inputName,
+                role: BindingRole.custom,
+                controlType: WorkflowControlType.enumeration,
+              ),
+            ],
+          ),
+          endpoint: ComfyEndpoint.parse('http://host:8188'),
+          objectInfo: {
+            'ConfigNode': {
+              'input': {
+                'required': {
+                  inputName: [
+                    ['supported'],
+                    <String, dynamic>{},
+                  ],
+                },
+              },
+            },
+          },
+        );
+
+        expect(
+          result.issues
+              .where(
+                (issue) =>
+                    issue.code == 'enum_mismatch' &&
+                    issue.inputName == inputName,
+              )
+              .length,
+          1,
+          reason: inputName,
+        );
+        expect(
+          result.issues.where((issue) => issue.code == 'missing_model'),
+          isEmpty,
           reason: inputName,
         );
       }
