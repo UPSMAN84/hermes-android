@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:hermes_android/core/models/comfy_ui_graph.dart';
 import 'package:hermes_android/core/models/comfy_workflow.dart';
 import 'package:hermes_android/core/services/comfy_workflow_codec.dart';
 
@@ -50,6 +51,40 @@ void main() {
           reason: source,
         );
       }
+    });
+
+    test('accepts ComfyUI\'s regular UI-format export (nodes/links)', () {
+      final source = utf8.encode(
+        jsonEncode({
+          'last_node_id': 1,
+          'last_link_id': 0,
+          'nodes': [
+            {
+              'id': 1,
+              'type': 'CheckpointLoaderSimple',
+              'pos': [0, 0],
+              'size': [300, 100],
+              'mode': 0,
+              'inputs': <dynamic>[],
+              'outputs': <dynamic>[],
+              'properties': <String, dynamic>{},
+              'widgets_values': ['sd_xl_base_1.0.safetensors'],
+            },
+          ],
+          'links': <dynamic>[],
+          'groups': <dynamic>[],
+          'config': <String, dynamic>{},
+          'extra': <String, dynamic>{},
+          'version': 0.4,
+        }),
+      );
+
+      final imported = ComfyWorkflowCodec.decode(
+        source,
+        sourceFileName: 'ui-workflow.json',
+      );
+
+      expect(ComfyWorkflowCodec.shapeOf(imported.graph), ComfyGraphShape.uiFormat);
     });
 
     test('rejected raw draft returns the unchanged saved graph', () {
@@ -191,6 +226,55 @@ void main() {
         expect(definition.bindings.single.id, 'prompt');
       },
     );
+  });
+
+  group('inline value editing', () {
+    test('updateFlatGraphInput mutates only a deep copy', () {
+      final graph = <String, dynamic>{
+        '1': {
+          'class_type': 'X',
+          'inputs': {'text': 'old'},
+        },
+      };
+
+      final updated = ComfyWorkflowCodec.updateFlatGraphInput(
+        graph: graph,
+        nodeId: '1',
+        inputName: 'text',
+        value: 'new',
+      );
+
+      expect(updated['1']['inputs']['text'], 'new');
+      expect(graph['1']['inputs']['text'], 'old');
+    });
+
+    test('updateFlatGraphInput rejects an unknown node or input', () {
+      final graph = <String, dynamic>{
+        '1': {
+          'class_type': 'X',
+          'inputs': {'text': 'old'},
+        },
+      };
+      expect(
+        () => ComfyWorkflowCodec.updateFlatGraphInput(
+          graph: graph,
+          nodeId: '2',
+          inputName: 'text',
+          value: 'new',
+        ),
+        throwsStateError,
+      );
+      expect(
+        () => ComfyWorkflowCodec.updateFlatGraphInput(
+          graph: graph,
+          nodeId: '1',
+          inputName: 'missing',
+          value: 'new',
+        ),
+        throwsStateError,
+      );
+    });
+
   });
 
   group('model JSON', () {
@@ -542,6 +626,26 @@ void main() {
       'image',
     ]);
     expect(jsonEncode(graph), before);
+  });
+
+  test('suggestions skip inputs wired to another node', () {
+    final graph = <String, dynamic>{
+      '1': {
+        'class_type': 'Common',
+        'inputs': {
+          'text': 'hello',
+          'width': ['2', 0],
+          'height': 512,
+        },
+      },
+    };
+
+    final suggestions = ComfyWorkflowCodec.suggestBindings(graph);
+
+    expect(suggestions.map((binding) => binding.inputName), [
+      'text',
+      'height',
+    ]);
   });
 }
 

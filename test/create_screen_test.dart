@@ -10,6 +10,7 @@ import 'package:hermes_android/core/models/connection.dart';
 import 'package:hermes_android/core/models/generation_job.dart';
 import 'package:hermes_android/core/models/media_asset.dart';
 import 'package:hermes_android/core/screens/create_screen.dart';
+import 'package:hermes_android/core/services/comfy_ui_graph_converter.dart';
 import 'package:hermes_android/core/services/generation_repository.dart';
 
 void main() {
@@ -257,6 +258,13 @@ final class _FakeGenerationRepository implements GenerationRepository {
     String workflowId, {
     required bool againstServer,
   }) => throw UnimplementedError();
+
+  @override
+  Future<JsonObject> fetchObjectInfo() => throw UnimplementedError();
+
+  @override
+  Future<GraphConversionResult> normalizeImportedGraph(JsonObject graph) =>
+      throw UnimplementedError();
 
   @override
   Future<Uint8List> exportWorkflow(

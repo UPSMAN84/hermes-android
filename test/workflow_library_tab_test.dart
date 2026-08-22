@@ -7,9 +7,12 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/models/character_generation_context.dart';
 import 'package:hermes_android/core/models/comfy_workflow.dart';
+import 'package:hermes_android/core/models/comfy_ui_graph.dart';
 import 'package:hermes_android/core/models/generation_job.dart';
 import 'package:hermes_android/core/models/media_asset.dart';
 import 'package:hermes_android/core/screens/settings_screen.dart';
+import 'package:hermes_android/core/services/comfy_ui_graph_converter.dart';
+import 'package:hermes_android/core/services/comfy_workflow_codec.dart';
 import 'package:hermes_android/core/services/comfyui_client.dart';
 import 'package:hermes_android/core/services/generation_repository.dart';
 import 'package:hermes_android/core/services/workflow_document_port.dart';
@@ -47,7 +50,7 @@ void main() {
       await tester.tap(find.text('Import workflow'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Confirm inputs'), findsOneWidget);
+      expect(find.text('Review workflow inputs'), findsOneWidget);
       expect(repository.savedWorkflows, isEmpty);
     });
 
@@ -59,7 +62,7 @@ void main() {
       await tester.tap(find.text('Import workflow'));
       await tester.pumpAndSettle();
 
-      await tester.tap(find.widgetWithText(FilledButton, 'Confirm inputs'));
+      await tester.tap(find.byKey(const Key('binding-editor-save')));
       await tester.pumpAndSettle();
 
       expect(repository.savedWorkflows, hasLength(1));
@@ -92,7 +95,7 @@ void main() {
       await tester.tap(find.text('Paste workflow JSON'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Confirm inputs'), findsOneWidget);
+      expect(find.text('Review workflow inputs'), findsOneWidget);
     });
 
     testWidgets('an oversized import is rejected before the confirm dialog', (
@@ -105,10 +108,64 @@ void main() {
       await tester.tap(find.text('Import workflow'));
       await tester.pumpAndSettle();
 
-      expect(find.text('Confirm inputs'), findsNothing);
+      expect(find.text('Review workflow inputs'), findsNothing);
       expect(find.textContaining('Invalid workflow JSON'), findsOneWidget);
       expect(repository.savedWorkflows, isEmpty);
     });
+
+    testWidgets(
+      'importing a native UI-format export converts it once at import time '
+      'and reaches the editor pre-populated via suggestBindings on the '
+      'converted flat graph',
+      (tester) async {
+        documents.importedBytes = _uiFormatWorkflowBytes;
+        documents.importedFileName = 'ui-workflow.json';
+        repository.nextObjectInfo = _ksamplerObjectInfo;
+
+        await tester.pumpWidget(harness());
+        await tester.tap(find.text('Import workflow'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Review workflow inputs'), findsOneWidget);
+        // suggestBindings only matches against a flat graph -- reaching a
+        // pre-checked "steps" row here confirms normalizeImportedGraph ran
+        // the UI->API conversion before suggestions were computed.
+        expect(
+          find.byKey(const Key('binding-row-1-steps-expose')),
+          findsOneWidget,
+        );
+        final checkbox = tester.widget<CheckboxListTile>(
+          find.byKey(const Key('binding-row-1-steps-expose')),
+        );
+        expect(checkbox.value, isTrue);
+
+        await tester.tap(find.byKey(const Key('binding-editor-save')));
+        await tester.pumpAndSettle();
+
+        expect(repository.savedWorkflows, hasLength(1));
+        final saved = repository.savedWorkflows.single;
+        expect(saved.workingGraph['1']['class_type'], 'KSampler');
+        expect(saved.workingGraph['1']['inputs']['steps'], 20);
+      },
+    );
+
+    testWidgets(
+      'importing a native UI-format export with no reachable endpoint fails '
+      'with a clear message instead of opening the editor',
+      (tester) async {
+        documents.importedBytes = _uiFormatWorkflowBytes;
+        documents.importedFileName = 'ui-workflow.json';
+        repository.endpointConfigured = false;
+
+        await tester.pumpWidget(harness());
+        await tester.tap(find.text('Import workflow'));
+        await tester.pumpAndSettle();
+
+        expect(find.text('Review workflow inputs'), findsNothing);
+        expect(find.textContaining('Connect to ComfyUI'), findsOneWidget);
+        expect(repository.savedWorkflows, isEmpty);
+      },
+    );
 
     testWidgets('local validation reports the issue count', (tester) async {
       await repository.saveWorkflow(
@@ -196,6 +253,71 @@ void main() {
 
       expect(repository.savedWorkflows, isEmpty);
     });
+
+    testWidgets(
+      'editing and exposing an input on a saved workflow updates its value '
+      'and binds it',
+      (tester) async {
+        await repository.saveWorkflow(
+          _savedWorkflow,
+          sourceBytes: _workflowBytes,
+        );
+
+        await tester.pumpWidget(harness());
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Edit bindings'));
+        await tester.pumpAndSettle();
+
+        expect(find.textContaining('— bindings'), findsOneWidget);
+        const valueKey = Key('binding-row-1-text-value');
+        const exposeKey = Key('binding-row-1-text-expose');
+        expect(find.byKey(valueKey), findsOneWidget);
+
+        await tester.enterText(find.byKey(valueKey), 'a dog');
+        await tester.tap(find.byKey(exposeKey));
+        await tester.pumpAndSettle();
+        await tester.tap(find.byKey(const Key('binding-editor-save')));
+        await tester.pumpAndSettle();
+
+        final saved = repository.savedWorkflows.firstWhere(
+          (workflow) => workflow.id == 'workflow-1',
+        );
+        expect(saved.bindings, hasLength(1));
+        expect(saved.bindings.single.nodeId, '1');
+        expect(saved.bindings.single.inputName, 'text');
+        expect(saved.bindings.single.defaultValue, 'a dog');
+        expect(saved.workingGraph['1']['inputs']['text'], 'a dog');
+      },
+    );
+
+    testWidgets(
+      'editing the value field without exposing it updates the graph but '
+      'creates no binding',
+      (tester) async {
+        await repository.saveWorkflow(
+          _savedWorkflow,
+          sourceBytes: _workflowBytes,
+        );
+
+        await tester.pumpWidget(harness());
+        await tester.pumpAndSettle();
+        await tester.tap(find.text('Edit bindings'));
+        await tester.pumpAndSettle();
+
+        await tester.enterText(
+          find.byKey(const Key('binding-row-1-text-value')),
+          'a dog',
+        );
+        await tester.tap(find.byKey(const Key('binding-editor-save')));
+        await tester.pumpAndSettle();
+
+        final saved = repository.savedWorkflows.firstWhere(
+          (workflow) => workflow.id == 'workflow-1',
+        );
+        expect(saved.bindings, isEmpty);
+        expect(saved.workingGraph['1']['inputs']['text'], 'a dog');
+      },
+    );
   });
 
   group('ComfyEndpointSettings', () {
@@ -418,6 +540,40 @@ final ComfyWorkflowDefinition _savedWorkflow = ComfyWorkflowDefinition(
   updatedAt: DateTime.utc(2026, 8, 20),
 );
 
+/// A native ComfyUI "Save" export (UI-format) -- one KSampler node with a
+/// positional `steps` widget value -- used to exercise
+/// `normalizeImportedGraph`'s UI->API conversion at import time.
+final Uint8List _uiFormatWorkflowBytes = Uint8List.fromList(
+  utf8.encode(
+    jsonEncode({
+      'nodes': [
+        {
+          'id': 1,
+          'type': 'KSampler',
+          'pos': [0, 0],
+          'size': [300, 200],
+          'mode': 0,
+          'inputs': <dynamic>[],
+          'outputs': <dynamic>[],
+          'properties': <String, dynamic>{},
+          'widgets_values': [20],
+        },
+      ],
+      'links': <dynamic>[],
+    }),
+  ),
+);
+
+const _ksamplerObjectInfo = {
+  'KSampler': {
+    'input': {
+      'required': {
+        'steps': ['INT', <String, dynamic>{}],
+      },
+    },
+  },
+};
+
 final class _FakeWorkflowDocumentPort implements WorkflowDocumentPort {
   Uint8List? importedBytes;
   String importedFileName = 'workflow.json';
@@ -449,6 +605,9 @@ final class _FakeGenerationRepository implements GenerationRepository {
   WorkflowValidationResult? nextLocalValidation;
   WorkflowValidationResult? nextServerValidation;
   Object? serverValidationError;
+  JsonObject? nextObjectInfo;
+  Object? objectInfoError;
+  bool endpointConfigured = true;
 
   List<ComfyWorkflowDefinition> get savedWorkflows =>
       _workflows.values.toList(growable: false);
@@ -551,6 +710,53 @@ final class _FakeGenerationRepository implements GenerationRepository {
       return nextServerValidation ?? const WorkflowValidationResult(issues: []);
     }
     return nextLocalValidation ?? const WorkflowValidationResult(issues: []);
+  }
+
+  @override
+  Future<JsonObject> fetchObjectInfo() async {
+    final error = objectInfoError;
+    if (error != null) throw error;
+    return nextObjectInfo ?? const {};
+  }
+
+  @override
+  Future<GraphConversionResult> normalizeImportedGraph(JsonObject graph) async {
+    if (ComfyWorkflowCodec.shapeOf(graph) == ComfyGraphShape.flatApi) {
+      return ConvertedPrompt(graph);
+    }
+    if (!endpointConfigured) {
+      return const ConversionFailed([
+        WorkflowValidationIssue(
+          code: 'no_endpoint',
+          message: 'Connect to ComfyUI before importing a native ComfyUI '
+              '"Save" export, or re-export the workflow using ComfyUI\'s '
+              '"Export (API)" format instead.',
+        ),
+      ]);
+    }
+    final error = objectInfoError;
+    if (error != null) {
+      return ConversionFailed([
+        WorkflowValidationIssue(
+          code: 'object_info_unavailable',
+          message: 'Could not fetch ComfyUI node schema: $error',
+        ),
+      ]);
+    }
+    try {
+      final parsed = UiFormatGraph.parse(graph);
+      return ComfyUiGraphConverter.convert(
+        graph: parsed,
+        objectInfo: nextObjectInfo ?? const {},
+      );
+    } on FormatException catch (e) {
+      return ConversionFailed([
+        WorkflowValidationIssue(
+          code: 'invalid_graph',
+          message: 'Imported workflow graph is invalid: ${e.message}',
+        ),
+      ]);
+    }
   }
 
   @override

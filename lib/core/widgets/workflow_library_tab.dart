@@ -9,8 +9,10 @@ import 'package:uuid/uuid.dart';
 import '../models/comfy_workflow.dart';
 import '../models/generation_job.dart';
 import '../services/comfy_workflow_codec.dart';
+import '../services/comfy_ui_graph_converter.dart';
 import '../services/generation_repository.dart';
 import '../services/workflow_document_port.dart';
+import 'workflow_binding_editor.dart';
 
 /// The Workflows tab, hosted inside Create (Task 10 wires this in). Owns
 /// import/paste, per-workflow binding editing, local/server validation,
@@ -110,26 +112,43 @@ class _WorkflowLibraryTabState extends State<WorkflowLibraryTab> {
       _showBanner('Invalid workflow JSON: ${error.message}');
       return;
     }
-    final suggested = ComfyWorkflowCodec.suggestBindings(imported.graph);
+    final normalized = await widget.repository.normalizeImportedGraph(
+      imported.graph,
+    );
     if (!mounted) return;
-    final confirmed = await showDialog<_BindingConfirmationResult>(
-      context: context,
-      builder: (_) => _BindingConfirmationDialog(
-        initialName: sourceFileName,
-        initialKind: ComfyMediaKind.image,
-        initialBindings: suggested,
+    final JsonObject flatGraph;
+    switch (normalized) {
+      case ConversionFailed(:final issues):
+        _showBanner(issues.map((issue) => issue.message).join('; '));
+        return;
+      case ConvertedPrompt(:final prompt):
+        flatGraph = prompt;
+    }
+
+    final suggested = ComfyWorkflowCodec.suggestBindings(flatGraph);
+    if (!mounted) return;
+    final result = await Navigator.of(context).push<WorkflowBindingEditorResult>(
+      MaterialPageRoute<WorkflowBindingEditorResult>(
+        builder: (_) => WorkflowBindingEditorScreen(
+          graph: flatGraph,
+          initialBindings: suggested,
+          title: 'Review workflow inputs',
+          showNameAndKind: true,
+          initialName: sourceFileName,
+          initialKind: ComfyMediaKind.image,
+        ),
       ),
     );
-    if (confirmed == null) return;
+    if (result == null) return;
     final now = widget.clock().toUtc();
     final definition = ComfyWorkflowDefinition(
       id: const Uuid().v4(),
-      name: confirmed.name,
-      kind: confirmed.kind,
-      workingGraph: imported.graph,
+      name: result.name ?? sourceFileName,
+      kind: result.kind ?? ComfyMediaKind.image,
+      workingGraph: result.graph,
       sourceHash: imported.sourceHash,
       sourceFileName: sourceFileName,
-      bindings: confirmed.bindings,
+      bindings: result.bindings,
       createdAt: now,
       updatedAt: now,
     );
@@ -145,26 +164,31 @@ class _WorkflowLibraryTabState extends State<WorkflowLibraryTab> {
   }
 
   Future<void> _editBindings(ComfyWorkflowDefinition workflow) async {
-    final confirmed = await showDialog<_BindingConfirmationResult>(
-      context: context,
-      builder: (_) => _BindingConfirmationDialog(
-        initialName: workflow.name,
-        initialKind: workflow.kind,
-        initialBindings: workflow.bindings,
+    final result = await Navigator.of(context).push<WorkflowBindingEditorResult>(
+      MaterialPageRoute<WorkflowBindingEditorResult>(
+        builder: (_) => WorkflowBindingEditorScreen(
+          graph: workflow.workingGraph,
+          initialBindings: workflow.bindings,
+          title: '${workflow.name} — bindings',
+        ),
       ),
     );
-    if (confirmed == null) return;
+    if (result == null) return;
     final updated = workflow.copyWith(
-      name: confirmed.name,
-      kind: confirmed.kind,
-      bindings: confirmed.bindings,
+      workingGraph: result.graph,
+      bindings: result.bindings,
       updatedAt: widget.clock().toUtc(),
     );
-    final source = await widget.repository.exportWorkflow(
-      workflow.id,
-      WorkflowExportKind.originalSource,
-    );
-    await widget.repository.saveWorkflow(updated, sourceBytes: source);
+    try {
+      final source = await widget.repository.exportWorkflow(
+        workflow.id,
+        WorkflowExportKind.originalSource,
+      );
+      await widget.repository.saveWorkflow(updated, sourceBytes: source);
+      _showBanner('Bindings updated.');
+    } catch (error) {
+      _showBanner('Save failed: $error');
+    }
   }
 
   Future<void> _editRawGraph(ComfyWorkflowDefinition workflow) async {
@@ -460,7 +484,7 @@ class _WorkflowCard extends StatelessWidget {
                 ),
                 TextButton(
                   onPressed: onEditRawGraph,
-                  child: const Text('Edit raw JSON'),
+                  child: const Text('Advanced: edit raw JSON'),
                 ),
                 TextButton(
                   onPressed: onValidateLocal,
@@ -499,307 +523,6 @@ class _WorkflowCard extends StatelessWidget {
                 TextButton(onPressed: onDelete, child: const Text('Delete')),
               ],
             ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-final class _BindingConfirmationResult {
-  const _BindingConfirmationResult({
-    required this.name,
-    required this.kind,
-    required this.bindings,
-  });
-
-  final String name;
-  final ComfyMediaKind kind;
-  final List<WorkflowInputBinding> bindings;
-}
-
-class _BindingConfirmationDialog extends StatefulWidget {
-  const _BindingConfirmationDialog({
-    required this.initialName,
-    required this.initialKind,
-    required this.initialBindings,
-  });
-
-  final String initialName;
-  final ComfyMediaKind initialKind;
-  final List<WorkflowInputBinding> initialBindings;
-
-  @override
-  State<_BindingConfirmationDialog> createState() =>
-      _BindingConfirmationDialogState();
-}
-
-class _BindingConfirmationDialogState
-    extends State<_BindingConfirmationDialog> {
-  late final TextEditingController _nameController = TextEditingController(
-    text: widget.initialName,
-  );
-  late ComfyMediaKind _kind = widget.initialKind;
-  late final List<_EditableBinding> _rows = widget.initialBindings
-      .map((binding) => _EditableBinding(binding: binding))
-      .toList();
-
-  @override
-  void dispose() {
-    _nameController.dispose();
-    for (final row in _rows) {
-      row.dispose();
-    }
-    super.dispose();
-  }
-
-  void _confirm() {
-    final bindings = _rows
-        .where((row) => row.included)
-        .map((row) => row.toBinding())
-        .toList(growable: false);
-    Navigator.of(context).pop(
-      _BindingConfirmationResult(
-        name: _nameController.text.trim().isEmpty
-            ? widget.initialName
-            : _nameController.text.trim(),
-        kind: _kind,
-        bindings: bindings,
-      ),
-    );
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: const Text('Review workflow inputs'),
-      content: SizedBox(
-        width: 480,
-        child: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              TextField(
-                controller: _nameController,
-                decoration: const InputDecoration(labelText: 'Name'),
-              ),
-              const SizedBox(height: 8),
-              SegmentedButton<ComfyMediaKind>(
-                segments: const [
-                  ButtonSegment(
-                    value: ComfyMediaKind.image,
-                    label: Text('Image'),
-                  ),
-                  ButtonSegment(
-                    value: ComfyMediaKind.video,
-                    label: Text('Video'),
-                  ),
-                ],
-                selected: {_kind},
-                onSelectionChanged: (selection) =>
-                    setState(() => _kind = selection.first),
-              ),
-              const SizedBox(height: 12),
-              for (final row in _rows) row.build(context, setState),
-            ],
-          ),
-        ),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(onPressed: _confirm, child: const Text('Confirm inputs')),
-      ],
-    );
-  }
-}
-
-/// Mutable editing state for one binding row inside the confirmation dialog.
-/// Role and control type stay as suggested/originally-saved -- editable via
-/// dropdowns -- while label, required, default, range, and choices are
-/// freely editable text fields.
-class _EditableBinding {
-  _EditableBinding({required WorkflowInputBinding binding})
-    : id = binding.id,
-      nodeId = binding.nodeId,
-      inputName = binding.inputName,
-      role = binding.role,
-      controlType = binding.controlType,
-      included = true,
-      required = binding.required,
-      labelController = TextEditingController(text: binding.label),
-      defaultController = TextEditingController(
-        text: binding.defaultValue?.toString() ?? '',
-      ),
-      minimumController = TextEditingController(
-        text: binding.minimum?.toString() ?? '',
-      ),
-      maximumController = TextEditingController(
-        text: binding.maximum?.toString() ?? '',
-      ),
-      choicesController = TextEditingController(
-        text: binding.choices.join(', '),
-      );
-
-  final String id;
-  final String nodeId;
-  final String inputName;
-  BindingRole role;
-  WorkflowControlType controlType;
-  bool included;
-  bool required;
-  final TextEditingController labelController;
-  final TextEditingController defaultController;
-  final TextEditingController minimumController;
-  final TextEditingController maximumController;
-  final TextEditingController choicesController;
-
-  void dispose() {
-    labelController.dispose();
-    defaultController.dispose();
-    minimumController.dispose();
-    maximumController.dispose();
-    choicesController.dispose();
-  }
-
-  Object? _parsedDefault() {
-    final text = defaultController.text;
-    if (text.isEmpty) return null;
-    return switch (controlType) {
-      WorkflowControlType.integer => int.tryParse(text) ?? text,
-      WorkflowControlType.decimal => double.tryParse(text) ?? text,
-      WorkflowControlType.toggle => text.toLowerCase() == 'true',
-      _ => text,
-    };
-  }
-
-  WorkflowInputBinding toBinding() => WorkflowInputBinding(
-    id: id,
-    nodeId: nodeId,
-    inputName: inputName,
-    label: labelController.text.trim().isEmpty
-        ? inputName
-        : labelController.text.trim(),
-    role: role,
-    controlType: controlType,
-    required: required,
-    defaultValue: _parsedDefault(),
-    minimum: num.tryParse(minimumController.text),
-    maximum: num.tryParse(maximumController.text),
-    choices: choicesController.text
-        .split(',')
-        .map((choice) => choice.trim())
-        .where((choice) => choice.isNotEmpty)
-        .toList(growable: false),
-  );
-
-  Widget build(BuildContext context, StateSetter setState) {
-    final isNumeric =
-        controlType == WorkflowControlType.integer ||
-        controlType == WorkflowControlType.decimal;
-    return Card(
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      child: Padding(
-        padding: const EdgeInsets.all(8),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Checkbox(
-                  value: included,
-                  onChanged: (value) =>
-                      setState(() => included = value ?? false),
-                ),
-                Expanded(
-                  child: Text(
-                    '$nodeId.$inputName',
-                    style: Theme.of(context).textTheme.bodySmall,
-                  ),
-                ),
-                Checkbox(
-                  value: required,
-                  onChanged: (value) =>
-                      setState(() => required = value ?? false),
-                ),
-                const Text('Required'),
-              ],
-            ),
-            if (included) ...[
-              TextField(
-                controller: labelController,
-                decoration: const InputDecoration(labelText: 'Label'),
-              ),
-              Row(
-                children: [
-                  Expanded(
-                    child: DropdownButtonFormField<BindingRole>(
-                      initialValue: role,
-                      isExpanded: true,
-                      decoration: const InputDecoration(labelText: 'Role'),
-                      items: [
-                        for (final value in BindingRole.values)
-                          DropdownMenuItem(
-                            value: value,
-                            child: Text(value.name),
-                          ),
-                      ],
-                      onChanged: (value) =>
-                          setState(() => role = value ?? role),
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: DropdownButtonFormField<WorkflowControlType>(
-                      initialValue: controlType,
-                      isExpanded: true,
-                      decoration: const InputDecoration(labelText: 'Control'),
-                      items: [
-                        for (final value in WorkflowControlType.values)
-                          DropdownMenuItem(
-                            value: value,
-                            child: Text(value.name),
-                          ),
-                      ],
-                      onChanged: (value) =>
-                          setState(() => controlType = value ?? controlType),
-                    ),
-                  ),
-                ],
-              ),
-              TextField(
-                controller: defaultController,
-                decoration: const InputDecoration(labelText: 'Default value'),
-              ),
-              if (isNumeric)
-                Row(
-                  children: [
-                    Expanded(
-                      child: TextField(
-                        controller: minimumController,
-                        decoration: const InputDecoration(labelText: 'Min'),
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Expanded(
-                      child: TextField(
-                        controller: maximumController,
-                        decoration: const InputDecoration(labelText: 'Max'),
-                      ),
-                    ),
-                  ],
-                ),
-              if (controlType == WorkflowControlType.enumeration)
-                TextField(
-                  controller: choicesController,
-                  decoration: const InputDecoration(
-                    labelText: 'Choices (comma-separated)',
-                  ),
-                ),
-            ],
           ],
         ),
       ),
@@ -863,3 +586,4 @@ class _RawGraphEditDialogState extends State<_RawGraphEditDialog> {
     );
   }
 }
+

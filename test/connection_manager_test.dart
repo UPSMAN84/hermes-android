@@ -417,6 +417,29 @@ void main() {
       },
     );
 
+    test(
+      'an attached image becomes an image_url part alongside the typed text',
+      () {
+        final messages = GatewayChatClient.buildChatCompletionMessages(
+          message: 'screenshot',
+          imageDataUrls: ['data:image/png;base64,AAAA'],
+        );
+
+        expect(messages, [
+          {
+            'role': 'user',
+            'content': [
+              {'type': 'text', 'text': 'screenshot'},
+              {
+                'type': 'image_url',
+                'image_url': {'url': 'data:image/png;base64,AAAA'},
+              },
+            ],
+          },
+        ]);
+      },
+    );
+
     test('parses normal chat completion SSE token frames', () {
       final token = GatewayChatClient.parseSseFrame(
         'data: {"choices":[{"delta":{"content":"hello"}}]}',

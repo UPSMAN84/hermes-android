@@ -173,6 +173,20 @@ class _GenerationFormState extends State<GenerationForm> {
     return true;
   }
 
+  /// Names the first binding blocking submission, so a disabled Generate
+  /// button never looks like it's simply doing nothing.
+  String? get _invalidReason {
+    for (final binding in widget.workflow.bindings) {
+      if (binding.required && !_isRequiredSatisfied(binding)) {
+        return '"${binding.label}" is required.';
+      }
+      if (!_isRangeSatisfied(binding)) {
+        return '"${binding.label}" has an invalid value.';
+      }
+    }
+    return null;
+  }
+
   Object? _valueFor(WorkflowInputBinding binding) {
     switch (binding.controlType) {
       case WorkflowControlType.file:
@@ -338,6 +352,11 @@ class _GenerationFormState extends State<GenerationForm> {
         if (_submitError != null)
           Text(
             _submitError!,
+            style: TextStyle(color: Theme.of(context).colorScheme.error),
+          ),
+        if (_submitError == null && !_isValid && _invalidReason != null)
+          Text(
+            _invalidReason!,
             style: TextStyle(color: Theme.of(context).colorScheme.error),
           ),
         const SizedBox(height: 8),

@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:crypto/crypto.dart';
+import 'package:hermes_android/core/models/comfy_ui_graph.dart';
 import 'package:hermes_android/core/models/comfy_workflow.dart';
 
 final class WorkflowDraftResult {
@@ -17,6 +18,11 @@ final class WorkflowDraftResult {
 
 abstract final class ComfyWorkflowCodec {
   static const int maxSourceBytes = 5 * 1024 * 1024;
+
+  /// Whether [graph] is the legacy flat API-format map or ComfyUI's own
+  /// "Save" export (nodes/links/positions). Derived from the JSON itself,
+  /// never stored, so a raw-JSON edit can't leave a stale shape behind.
+  static ComfyGraphShape shapeOf(JsonObject graph) => detectGraphShape(graph);
 
   static ImportedWorkflow decode(
     List<int> sourceBytes, {
@@ -37,7 +43,12 @@ abstract final class ComfyWorkflowCodec {
     if (decoded is! Map<String, dynamic>) {
       throw const FormatException('Workflow root must be an object');
     }
-    _requireGraphShape(decoded);
+    switch (detectGraphShape(decoded)) {
+      case ComfyGraphShape.uiFormat:
+        UiFormatGraph.parse(decoded);
+      case ComfyGraphShape.flatApi:
+        _requireGraphShape(decoded);
+    }
 
     return ImportedWorkflow(
       sourceBytes: sourceBytes,
@@ -64,6 +75,10 @@ abstract final class ComfyWorkflowCodec {
     }
   }
 
+  /// Writes binding values directly into the flat graph's `inputs`. Every
+  /// stored `workingGraph` is flat API-format by the time this runs --
+  /// UI-format imports are normalized once, at import time (see
+  /// `GenerationRepository.normalizeImportedGraph`).
   static JsonObject applyBindings(
     JsonObject graph,
     List<WorkflowInputBinding> bindings,
@@ -84,6 +99,27 @@ abstract final class ComfyWorkflowCodec {
       }
       _bindingTarget(copy, binding)[binding.inputName] = value;
     }
+    return copy;
+  }
+
+  /// Directly writes one input's literal value on a flat API-format graph --
+  /// the canvas's inline value editor (Stage 4) for legacy workflows.
+  static JsonObject updateFlatGraphInput({
+    required JsonObject graph,
+    required String nodeId,
+    required String inputName,
+    required Object? value,
+  }) {
+    final copy = _deepCopy(graph);
+    final node = copy[nodeId];
+    if (node is! Map) {
+      throw StateError('Unknown node: $nodeId');
+    }
+    final inputs = node['inputs'];
+    if (inputs is! Map || !inputs.containsKey(inputName)) {
+      throw StateError('Node $nodeId has no input $inputName');
+    }
+    inputs[inputName] = value;
     return copy;
   }
 
@@ -186,7 +222,7 @@ abstract final class ComfyWorkflowCodec {
         final descriptor = schemaInputs[input.key];
         if (descriptor is! List || descriptor.isEmpty) continue;
         final value = input.value;
-        if (_isConnection(value)) continue;
+        if (isConnectionValue(value)) continue;
         final type = descriptor.first;
         final isMapped = mappedInputs.contains((entry.key, input.key));
         if (type is List) {
@@ -272,6 +308,8 @@ abstract final class ComfyWorkflowCodec {
       for (final inputName in inputs.keys.whereType<String>()) {
         final definition = definitions[inputName];
         if (definition == null) continue;
+        final value = inputs[inputName];
+        if (isConnectionValue(value)) continue;
         suggestions.add(
           WorkflowInputBinding(
             id: '${entry.key}_$inputName',
@@ -281,7 +319,7 @@ abstract final class ComfyWorkflowCodec {
             role: definition.$1,
             controlType: definition.$2,
             required: false,
-            defaultValue: inputs[inputName],
+            defaultValue: value,
           ),
         );
       }
@@ -336,7 +374,9 @@ abstract final class ComfyWorkflowCodec {
     return result;
   }
 
-  static bool _isConnection(Object? value) =>
+  /// Whether a flat graph input's value is a `[originNodeId, slot]` graph
+  /// connection rather than a literal value.
+  static bool isConnectionValue(Object? value) =>
       value is List && value.length == 2 && value.first is String;
 
   static bool _matchesPrimitive(String type, Object? value) => switch (type) {

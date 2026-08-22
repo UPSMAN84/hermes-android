@@ -6,10 +6,12 @@ import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
 
 import '../models/character_generation_context.dart';
+import '../models/comfy_ui_graph.dart';
 import '../models/comfy_workflow.dart';
 import '../models/generation_job.dart';
 import '../models/media_asset.dart';
 import 'character_generation_context_store.dart';
+import 'comfy_ui_graph_converter.dart';
 import 'comfy_workflow_codec.dart';
 import 'comfyui.dart';
 import 'comfyui_client.dart';
@@ -72,6 +74,18 @@ abstract interface class GenerationRepository {
     String workflowId, {
     required bool againstServer,
   });
+
+  /// The raw `/object_info` schema from the configured ComfyUI endpoint.
+  /// Throws if no endpoint is configured or it's unreachable.
+  Future<JsonObject> fetchObjectInfo();
+
+  /// Normalizes a freshly-decoded, not-yet-saved graph to flat API-format,
+  /// once, at import time. A flat-shaped [graph] passes through unchanged
+  /// with zero network calls. A UI-format graph (ComfyUI's native "Save"
+  /// export) is converted via a fresh `/object_info` fetch -- every
+  /// [ComfyWorkflowDefinition.workingGraph] is flat from this point on, so
+  /// nothing downstream of import ever has to branch on graph shape again.
+  Future<GraphConversionResult> normalizeImportedGraph(JsonObject graph);
   Future<Uint8List> exportWorkflow(String workflowId, WorkflowExportKind kind);
   Future<void> deleteWorkflow(String workflowId);
 
@@ -327,6 +341,51 @@ final class DefaultGenerationRepository implements GenerationRepository {
       if (!handedOff && leaseHeld) {
         unawaited(foregroundLease.release());
       }
+    }
+  }
+
+  @override
+  Future<GraphConversionResult> normalizeImportedGraph(JsonObject graph) async {
+    if (ComfyWorkflowCodec.shapeOf(graph) == ComfyGraphShape.flatApi) {
+      return ConvertedPrompt(graph);
+    }
+
+    final endpoint = await endpointConfig.load();
+    if (endpoint == null) {
+      return const ConversionFailed([
+        WorkflowValidationIssue(
+          code: 'no_endpoint',
+          message:
+              'Connect to ComfyUI before importing a native ComfyUI "Save" '
+              'export, or re-export the workflow using ComfyUI\'s '
+              '"Export (API)" format instead.',
+        ),
+      ]);
+    }
+
+    final client = await _clientFor(endpoint);
+    final JsonObject objectInfo;
+    try {
+      objectInfo = await client.getObjectInfo();
+    } catch (error) {
+      return ConversionFailed([
+        WorkflowValidationIssue(
+          code: 'object_info_unavailable',
+          message: 'Could not fetch ComfyUI node schema: $error',
+        ),
+      ]);
+    }
+
+    try {
+      final parsed = UiFormatGraph.parse(graph);
+      return ComfyUiGraphConverter.convert(graph: parsed, objectInfo: objectInfo);
+    } on FormatException catch (error) {
+      return ConversionFailed([
+        WorkflowValidationIssue(
+          code: 'invalid_graph',
+          message: 'Imported workflow graph is invalid: ${error.message}',
+        ),
+      ]);
     }
   }
 
@@ -731,6 +790,14 @@ final class DefaultGenerationRepository implements GenerationRepository {
       await saveWorkflow(updated, sourceBytes: bytes);
     }
     return result;
+  }
+
+  @override
+  Future<JsonObject> fetchObjectInfo() async {
+    final endpoint = await endpointConfig.load();
+    if (endpoint == null) throw StateError('ComfyUI is not configured');
+    final client = await _clientFor(endpoint);
+    return client.getObjectInfo();
   }
 
   @override

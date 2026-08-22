@@ -17,6 +17,7 @@ import 'package:hermes_android/core/models/generation_job.dart';
 import 'package:hermes_android/core/models/media_asset.dart';
 import 'package:hermes_android/core/screens/chat_screen.dart';
 import 'package:hermes_android/core/screens/create_screen.dart';
+import 'package:hermes_android/core/services/comfy_ui_graph_converter.dart';
 import 'package:hermes_android/core/services/connection_manager.dart';
 import 'package:hermes_android/core/services/generation_repository.dart';
 import 'package:hermes_android/core/services/media_cache_service.dart';
@@ -239,6 +240,13 @@ class _FakeGenerationRepository implements GenerationRepository {
     String workflowId, {
     required bool againstServer,
   }) => throw UnimplementedError();
+
+  @override
+  Future<JsonObject> fetchObjectInfo() => throw UnimplementedError();
+
+  @override
+  Future<GraphConversionResult> normalizeImportedGraph(JsonObject graph) =>
+      throw UnimplementedError();
 
   @override
   Future<Uint8List> exportWorkflow(
@@ -1104,6 +1112,49 @@ void main() {
 
       expect(find.text('Photo attached'), findsOneWidget);
     });
+
+    testWidgets(
+      'sending after attaching a photo puts the image in the actual '
+      'outgoing request body',
+      (tester) async {
+        ImagePickerPlatform.instance = _FakeImagePickerPlatform()
+          ..nextPick = XFile.fromData(
+            pngBytes,
+            mimeType: 'image/png',
+            name: 'photo.png',
+          );
+        final gw = _FakeGateway()..streamFrames = ['ok'];
+
+        await tester.pumpWidget(_app(gw, _SilentTts()));
+        await tester.pumpAndSettle();
+
+        await tester.tap(find.byTooltip('Attach photo'));
+        await tester.pumpAndSettle();
+        expect(find.text('Photo attached'), findsOneWidget);
+
+        await tester.enterText(find.byType(TextField), 'screenshot');
+        await tester.testTextInput.receiveAction(TextInputAction.send);
+        await tester.pumpAndSettle();
+
+        final body = jsonDecode(gw.sentBodies.single) as Map<String, dynamic>;
+        final sent = (body['messages'] as List).cast<Map<String, dynamic>>();
+        final content = sent.single['content'];
+        expect(
+          content,
+          isA<List>()
+              .having(
+                (c) => c.cast<Map>().map((p) => p['type']),
+                'part types',
+                containsAll(['text', 'image_url']),
+              ),
+        );
+        final imagePart = (content as List).cast<Map>().firstWhere(
+          (p) => p['type'] == 'image_url',
+        );
+        final url = (imagePart['image_url'] as Map)['url'] as String;
+        expect(url, startsWith('data:image/png;base64,'));
+      },
+    );
 
     testWidgets(
       'a picker exception shows an error instead of silently doing nothing',
