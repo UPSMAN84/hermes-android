@@ -421,7 +421,7 @@ class _HomeScreenState extends State<HomeScreen> {
           ],
         ),
       ),
-    );
+    ).whenComplete(() => ctrl.dispose());
   }
 
   void _showDashboardAuthDialog(SavedConnection conn) {

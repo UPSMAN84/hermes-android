@@ -67,10 +67,13 @@ class XttsService implements TtsProvider {
   @override
   bool get isPlaying => _isPlaying;
 
+  late final StreamSubscription<void> _onCompleteSub;
+  late final StreamSubscription<PlayerState> _onStateSub;
+
   XttsService({http.Client? httpClient, this.fallbackHost})
       : _http = httpClient ?? http.Client() {
-    _player.onPlayerComplete.listen((_) => _complete());
-    _player.onPlayerStateChanged.listen((state) {
+    _onCompleteSub = _player.onPlayerComplete.listen((_) => _complete());
+    _onStateSub = _player.onPlayerStateChanged.listen((state) {
       _isPlaying = state == PlayerState.playing;
     });
   }
@@ -447,6 +450,8 @@ class XttsService implements TtsProvider {
     _cancelSignal = null;
     _onComplete = null;
     _isPlaying = false;
+    _onCompleteSub.cancel();
+    _onStateSub.cancel();
     _player.dispose();
     _http.close();
   }

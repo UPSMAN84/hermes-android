@@ -136,6 +136,7 @@ class _WorkflowLibraryTabState extends State<WorkflowLibraryTab> {
           showNameAndKind: true,
           initialName: sourceFileName,
           initialKind: ComfyMediaKind.image,
+          fetchObjectInfo: widget.repository.fetchObjectInfo,
         ),
       ),
     );
@@ -170,6 +171,7 @@ class _WorkflowLibraryTabState extends State<WorkflowLibraryTab> {
           graph: workflow.workingGraph,
           initialBindings: workflow.bindings,
           title: '${workflow.name} — bindings',
+          fetchObjectInfo: widget.repository.fetchObjectInfo,
         ),
       ),
     );
@@ -205,16 +207,20 @@ class _WorkflowLibraryTabState extends State<WorkflowLibraryTab> {
       _showBanner('Invalid JSON, not saved: ${draft.error}');
       return;
     }
-    final updated = workflow.copyWith(
-      workingGraph: draft.graph,
-      updatedAt: widget.clock().toUtc(),
-    );
-    final source = await widget.repository.exportWorkflow(
-      workflow.id,
-      WorkflowExportKind.originalSource,
-    );
-    await widget.repository.saveWorkflow(updated, sourceBytes: source);
-    _showBanner('Working graph updated.');
+    try {
+      final updated = workflow.copyWith(
+        workingGraph: draft.graph,
+        updatedAt: widget.clock().toUtc(),
+      );
+      final source = await widget.repository.exportWorkflow(
+        workflow.id,
+        WorkflowExportKind.originalSource,
+      );
+      await widget.repository.saveWorkflow(updated, sourceBytes: source);
+      _showBanner('Working graph updated.');
+    } catch (e) {
+      _showBanner('Failed to save working graph: $e');
+    }
   }
 
   Future<void> _validateLocal(ComfyWorkflowDefinition workflow) async {
@@ -364,7 +370,7 @@ class _WorkflowLibraryTabState extends State<WorkflowLibraryTab> {
           ),
         ],
       ),
-    );
+    ).whenComplete(() => controller.dispose());
   }
 
   @override
@@ -402,14 +408,62 @@ class _WorkflowLibraryTabState extends State<WorkflowLibraryTab> {
                   itemCount: _workflows.length,
                   itemBuilder: (context, index) => _WorkflowCard(
                     workflow: _workflows[index],
-                    onEditBindings: () => _editBindings(_workflows[index]),
-                    onEditRawGraph: () => _editRawGraph(_workflows[index]),
-                    onValidateLocal: () => _validateLocal(_workflows[index]),
-                    onValidateServer: () => _validateServer(_workflows[index]),
-                    onDuplicate: () => _duplicate(_workflows[index]),
-                    onExport: (kind) => _export(_workflows[index], kind),
-                    onDelete: () => _delete(_workflows[index]),
-                    onTestRun: () => _testRun(_workflows[index]),
+                    onEditBindings: () async {
+                      try {
+                        await _editBindings(_workflows[index]);
+                      } catch (e) {
+                        _showBanner('Edit bindings failed: $e');
+                      }
+                    },
+                    onEditRawGraph: () async {
+                      try {
+                        await _editRawGraph(_workflows[index]);
+                      } catch (e) {
+                        _showBanner('Edit graph failed: $e');
+                      }
+                    },
+                    onValidateLocal: () async {
+                      try {
+                        await _validateLocal(_workflows[index]);
+                      } catch (e) {
+                        _showBanner('Local validation failed: $e');
+                      }
+                    },
+                    onValidateServer: () async {
+                      try {
+                        await _validateServer(_workflows[index]);
+                      } catch (e) {
+                        _showBanner('Server validation failed: $e');
+                      }
+                    },
+                    onDuplicate: () async {
+                      try {
+                        await _duplicate(_workflows[index]);
+                      } catch (e) {
+                        _showBanner('Duplicate failed: $e');
+                      }
+                    },
+                    onExport: (kind) async {
+                      try {
+                        await _export(_workflows[index], kind);
+                      } catch (e) {
+                        _showBanner('Export failed: $e');
+                      }
+                    },
+                    onDelete: () async {
+                      try {
+                        await _delete(_workflows[index]);
+                      } catch (e) {
+                        _showBanner('Delete failed: $e');
+                      }
+                    },
+                    onTestRun: () async {
+                      try {
+                        await _testRun(_workflows[index]);
+                      } catch (e) {
+                        _showBanner('Test run failed: $e');
+                      }
+                    },
                   ),
                 ),
         ),

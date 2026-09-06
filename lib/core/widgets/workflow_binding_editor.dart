@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:uuid/uuid.dart';
 
 import '../models/comfy_workflow.dart';
+import '../services/comfy_ui_graph_converter.dart';
 import '../services/comfy_workflow_codec.dart';
 
 /// Result of a [WorkflowBindingEditorScreen] session: the flat graph with
@@ -40,6 +41,7 @@ class WorkflowBindingEditorScreen extends StatefulWidget {
     this.showNameAndKind = false,
     this.initialName,
     this.initialKind,
+    this.fetchObjectInfo,
   });
 
   /// Already-flat `{nodeId: {class_type, inputs}}` graph.
@@ -49,6 +51,12 @@ class WorkflowBindingEditorScreen extends StatefulWidget {
   final bool showNameAndKind;
   final String? initialName;
   final ComfyMediaKind? initialKind;
+
+  /// Live `/object_info` fetcher, used only to pull the real choice list for
+  /// `lora_name` inputs from the connected ComfyUI server. Null when no
+  /// endpoint is configured -- the row then falls back to manual comma-
+  /// separated entry, same as any other enum control.
+  final Future<JsonObject> Function()? fetchObjectInfo;
 
   @override
   State<WorkflowBindingEditorScreen> createState() =>
@@ -64,6 +72,7 @@ class _WorkflowBindingEditorScreenState
   final TextEditingController _searchController = TextEditingController();
   final Set<String> _collapsedNodeIds = {};
   late final List<_NodeGroup> _groups = _buildGroups();
+  JsonObject? _objectInfo;
 
   List<_NodeGroup> _buildGroups() {
     final groups = <_NodeGroup>[];
@@ -94,6 +103,42 @@ class _WorkflowBindingEditorScreenState
       );
     }
     return groups;
+  }
+
+  /// Fetches the live `/object_info` schema (cached for the life of the
+  /// screen) and, if the row's node class declares real choices for
+  /// `lora_name`, overwrites the row's choices with them. Silent no-op when
+  /// no `fetchObjectInfo` was supplied (no endpoint configured); surfaces a
+  /// snack bar on fetch failure rather than blocking the row.
+  Future<void> _pullLoraChoices(_NodeGroup group, _BindingRow row) async {
+    final fetch = widget.fetchObjectInfo;
+    if (fetch == null) return;
+    setState(() => row.loadingChoices = true);
+    try {
+      final objectInfo = _objectInfo ??= await fetch();
+      final schema = objectInfo[group.classType];
+      if (schema is Map) {
+        for (final input in ComfyUiGraphConverter.orderedSchemaInputs(
+          schema,
+        )) {
+          if (input.name == row.inputName && input.choices.isNotEmpty) {
+            row.choicesController.text = input.choices.join(', ');
+            row.controlType = WorkflowControlType.enumeration;
+            break;
+          }
+        }
+      }
+    } catch (error) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not load LoRA list from ComfyUI: $error'),
+          ),
+        );
+      }
+    } finally {
+      if (mounted) setState(() => row.loadingChoices = false);
+    }
   }
 
   WorkflowInputBinding? _findBinding(String nodeId, String inputName) {
@@ -174,15 +219,7 @@ class _WorkflowBindingEditorScreenState
       visibleGroups.add((group, rows, expanded));
     }
 
-    var hasErrors = false;
-    for (final group in _groups) {
-      for (final row in group.rows) {
-        if (row.validate() != null) {
-          hasErrors = true;
-          break;
-        }
-      }
-    }
+    final hasErrors = _hasErrors;
 
     return Scaffold(
       appBar: AppBar(
@@ -292,7 +329,7 @@ class _WorkflowBindingEditorScreenState
             Padding(
               padding: const EdgeInsets.only(left: 8, right: 8, bottom: 8),
               child: Column(
-                children: [for (final row in rows) _buildRow(row)],
+                children: [for (final row in rows) _buildRow(group, row)],
               ),
             ),
         ],
@@ -300,8 +337,104 @@ class _WorkflowBindingEditorScreenState
     );
   }
 
-  Widget _buildRow(_BindingRow row) {
-    final error = row.validate();
+  /// Cached per-row validation errors, updated by [_BindingRowWidget] via
+  /// [onErrorChanged]. The Save button reads this map instead of calling
+  /// [validate()] on every row during build, avoiding O(n) work per frame.
+  final Map<String, String?> _rowErrors = {};
+
+  void _onRowErrorChanged(String rowId, String? error) {
+    if (_rowErrors[rowId] == error) return;
+    setState(() => _rowErrors[rowId] = error);
+  }
+
+  bool get _hasErrors {
+    for (final error in _rowErrors.values) {
+      if (error != null) return true;
+    }
+    return false;
+  }
+
+  Widget _buildRow(_NodeGroup group, _BindingRow row) {
+    return _BindingRowWidget(
+      key: ValueKey(row.id),
+      group: group,
+      row: row,
+      canFetchLora: widget.fetchObjectInfo != null,
+      onErrorChanged: _onRowErrorChanged,
+      onPullLora: () => _pullLoraChoices(group, row),
+    );
+  }
+}
+
+/// Self-contained editing widget for one workflow input row. Rebuilds only
+/// itself on keystrokes or toggle changes, rather than triggering a full
+/// screen rebuild through the parent's [State.setState].
+class _BindingRowWidget extends StatefulWidget {
+  const _BindingRowWidget({
+    super.key,
+    required this.group,
+    required this.row,
+    required this.canFetchLora,
+    required this.onErrorChanged,
+    required this.onPullLora,
+  });
+
+  final _NodeGroup group;
+  final _BindingRow row;
+  final bool canFetchLora;
+  final void Function(String rowId, String? error) onErrorChanged;
+  final VoidCallback onPullLora;
+
+  @override
+  State<_BindingRowWidget> createState() => _BindingRowWidgetState();
+}
+
+class _BindingRowWidgetState extends State<_BindingRowWidget> {
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.row.choicesController.addListener(_onChoicesChanged);
+    _revalidate();
+  }
+
+  @override
+  void didUpdateWidget(covariant _BindingRowWidget oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.row.choicesController != widget.row.choicesController) {
+      oldWidget.row.choicesController.removeListener(_onChoicesChanged);
+      widget.row.choicesController.addListener(_onChoicesChanged);
+    }
+    // Re-validate when the parent toggles loadingChoices (async fetch gate).
+    if (oldWidget.row.loadingChoices != widget.row.loadingChoices) {
+      _revalidate();
+    }
+  }
+
+  @override
+  void dispose() {
+    widget.row.choicesController.removeListener(_onChoicesChanged);
+    super.dispose();
+  }
+
+  void _onChoicesChanged() => setState(_revalidate);
+
+  void _revalidate() {
+    final error = widget.row.validate();
+    if (_error != error) {
+      _error = error;
+      widget.onErrorChanged(widget.row.id, error);
+    }
+  }
+
+  void _onChanged([_]) {
+    setState(_revalidate);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final row = widget.row;
     return Card(
       margin: const EdgeInsets.symmetric(vertical: 4),
       child: Padding(
@@ -324,7 +457,7 @@ class _WorkflowBindingEditorScreenState
               key: Key('binding-row-${row.nodeId}-${row.inputName}-value'),
               controller: row.valueController,
               decoration: const InputDecoration(labelText: 'Value'),
-              onChanged: (_) => setState(() {}),
+              onChanged: _onChanged,
             ),
             CheckboxListTile(
               key: Key('binding-row-${row.nodeId}-${row.inputName}-expose'),
@@ -332,15 +465,23 @@ class _WorkflowBindingEditorScreenState
               controlAffinity: ListTileControlAffinity.leading,
               title: const Text('Expose as app control'),
               value: row.exposed,
-              onChanged: (value) =>
-                  setState(() => row.exposed = value ?? false),
+              onChanged: (value) {
+                final expose = value ?? false;
+                setState(() => row.exposed = expose);
+                _revalidate();
+                if (expose &&
+                    row.inputName == 'lora_name' &&
+                    row.choicesController.text.trim().isEmpty) {
+                  widget.onPullLora();
+                }
+              },
             ),
             if (row.exposed) ...[
               TextField(
                 key: Key('binding-row-${row.nodeId}-${row.inputName}-label'),
                 controller: row.labelController,
                 decoration: const InputDecoration(labelText: 'Label'),
-                onChanged: (_) => setState(() {}),
+                onChanged: _onChanged,
               ),
               Row(
                 children: [
@@ -357,8 +498,10 @@ class _WorkflowBindingEditorScreenState
                             child: Text(value.name),
                           ),
                       ],
-                      onChanged: (value) =>
-                          setState(() => row.role = value ?? row.role),
+                      onChanged: (value) {
+                        setState(() => row.role = value ?? row.role);
+                        _revalidate();
+                      },
                     ),
                   ),
                   const SizedBox(width: 8),
@@ -377,9 +520,12 @@ class _WorkflowBindingEditorScreenState
                             child: Text(value.name),
                           ),
                       ],
-                      onChanged: (value) => setState(
-                        () => row.controlType = value ?? row.controlType,
-                      ),
+                      onChanged: (value) {
+                        setState(
+                          () => row.controlType = value ?? row.controlType,
+                        );
+                        _revalidate();
+                      },
                     ),
                   ),
                 ],
@@ -390,8 +536,10 @@ class _WorkflowBindingEditorScreenState
                 controlAffinity: ListTileControlAffinity.leading,
                 title: const Text('Required'),
                 value: row.required,
-                onChanged: (value) =>
-                    setState(() => row.required = value ?? false),
+                onChanged: (value) {
+                  setState(() => row.required = value ?? false);
+                  _revalidate();
+                },
               ),
               if (row.isNumeric)
                 Row(
@@ -403,7 +551,7 @@ class _WorkflowBindingEditorScreenState
                         ),
                         controller: row.minController,
                         decoration: const InputDecoration(labelText: 'Min'),
-                        onChanged: (_) => setState(() {}),
+                        onChanged: _onChanged,
                       ),
                     ),
                     const SizedBox(width: 8),
@@ -414,27 +562,53 @@ class _WorkflowBindingEditorScreenState
                         ),
                         controller: row.maxController,
                         decoration: const InputDecoration(labelText: 'Max'),
-                        onChanged: (_) => setState(() {}),
+                        onChanged: _onChanged,
                       ),
                     ),
                   ],
                 ),
               if (row.controlType == WorkflowControlType.enumeration)
-                TextField(
-                  key: Key(
-                    'binding-row-${row.nodeId}-${row.inputName}-choices',
-                  ),
-                  controller: row.choicesController,
-                  decoration: const InputDecoration(
-                    labelText: 'Choices (comma-separated)',
-                  ),
-                  onChanged: (_) => setState(() {}),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.center,
+                  children: [
+                    Expanded(
+                      child: TextField(
+                        key: Key(
+                          'binding-row-${row.nodeId}-${row.inputName}-choices',
+                        ),
+                        controller: row.choicesController,
+                        decoration: const InputDecoration(
+                          labelText: 'Choices (comma-separated)',
+                        ),
+                        onChanged: _onChanged,
+                      ),
+                    ),
+                    if (row.inputName == 'lora_name' &&
+                        widget.canFetchLora) ...[
+                      const SizedBox(width: 8),
+                      if (row.loadingChoices)
+                        const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      else
+                        IconButton(
+                          key: Key(
+                            'binding-row-${row.nodeId}-${row.inputName}-pull-choices',
+                          ),
+                          icon: const Icon(Icons.sync),
+                          tooltip: 'Pull LoRA list from ComfyUI',
+                          onPressed: widget.onPullLora,
+                        ),
+                    ],
+                  ],
                 ),
-              if (error != null)
+              if (_error != null)
                 Padding(
                   padding: const EdgeInsets.only(top: 4),
                   child: Text(
-                    error,
+                    _error!,
                     style: TextStyle(
                       color: Theme.of(context).colorScheme.error,
                     ),
@@ -471,7 +645,8 @@ class _BindingRow {
   }) : id = existing?.id ?? const Uuid().v4(),
        exposed = existing != null,
        role = existing?.role ?? _inferBindingRole(inputName),
-       controlType = existing?.controlType ?? _inferControlType(currentValue),
+       controlType =
+           existing?.controlType ?? _inferControlType(inputName, currentValue),
        required = existing?.required ?? false,
        valueController = TextEditingController(
          text: currentValue?.toString() ?? '',
@@ -496,6 +671,7 @@ class _BindingRow {
   BindingRole role;
   WorkflowControlType controlType;
   bool required;
+  bool loadingChoices = false;
   final TextEditingController valueController;
   final TextEditingController labelController;
   final TextEditingController minController;
@@ -592,7 +768,8 @@ BindingRole _inferBindingRole(String inputName) {
   return roles[inputName] ?? BindingRole.custom;
 }
 
-WorkflowControlType _inferControlType(Object? value) {
+WorkflowControlType _inferControlType(String inputName, Object? value) {
+  if (inputName == 'lora_name') return WorkflowControlType.enumeration;
   if (value is int) return WorkflowControlType.integer;
   if (value is double) return WorkflowControlType.decimal;
   if (value is bool) return WorkflowControlType.toggle;
