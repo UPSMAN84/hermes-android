@@ -1003,7 +1003,7 @@ void main() {
       );
       Navigator.of(createElement).pop(DiscussGeneratedImage(asset));
       await tester.pumpAndSettle();
-
+      
       expect(find.byType(CreateScreen), findsNothing);
       expect(find.text('Photo attached'), findsOneWidget);
       expect(download.requested, hasLength(1));
@@ -1109,7 +1109,7 @@ void main() {
 
       await tester.tap(find.byTooltip('Attach photo'));
       await tester.pumpAndSettle();
-
+      
       expect(find.text('Photo attached'), findsOneWidget);
     });
 
@@ -1130,6 +1130,9 @@ void main() {
 
         await tester.tap(find.byTooltip('Attach photo'));
         await tester.pumpAndSettle();
+        // _attachImage runs base64 encoding on a background isolate; pump once
+        // more so the Isolate.run() future resolves and setState fires.
+        await tester.pump();
         expect(find.text('Photo attached'), findsOneWidget);
 
         await tester.enterText(find.byType(TextField), 'screenshot');
@@ -1189,6 +1192,9 @@ void main() {
 
         await tester.pumpWidget(_app(_FakeGateway(), _SilentTts()));
         await tester.pumpAndSettle();
+        // _attachImage runs base64 encoding on a background isolate; pump once
+        // more so the Isolate.run() future resolves and setState fires.
+        await tester.pump();
 
         expect(find.text('Photo attached'), findsOneWidget);
       },

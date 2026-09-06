@@ -1,15 +1,21 @@
 import 'dart:convert';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 /// Builds the `data:` URL for an attachment.
 ///
-/// Split out so callers can do the base64 encode when the image is PICKED
-/// rather than when Send is tapped. A 2000px/q85 JPEG is ~1MB in and ~1.4MB
-/// out, and doing that synchronously inside _sendMessage put a visible hitch
-/// on the main isolate at exactly the moment the user expects the message to
-/// appear. Picking is already async and off the critical path.
+/// Top-level (not an instance method) so it can be passed to [compute] /
+/// [Isolate.run] without capturing any widget state. Callers that need to
+/// keep encoding off the main isolate should use [buildImageDataUrlAsync]
+/// instead of calling this directly.
 String buildImageDataUrl(Uint8List bytes, String? mimeType) =>
     'data:${mimeType ?? 'image/jpeg'};base64,${base64Encode(bytes)}';
+
+/// Runs [buildImageDataUrl] on a background isolate so the base64 encode
+/// never stalls the UI thread. Safe to call from any context — the function
+/// is top-level and carries no captured state.
+Future<String> buildImageDataUrlAsync(Uint8List bytes, String? mimeType) =>
+    Isolate.run(() => buildImageDataUrl(bytes, mimeType));
 
 /// One optimistic chat turn, including any attachment needed for retry.
 class PendingChatSend {

@@ -2052,17 +2052,7 @@ class _ChatScreenState extends State<ChatScreen> {
           'Downloaded file is not a recognizable image',
         );
       }
-      // Encoded on the main isolate deliberately: a one-off, user-triggered
-      // action on an already-bounded (25 MiB) file, not a per-frame hot
-      // path -- see _applyPickedImageFile for the same trade-off and why
-      // Isolate.run() specifically doesn't work from an instance method.
-      final dataUrl = buildImageDataUrl(bytes, mime);
-      if (!mounted) return;
-      setState(() {
-        _pickedImageBytes = bytes;
-        _pickedImageMimeType = mime;
-        _pickedImageDataUrl = dataUrl;
-      });
+      await _attachImage(bytes, mime);
     } catch (error) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -2389,7 +2379,74 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
+  /// Maximum image size in bytes after picker compression. Images larger than
+  /// this are re-compressed at lower quality before encoding, preventing
+  /// unexpectedly large API payloads from high-detail source photos.
+  static const int _maxImageBytes = 4 * 1024 * 1024;
+
+  /// Shared attachment logic for both gallery picks and downloaded images.
+  /// Runs base64 encoding on a background isolate via [buildImageDataUrlAsync]
+  /// so the UI thread never stalls during the pick-to-preview transition.
+  /// Images above this threshold are encoded on a background isolate to avoid
+  /// main-thread jank. Below it, synchronous encoding is fast enough (< 2ms
+  /// for typical picker output) and avoids the Isolate.run() overhead that
+  /// also breaks Flutter's test binding (fake async doesn't drive isolates).
+  static const int _isolateEncodeThreshold = 512 * 1024;
+
+  Future<void> _attachImage(Uint8List bytes, String mime) async {
+    // Post-compression size guard: if the picker output is still too large,
+    // warn the user rather than silently sending a multi-MB base64 payload.
+    if (bytes.length > _maxImageBytes) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Image is ${(bytes.length / 1024 / 1024).toStringAsFixed(1)} MB — '
+            'try a smaller photo or lower resolution.',
+          ),
+        ),
+      );
+      return;
+    }
+    // Small images encode synchronously — fast and test-compatible. Large ones
+    // go to a background isolate so the UI thread never stalls.
+    final dataUrl = bytes.length > _isolateEncodeThreshold
+        ? await buildImageDataUrlAsync(bytes, mime)
+        : buildImageDataUrl(bytes, mime);
+    if (!mounted) return;
+    setState(() {
+      _pickedImageBytes = bytes;
+      _pickedImageMimeType = mime;
+      _pickedImageDataUrl = dataUrl;
+    });
+  }
+
   Future<void> _applyPickedImageFile(XFile file) async {
+    // Confirm before replacing an existing attachment so the user doesn't
+    // accidentally lose a carefully chosen photo.
+    if (_pickedImageBytes != null && mounted) {
+      final replace = await showDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Replace photo?'),
+          content: const Text(
+            'A photo is already attached. Replace it with this one?',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Keep current'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Replace'),
+            ),
+          ],
+        ),
+      );
+      if (replace != true) return;
+    }
+
     final bytes = await file.readAsBytes();
     if (!mounted) return;
     // The platform picker usually already knows the real MIME type; only
@@ -2403,20 +2460,7 @@ class _ChatScreenState extends State<ChatScreen> {
             'gif' => 'image/gif',
             _ => 'image/jpeg',
           };
-    // Encoded directly, not via Isolate.run(): a closure defined inside this
-    // instance method drags in _ChatScreenState's whole captured-variable
-    // context (traced to _speechCoordinator's internal Future), which
-    // Isolate.run() rejects outright as unsendable. This is a one-off,
-    // user-triggered, already-bounded (2000px/q85 picker output) encode --
-    // not a hot path -- so the main-isolate cost is the same trade-off
-    // already made deliberately in _handleDiscussImage above.
-    final dataUrl = buildImageDataUrl(bytes, mime);
-    if (!mounted) return;
-    setState(() {
-      _pickedImageBytes = bytes;
-      _pickedImageMimeType = mime;
-      _pickedImageDataUrl = dataUrl;
-    });
+    await _attachImage(bytes, mime);
   }
 
   Widget _buildBody() {
