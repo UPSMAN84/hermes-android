@@ -35,9 +35,16 @@ class ComfyUi {
   /// A filename with an image or video extension, preceded by a path separator
   /// (so we don't pick up `"src":"foo.png"`-style JSON noise).
   static final RegExp _mediaPathRe = RegExp(
-    r'[\\/:]\s*([A-Za-z0-9_\-]+\.(?:png|jpe?g|webp|mp4|webm|mkv|mov|gif))',
+    r'(?:[\\/:]|\n|\t)([A-Za-z0-9_\-]+\.(?:png|jpe?g|webp|mp4|webm|mkv|mov|gif))',
     caseSensitive: false,
   );
+
+  /// Tool results are JSON-encoded, so the newline before a filename can arrive
+  /// as a literal `\n`. The path-separator prefix then matched that backslash
+  /// and captured the `n` as part of the name -- `nKrea_Upscale_00033_.png`,
+  /// which 404s and renders a bogus "image unavailable" row. Normalize the
+  /// escape sequences before scanning.
+  static final RegExp _escapeRe = RegExp(r'\\[nrt]');
 
   static final RegExp _videoExtRe = RegExp(
     r'\.(?:mp4|webm|mkv|mov)$',
@@ -67,7 +74,7 @@ class ComfyUi {
   /// `{"output":"...rendered: C:\\...\\output\\TG_00084_.png..."}`).
   static List<String> extractMediaFilenames(String content) {
     final names = <String>{};
-    for (final m in _mediaPathRe.allMatches(content)) {
+    for (final m in _mediaPathRe.allMatches(content.replaceAll(_escapeRe, '\n'))) {
       final name = m.group(1);
       if (name != null && name.isNotEmpty) names.add(name);
     }

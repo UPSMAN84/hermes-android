@@ -18,10 +18,56 @@ export '../models/session.dart';
 /// Manages saved remote connections using SharedPreferences.
 class ConnectionManager {
   static const String _key = 'saved_connections';
+  static const String _seededKey = 'default_connections_seeded_v1';
   static const Uuid _uuid = Uuid();
   final SharedPreferences prefs;
 
   ConnectionManager(this.prefs);
+
+  /// Seeds built-in default connections on first launch only.
+  ///
+  /// Defaults are inserted at the end of the list so any user-created
+  /// connections stay above them. Re-seeding is skipped once [_seededKey]
+  /// is set, so edits/deletes to the defaults persist across launches.
+  Future<void> seedDefaultConnectionsIfNeeded() async {
+    if (prefs.getBool(_seededKey) == true) return;
+
+    final current = getConnections();
+    final existingHosts = {for (final c in current) '${c.host}:${c.port}'};
+
+    // Primary: Tailscale endpoint (works anywhere).
+    if (!existingHosts.contains('100.122.23.46:8642')) {
+      current.add(SavedConnection(
+        id: _uuid.v4(),
+        label: 'PC Hermes',
+        host: '100.122.23.46',
+        port: 8642,
+        apiKey: 'hc_SC_34uQlK6LpYzc_k8lRv8AJhsq7Ik3QlRLlpQEv0T0',
+        useHttps: false,
+        dashboardPortOverride: 9119,
+        dashboardUsername: 'upsman',
+        dashboardPassword: '1234upsman',
+      ));
+    }
+
+    // Fallback: LAN-only when Tailscale is unreachable.
+    if (!existingHosts.contains('192.168.1.79:8642')) {
+      current.add(SavedConnection(
+        id: _uuid.v4(),
+        label: 'PC Hermes (LAN)',
+        host: '192.168.1.79',
+        port: 8642,
+        apiKey: 'hc_SC_34uQlK6LpYzc_k8lRv8AJhsq7Ik3QlRLlpQEv0T0',
+        useHttps: false,
+        dashboardPortOverride: 9119,
+        dashboardUsername: 'upsman',
+        dashboardPassword: '1234upsman',
+      ));
+    }
+
+    _saveAll(current);
+    await prefs.setBool(_seededKey, true);
+  }
 
   List<SavedConnection> getConnections() {
     final jsonList = prefs.getStringList(_key) ?? [];

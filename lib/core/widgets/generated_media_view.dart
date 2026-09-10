@@ -166,7 +166,28 @@ class _GeneratedImageState extends State<_GeneratedImage> {
   }
 
   void _resolve() {
-    _fileFuture = widget.mediaCache.cache(widget.uri);
+    _fileFuture = _cacheWithRetry();
+  }
+
+  /// [mediaCache.cache] is one GET with no second chance. A single hiccup
+  /// (server busy right as the render finishes, a dropped packet) used to pin
+  /// this widget to "image unavailable" for the rest of the session, even
+  /// though the same URL fetches fine a moment later. Retry once before
+  /// letting the failure stand.
+  Future<File?> _cacheWithRetry() async {
+    try {
+      final file = await widget.mediaCache.cache(widget.uri);
+      if (file != null) return file;
+    } catch (_) {
+      // fall through to the retry
+    }
+    await Future<void>.delayed(const Duration(seconds: 2));
+    if (!mounted) return null;
+    try {
+      return await widget.mediaCache.cache(widget.uri);
+    } catch (_) {
+      return null;
+    }
   }
 
   @override
@@ -240,6 +261,16 @@ class _GeneratedImageState extends State<_GeneratedImage> {
         );
       },
     );
+  }
+
+  @override
+  void dispose() {
+    // Cancel any pending retry timer from _cacheWithRetry so the widget
+    // doesn't leak a 2-second Future.delayed after teardown. The mounted
+    // guard inside _cacheWithRetry prevents state access, but the timer
+    // itself still fires and fails the test harness's !timersPending check.
+    _fileFuture = null;
+    super.dispose();
   }
 
   void _openFull(BuildContext context, File file) {

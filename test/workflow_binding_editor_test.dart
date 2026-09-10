@@ -284,6 +284,51 @@ void main() {
     },
   );
 
+  testWidgets(
+    'exposing a lora_name row pulls its real choices from ComfyUI',
+    (tester) async {
+      final loraGraph = <String, dynamic>{
+        '3': {
+          'class_type': 'LoraLoader',
+          'inputs': {'lora_name': 'old.safetensors', 'strength_model': 1.0},
+        },
+      };
+      final read = await _openEditor(
+        tester,
+        graph: loraGraph,
+        fetchObjectInfo: () async => {
+          'LoraLoader': {
+            'input': {
+              'required': {
+                'lora_name': [
+                  ['best.safetensors', 'other.safetensors'],
+                  {},
+                ],
+              },
+            },
+          },
+        },
+      );
+
+      await tester.tap(find.byKey(const Key('binding-row-3-lora_name-expose')));
+      await tester.pumpAndSettle();
+
+      final choicesField = tester.widget<TextField>(
+        find.byKey(const Key('binding-row-3-lora_name-choices')),
+      );
+      expect(
+        choicesField.controller!.text,
+        'best.safetensors, other.safetensors',
+      );
+
+      await tester.tap(find.byKey(const Key('binding-editor-save')));
+      await tester.pumpAndSettle();
+
+      final binding = read()!.bindings.single;
+      expect(binding.choices, ['best.safetensors', 'other.safetensors']);
+    },
+  );
+
   testWidgets('Cancel discards local edits and returns null', (
     tester,
   ) async {
@@ -309,6 +354,7 @@ Future<_ResultReader> _openEditor(
   bool showNameAndKind = false,
   String? initialName,
   ComfyMediaKind? initialKind,
+  Future<Map<String, dynamic>> Function()? fetchObjectInfo,
 }) async {
   // An exposed row's full field set (label, role/control dropdowns,
   // required, min/max) can push well past the default 800x600 test surface
@@ -339,6 +385,7 @@ Future<_ResultReader> _openEditor(
                       showNameAndKind: showNameAndKind,
                       initialName: initialName,
                       initialKind: initialKind,
+                      fetchObjectInfo: fetchObjectInfo,
                     ),
                   ),
                 );

@@ -195,6 +195,12 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
+    _seedAndRefresh();
+  }
+
+  Future<void> _seedAndRefresh() async {
+    await widget.connManager.seedDefaultConnectionsIfNeeded();
+    if (!mounted) return;
     _refresh();
   }
 
