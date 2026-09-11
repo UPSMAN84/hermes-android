@@ -1,6 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:hermes_android/core/services/async_generation_gate.dart';
-import 'package:hermes_android/core/services/call_route_policy.dart';
 import 'package:hermes_android/core/services/speech_recognition_coordinator.dart';
 import 'package:hermes_android/core/services/speech_retry_backoff.dart';
 import 'package:hermes_android/core/services/tts_url.dart';
@@ -53,55 +52,5 @@ void main() {
     expect(speechErrorNeedsBackoff('error_speech_timeout'), isFalse);
     expect(speechErrorNeedsBackoff('error_no_match'), isFalse);
     expect(speechErrorNeedsBackoff('error_client'), isTrue);
-  });
-
-  test('handset listening keeps native communication routing active', () {
-    expect(
-      callRouteForPhase(
-        phase: CallAudioPhase.listening,
-        bluetoothActive: false,
-        speakerOn: false,
-      ),
-      CallNativeRoute.handset,
-    );
-    expect(
-      callRouteForPhase(
-        phase: CallAudioPhase.speaking,
-        bluetoothActive: false,
-        speakerOn: false,
-      ),
-      CallNativeRoute.handset,
-    );
-  });
-
-  test('Bluetooth and speaker routes stay active while listening', () {
-    expect(
-      callRouteForPhase(
-        phase: CallAudioPhase.listening,
-        bluetoothActive: true,
-        speakerOn: false,
-      ),
-      CallNativeRoute.bluetooth,
-    );
-    expect(
-      callRouteForPhase(
-        phase: CallAudioPhase.listening,
-        bluetoothActive: false,
-        speakerOn: true,
-      ),
-      CallNativeRoute.speaker,
-    );
-  });
-
-  test('terminal status waits for final result or error before rearming', () {
-    expect(shouldRearmAfterSpeechStatus('done'), isFalse);
-    expect(shouldRearmAfterSpeechStatus('notListening'), isFalse);
-  });
-
-  test('call delegates audio focus to recognizer and player', () {
-    expect(
-      callAudioFocusStrategy(),
-      CallAudioFocusStrategy.platformComponents,
-    );
   });
 }

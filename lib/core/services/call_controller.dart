@@ -12,7 +12,6 @@ import 'package:speech_to_text/speech_recognition_result.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 
 import 'call_audio.dart';
-import 'call_route_policy.dart';
 import 'connection_manager.dart';
 import 'tts_provider.dart';
 import 'xtts_service.dart';
@@ -90,7 +89,6 @@ class CallController extends ChangeNotifier {
   /// `AudioManager.isSpeakerphoneOn` after `_applyCallAudio` so the UI matches
   /// the actual route on first render; updated by [toggleSpeaker].
   bool _speakerOn = true;
-  bool _bluetoothActive = false;
   bool get speakerOn => _speakerOn;
 
   String? _status;
@@ -101,7 +99,6 @@ class CallController extends ChangeNotifier {
   // Guards against a second native stopCallAudio: both hangUp() and dispose()
   // restore audio, and a normal exit runs both. Set on first teardown.
   bool _audioStopped = false;
-  bool _callAudioSessionActive = false;
   String _sttLocaleId = 'en-US';
   StreamCancelToken? _sendCancelToken;
 
@@ -172,11 +169,9 @@ class CallController extends ChangeNotifier {
       await CallAudio.stopCallAudio();
       return;
     }
-    if (callAudioFocusStrategy() == CallAudioFocusStrategy.manualCall) {
-      _audioFocusSubscription ??=
-          CallAudio.audioFocusChanges.listen(_onAudioFocusChange);
-      await CallAudio.requestAudioFocus();
-    }
+    _audioFocusSubscription ??=
+        CallAudio.audioFocusChanges.listen(_onAudioFocusChange);
+    await CallAudio.requestAudioFocus();
     if (!_lifecycle.isCurrent(lifecycle)) {
       await _audioFocusSubscription?.cancel();
       _audioFocusSubscription = null;
@@ -193,28 +188,20 @@ class CallController extends ChangeNotifier {
     _listen();
   }
 
-  /// Route mic + playback through a connected Bluetooth earpiece: ask native
-  /// AudioManager to enter call mode + open Bluetooth SCO, wait for SCO to
-  /// actually connect. The order matters — starting the recognizer before SCO
-  /// is up makes Android grab the phone mic and ignore the BT earpiece. We
-  /// intentionally do NOT push an audioplayers AudioContext here: the native
-  /// AudioManager already set MODE_IN_COMMUNICATION + routed to SCO, and a
-  /// competing AudioContextAndroid call from the Dart side would race the
-  /// Kotlin route and can flip speaker back on.
-  ///
-  /// On exit, native sets `isSpeakerphoneOn = false` (`MODE_IN_COMMUNICATION`).
-  /// We seed `_speakerOn` from the actual native state so the UI matches audio
-  /// routing on first render — toggling works the same regardless.
+  /// Enter MODE_IN_COMMUNICATION and seed the speaker state from the native
+  /// side. The platform handles device routing automatically (Bluetooth,
+  /// handset, or speaker) — we never force a specific route, because on
+  /// Samsung OneUI explicit setCommunicationDevice() calls trigger an AppOps
+  /// UID attribution bug inside com.android.phone that throws
+  /// SecurityException and destabilizes the telephony stack.
   Future<void> _applyCallAudio() async {
-    final scoOn = await CallAudio.startCallAudio();
-    _callAudioSessionActive = true;
-    _bluetoothActive = scoOn;
-    debugPrint('[Call] SCO ready: $scoOn');
+    await CallAudio.startCallAudio();
+    debugPrint('[Call] MODE_IN_COMMUNICATION active');
     final speakerState = await CallAudio.setSpeakerphone(enabled: false);
     if (speakerState != null) _speakerOn = speakerState;
   }
 
-  /// Undo [_applyCallAudio]: stop SCO, return to normal mode + media playback.
+  /// Undo [_applyCallAudio]: restore MODE_NORMAL + media playback.
   /// Idempotent — a second call (hangUp then dispose) is a no-op.
   Future<void> _restoreAudio() async {
     if (_audioStopped) return;
@@ -223,7 +210,6 @@ class CallController extends ChangeNotifier {
     _audioFocusSubscription = null;
     await CallAudio.abandonAudioFocus();
     await CallAudio.stopCallAudio();
-    _callAudioSessionActive = false;
     try {
       await AudioPlayer.global.setAudioContext(
         AudioContext(
@@ -231,31 +217,6 @@ class CallController extends ChangeNotifier {
         ),
       );
     } catch (_) {}
-  }
-
-  Future<void> _prepareAudioPhase(CallAudioPhase phase) async {
-    final route = callRouteForPhase(
-      phase: phase,
-      bluetoothActive: _bluetoothActive,
-      speakerOn: _speakerOn,
-    );
-    switch (route) {
-      case CallNativeRoute.released:
-        break;
-      case CallNativeRoute.handset:
-        if (!_callAudioSessionActive) {
-          _bluetoothActive = await CallAudio.startCallAudio();
-          _callAudioSessionActive = true;
-          if (!_bluetoothActive) {
-            await CallAudio.setSpeakerphone(enabled: false);
-          }
-        }
-        break;
-      case CallNativeRoute.speaker:
-        break;
-      case CallNativeRoute.bluetooth:
-        break;
-    }
   }
 
   Future<void> _onAudioFocusChange(int change) async {
@@ -364,11 +325,6 @@ class CallController extends ChangeNotifier {
       return;
     }
     _listenStarting = true;
-    // Audio route is set once by _applyCallAudio at call start. Re-routing
-    // before every listen via _prepareAudioPhase(listening) conflicts with
-    // the speech recognizer's mic access on some OEMs — the native route
-    // change briefly resets the mic stream, causing listen() to silently
-    // fail to activate it. Chat mode (which works) never re-routes.
     if (!_active || _muted) {
       _listenStarting = false;
       return;
@@ -405,10 +361,6 @@ class CallController extends ChangeNotifier {
         // mic to cycle on/off as _scheduleListen retries against a dead
         // session. Chat mode (which works) sets this to true.
         cancelOnError: true,
-        // onDevice removed: forces createOnDeviceSpeechRecognizer which
-        // silently fails to activate the mic on devices without an offline
-        // model installed. Chat mode (which works) doesn't use this flag.
-        // The cloud recognizer adds a brief beep but reliably captures voice.
       ),
       );
     } catch (e) {
@@ -487,13 +439,6 @@ class CallController extends ChangeNotifier {
       if (!speaking) {
         speaking = true;
         _setState(CallState.speaking);
-        // Route audio for playback before the first chunk is synthesized.
-        // Without this, TTS plays through whatever route was last active
-        // (often handset earpiece), and the subsequent _listenNow call to
-        // _prepareAudioPhase(listening) re-routes back — on some OEMs that
-        // triggers a brief SCO reconnect cycle that drops and re-opens the
-        // mic, producing the rapid on/off flicker.
-        unawaited(_prepareAudioPhase(CallAudioPhase.speaking));
       }
       for (final chunk in chunks) {
         _speechQueue.enqueue(chunk);
@@ -665,7 +610,8 @@ class CallController extends ChangeNotifier {
       });
     } else {
       await _listen();
-    }  }
+    }
+  }
 
   Future<void> toggleSpeaker() async {
     // No-op once the call has ended: flipping isSpeakerphoneOn in MODE_NORMAL

@@ -13,6 +13,3 @@ class SpeechRetryBackoff {
 bool speechErrorNeedsBackoff(String errorMsg) =>
     errorMsg != 'error_speech_timeout' && errorMsg != 'error_no_match';
 
-// Android can emit done/notListening before its final result or error. Rearm
-// only from those result/error callbacks or a new listen races the recognizer.
-bool shouldRearmAfterSpeechStatus(String status) => false;
