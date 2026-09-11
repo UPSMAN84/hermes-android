@@ -333,6 +333,15 @@ class CallController extends ChangeNotifier {
     // session before starting a new one so the mic actually activates.
     if (_speech.isListening) {
       debugPrint('[Call] phantom listen detected — forcing stop before re-listen');
+      // Bump epoch BEFORE stopping so the terminal status (done/notListening)
+      // that stop() emits is invalidated by the epoch guard in _onSpeechStatus
+      // and _onResult. Without this, the watchdog sees a valid terminal status
+      // from the force-stopped session and schedules another _listen(), which
+      // force-stops again — an infinite listen→stop→watchdog→listen cycle that
+      // never lets a genuine final result reach _send.
+      ++_listenEpoch;
+      _statusWatchdogTimer?.cancel();
+      _statusWatchdogTimer = null;
       try {
         await _speech.stop();
       } catch (_) {}
@@ -557,6 +566,17 @@ class CallController extends ChangeNotifier {
         _active &&
         !_muted &&
         _state == CallState.listening) {
+      // Some recognizers (especially on-device / SODA) deliver the final
+      // transcript via partial results but never emit a separate finalResult
+      // callback before the terminal status. If we have accumulated text,
+      // treat the terminal status as an implicit final and send now rather
+      // than waiting for a callback that will never arrive.
+      if (_lastTranscript.isNotEmpty) {
+        final toSend = _lastTranscript;
+        _lastTranscript = '';
+        _send(toSend);
+        return;
+      }
       // shouldRearmAfterSpeechStatus is permanently false: rearming
       // immediately off this status raced _onResult/_onSpeechError, which
       // fire for the same session. But if a session ends with truly empty
