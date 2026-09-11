@@ -217,6 +217,10 @@ class MainActivity : FlutterActivity() {
         }
 
         if (!am.setCommunicationDevice(selected)) {
+            android.util.Log.w(
+                "HermesAudio",
+                "setCommunicationDevice failed for type=${selected.type} id=${selected.id}",
+            )
             result.success(false)
             return
         }

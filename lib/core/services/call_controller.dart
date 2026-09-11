@@ -326,7 +326,26 @@ class CallController extends ChangeNotifier {
 
   Future<void> _listenNow() async {
     if (!_active || _muted || !_speechAvailable || _listenStarting) return;
-    if (_speech.isListening) return;
+    // Under MODE_IN_COMMUNICATION the recognizer can report isListening == true
+    // while capturing no audio and never emitting a terminal status — a phantom
+    // session that blocks all future listen attempts. Chat mode (which works)
+    // doesn't guard on isListening at all; instead we force-stop any stale
+    // session before starting a new one so the mic actually activates.
+    if (_speech.isListening) {
+      debugPrint('[Call] phantom listen detected — forcing stop before re-listen');
+      try {
+        await _speech.stop();
+      } catch (_) {}
+      // Yield to let the stop propagate through the native layer before
+      // re-entering listen(); without this the new listen races the old
+      // session's shutdown and can fail silently. Under MODE_IN_COMMUNICATION
+      // the audio stack needs significantly longer to release and re-acquire
+      // the mic than in normal mode — 100ms was enough for chat mode but
+      // produced phantom sessions here where isListening reported true while
+      // capturing no audio.
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      if (!_active || _muted) return;
+    }
     // Don't open the mic while TTS is still playing — we'd capture our own
     // reply and send it as the next turn. Also covers the gaps between queued
     // chunks of a streaming reply, where the player is briefly idle but the
@@ -336,11 +355,11 @@ class CallController extends ChangeNotifier {
       return;
     }
     _listenStarting = true;
-    try {
-      await _prepareAudioPhase(CallAudioPhase.listening);
-    } catch (e) {
-      debugPrint('[Call] listening route failed: $e');
-    }
+    // Audio route is set once by _applyCallAudio at call start. Re-routing
+    // before every listen via _prepareAudioPhase(listening) conflicts with
+    // the speech recognizer's mic access on some OEMs — the native route
+    // change briefly resets the mic stream, causing listen() to silently
+    // fail to activate it. Chat mode (which works) never re-routes.
     if (!_active || _muted) {
       _listenStarting = false;
       return;
@@ -359,11 +378,10 @@ class CallController extends ChangeNotifier {
       listenOptions: SpeechListenOptions(
         // 60s hard cap per turn so a stuck-open mic can't hang the call.
         listenFor: const Duration(seconds: 60),
-        // 1.5s end-of-turn silence. Maps to
-        // EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS — hard session
-        // close after this much silence, not an energy-VAD knob. This keeps
-        // call-mode replies responsive after the user stops talking.
-        pauseFor: const Duration(milliseconds: 1500),
+        // Match chat mode's 3s pause: shorter values caused the recognizer
+        // to close sessions prematurely on some devices, triggering rapid
+        // re-listen cycles. Chat mode (which works) uses 3s.
+        pauseFor: const Duration(seconds: 3),
         localeId: _sttLocaleId,
         listenMode: ListenMode.dictation,
         // Enable partial results so we see the running transcript as Android
@@ -373,12 +391,15 @@ class CallController extends ChangeNotifier {
         // truncated. With partials on we get intermediate results that
         // include those trailing words before the session closes.
         partialResults: true,
-        // Use the on-device recognizer when available (Android 12+). This
-        // routes through createOnDeviceSpeechRecognizer + EXTRA_PREFER_OFFLINE
-        // — sidesteps the network recognizer's start/stop beep on devices
-        // that ship an offline model (most modern Pixels/Samsungs). Falls
-        // back to the cloud recognizer with a beep if no offline model.
-        onDevice: true,
+        // cancelOnError matches chat mode: without it, the recognizer stays
+        // in a broken state after an error and never recovers, causing the
+        // mic to cycle on/off as _scheduleListen retries against a dead
+        // session. Chat mode (which works) sets this to true.
+        cancelOnError: true,
+        // onDevice removed: forces createOnDeviceSpeechRecognizer which
+        // silently fails to activate the mic on devices without an offline
+        // model installed. Chat mode (which works) doesn't use this flag.
+        // The cloud recognizer adds a brief beep but reliably captures voice.
       ),
       );
     } catch (e) {
@@ -401,6 +422,7 @@ class CallController extends ChangeNotifier {
     if (!_active || _muted || epoch != _listenEpoch) return;
     final text = result.recognizedWords.trim();
     _speechRetryBackoff.reset();
+    _silentFailureCount = 0;
     _listenRetryNotBefore = DateTime.fromMillisecondsSinceEpoch(0);
     if (text.isNotEmpty) _lastTranscript = text;
     // partialResults: true → Android emits partials while speaking AND a final
@@ -509,11 +531,16 @@ class CallController extends ChangeNotifier {
     );
   }
 
-  // Grace period after a terminal status (done/notListening) with no result
-  // or error yet, before the watchdog below force-rearms. Real
-  // results/errors normally follow a terminal status within tens of
-  // milliseconds; this is generous headroom, not a tuned deadline.
-  static const _statusWatchdogGrace = Duration(milliseconds: 1200);
+  // Base grace period after a terminal status (done/notListening) with no
+  // result or error yet. Real results/errors normally follow within tens of
+  // milliseconds; this is the floor for the first watchdog re-arm. Subsequent
+  // silent failures back off exponentially from this base.
+  static const _statusWatchdogBaseGraceMs = 1200;
+
+  // Tracks consecutive silent failures (watchdog re-arms with no result or
+  // error) so we can back off instead of spinning at a fixed interval.
+  // Reset when a genuine result or error arrives.
+  int _silentFailureCount = 0;
 
   void _onSpeechStatus(String status) {
     debugPrint('[Call] speech status: $status (epoch $_listenEpoch)');
@@ -541,8 +568,16 @@ class CallController extends ChangeNotifier {
       // window, so it can't race a genuine result/error the way an
       // immediate rearm would.
       final epoch = _listenEpoch;
+      _silentFailureCount++;
       _statusWatchdogTimer?.cancel();
-      _statusWatchdogTimer = Timer(_statusWatchdogGrace, () {
+      // Back off on consecutive silent failures so a broken audio state
+      // doesn't spin the mic at a fixed 1.2s interval forever. Caps at ~8s
+      // to match the error-path backoff ceiling.
+      final backoffMs = 500 * (1 << (_silentFailureCount - 1).clamp(0, 4));
+      final grace = Duration(milliseconds: backoffMs > _statusWatchdogBaseGraceMs ? backoffMs : _statusWatchdogBaseGraceMs);
+      debugPrint('[Call] watchdog re-arm in ${grace.inMilliseconds}ms '
+          '(silent failure #$_silentFailureCount)');
+      _statusWatchdogTimer = Timer(grace, () {
         _statusWatchdogTimer = null;
         if (_active &&
             !_muted &&
@@ -576,6 +611,7 @@ class CallController extends ChangeNotifier {
     // old _listen() call when a fresh one started) must not schedule a
     // rearm on top of the session that's actually live.
     if (epoch != _listenEpoch) return;
+    _silentFailureCount = 0;
     if (_active && !_muted) {
       if (speechErrorNeedsBackoff(error.errorMsg)) {
         final delay = _speechRetryBackoff.recordFailure();
