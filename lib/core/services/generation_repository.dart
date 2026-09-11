@@ -857,23 +857,17 @@ final class DefaultGenerationRepository implements GenerationRepository {
       final content = message['content'];
       if (content is! String) continue;
       final messageId = message['id']?.toString();
-      for (final filename in ComfyUi.extractMediaFilenames(content)) {
-        final ComfyOutputRef ref;
-        try {
-          ref = ComfyOutputRef(filename: filename);
-        } on FormatException {
-          continue;
-        }
+      for (final ref in ComfyUi.extractMediaOutputs(content)) {
         final asset = MediaAsset(
           id: _newId('media'),
-          kind: ComfyUi.isVideo(filename)
+          kind: ComfyUi.isVideo(ref.filename)
               ? ComfyMediaKind.video
               : ComfyMediaKind.image,
           endpointSnapshot: endpointSnapshot,
           filename: ref.filename,
           subfolder: ref.subfolder,
           type: ref.type,
-          contentType: _classifyContentType(filename),
+          contentType: _classifyContentType(ref.filename),
           sourceSessionId: sessionId,
           sourceMessageId: messageId,
           createdAt: now,

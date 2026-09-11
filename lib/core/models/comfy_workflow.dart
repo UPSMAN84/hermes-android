@@ -82,7 +82,11 @@ final class ComfyOutputRef {
 
   Map<String, String> get query => {
     'filename': filename,
-    if (subfolder.isNotEmpty) 'subfolder': subfolder,
+    // Don't send subfolder when it matches type — Windows paths like
+    // \ComfyUI\output\name.png cause the regex to capture "output" as a
+    // subfolder, producing /view?subfolder=output which 404s because
+    // ComfyUI looks in output/output/name.png instead of output/name.png.
+    if (subfolder.isNotEmpty && subfolder != type) 'subfolder': subfolder,
     'type': type,
   };
 }

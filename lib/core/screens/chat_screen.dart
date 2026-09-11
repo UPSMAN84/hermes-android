@@ -635,7 +635,7 @@ class _ChatScreenState extends State<ChatScreen> {
           ? language.replaceAll('-', '_')
           : null;
 
-      _speechCoordinator.claim(
+      await _speechCoordinator.claim(
         _speechOwner,
         onStatus: _handleSpeechStatus,
         onError: _handleSpeechError,
@@ -713,7 +713,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     await _xtts.stop();
     if (!mounted) return;
-    _speechCoordinator.claim(
+    await _speechCoordinator.claim(
       _speechOwner,
       onStatus: _handleSpeechStatus,
       onError: _handleSpeechError,
@@ -953,24 +953,13 @@ class _ChatScreenState extends State<ChatScreen> {
     final chunk = _pendingTokens.toString();
     _pendingTokens.clear();
     if (!mounted) return;
-    // Stay pinned to the newest text as it arrives, but only if the view was
-    // already at the bottom -- scrolling up to re-read something must not be
-    // yanked back. _showScrollToBottom is exactly that "user has scrolled
-    // away" signal. jumpTo rather than animateTo: an animation restarted
-    // every flush fights itself and never settles.
-    final follow = !_showScrollToBottom;
     setState(() {
       if (_messages.isNotEmpty && _messages.last['role'] == 'assistant') {
         _messages.last['content'] =
             (_messages.last['content'] as String) + chunk;
       }
     });
-    if (follow) {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || !_scrollController.hasClients) return;
-        _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
-      });
-    }
+    // Auto-scroll removed: user controls scroll position manually.
   }
 
   Future<void> _scrollToBottom() =>
@@ -1054,26 +1043,29 @@ class _ChatScreenState extends State<ChatScreen> {
   // phone. A tool message's content never changes once set, and a refetch
   // builds new map objects, so caching per map object is both safe and
   // self-invalidating.
-  final Expando<List<String>> _mediaNamesCache = Expando<List<String>>();
+  final Expando<List<ComfyOutputRef>> _mediaOutputsCache =
+      Expando<List<ComfyOutputRef>>();
 
-  List<String> _mediaNamesIn(Map<String, dynamic> msg) {
-    final cached = _mediaNamesCache[msg];
+  List<ComfyOutputRef> _mediaOutputsIn(Map<String, dynamic> msg) {
+    final cached = _mediaOutputsCache[msg];
     if (cached != null) return cached;
-    final names = ComfyUi.extractMediaFilenames(
+    final outputs = ComfyUi.extractMediaOutputs(
       (msg['content'] as String?) ?? '',
     );
-    _mediaNamesCache[msg] = names;
-    return names;
+    _mediaOutputsCache[msg] = outputs;
+    return outputs;
   }
 
   /// All generated-media URLs currently derivable from a message list — the
-  /// same harvest the build() path uses (tool messages → filenames → view URL).
+  /// same harvest the build() path uses (tool messages → outputs → view URI).
+  /// Preserves subfolder so nested ComfyUI outputs don't 404.
   Set<String> _mediaUrlsIn(List<Map<String, dynamic>> messages) {
+    final endpoint = ComfyEndpoint.parse(_comfyBaseUrl);
     final urls = <String>{};
     for (final msg in messages) {
       if ((msg['role'] as String?) != 'tool') continue;
-      for (final name in _mediaNamesIn(msg)) {
-        urls.add(ComfyUi.viewUrl(_comfyBaseUrl, name));
+      for (final output in _mediaOutputsIn(msg)) {
+        urls.add(endpoint.viewUri(output).toString());
       }
     }
     return urls;
@@ -1147,7 +1139,7 @@ class _ChatScreenState extends State<ChatScreen> {
             if (!_liveMediaUrls.contains(url)) _liveMediaUrls.add(url);
           }
         });
-        WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+        // Auto-scroll removed: user controls scroll position manually.
         return;
       }
     }
@@ -1421,7 +1413,7 @@ class _ChatScreenState extends State<ChatScreen> {
       _liveMediaUrls.clear();
     });
 
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    // Auto-scroll removed: user controls scroll position manually.
 
     // Started here (not reactively on backgrounding) so there's no gap
     // between the app going to the background and the OS actually
@@ -1528,9 +1520,9 @@ class _ChatScreenState extends State<ChatScreen> {
               // wait on — just pace on a fixed delay instead.
               _scheduleAutoContinue();
             }
-            WidgetsBinding.instance.addPostFrameCallback(
-              (_) => _scrollToBottom(),
-            );
+            // Auto-scroll on stream completion removed: user controls
+            // scroll position manually. Previously this yanked the view
+            // to the bottom when streaming ended, fighting scroll-up.
           } catch (e) {
             if (!mounted) return;
             setState(() {
@@ -1732,7 +1724,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     });
 
-    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToBottom());
+    // Auto-scroll removed: user controls scroll position manually.
 
     if (done && (tool == 'image_generate' || tool == 'video_generate')) {
       // Newer servers emit hermes.tool.progress with the rendered filename
@@ -1742,10 +1734,23 @@ class _ChatScreenState extends State<ChatScreen> {
         // Proof this gateway reports rendered filenames mid-stream, so the
         // read-after-write polling can stay switched off from here on.
         _rememberMediaFilenameCapability();
-        final url = ComfyUi.viewUrl(_comfyBaseUrl, filename);
-        if (!_liveMediaUrls.contains(url)) {
-          _invalidateDisplayList();
-          setState(() => _liveMediaUrls.add(url));
+        final subfolder = progress['subfolder']?.toString() ?? '';
+        final type = progress['type']?.toString() ?? 'output';
+        try {
+          final output = ComfyOutputRef(
+            filename: filename,
+            subfolder: subfolder,
+            type: type,
+          );
+          final url = ComfyEndpoint.parse(_comfyBaseUrl)
+              .viewUri(output)
+              .toString();
+          if (!_liveMediaUrls.contains(url)) {
+            _invalidateDisplayList();
+            setState(() => _liveMediaUrls.add(url));
+          }
+        } on FormatException {
+          // Unsafe filename/subfolder — skip rather than building a broken URL.
         }
         return;
       }
@@ -2533,6 +2538,9 @@ class _ChatScreenState extends State<ChatScreen> {
           final role = (msg['role'] as String?) ?? 'assistant';
           final parsed = parseMessageContent(msg['content']);
           final isUser = role == 'user';
+          if (parsed.imageUrls.isNotEmpty) {
+            debugPrint('[ChatScreen] message imageUrls: ${parsed.imageUrls}');
+          }
 
           child = _MessageBubble(
             content: parsed.text,
@@ -2819,10 +2827,12 @@ class _ChatScreenState extends State<ChatScreen> {
     for (final msg in _messages) {
       final role = (msg['role'] as String?) ?? 'assistant';
       if (role == 'tool') {
-        // Harvest generated-image filenames from the raw tool content
-        // (memoized per message — see _mediaNamesIn).
-        for (final name in _mediaNamesIn(msg)) {
-          final url = ComfyUi.viewUrl(_comfyBaseUrl, name);
+        // Harvest generated-image outputs from the raw tool content
+        // (memoized per message — see _mediaOutputsIn). Preserves subfolder
+        // so nested ComfyUI outputs don't 404 on /view.
+        final endpoint = ComfyEndpoint.parse(_comfyBaseUrl);
+        for (final output in _mediaOutputsIn(msg)) {
+          final url = endpoint.viewUri(output).toString();
           if (seenImages.add(url)) groupImages.add(url);
         }
         if (toolQueue.isNotEmpty) {

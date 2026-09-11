@@ -12,7 +12,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 class ComfyUiPrefs {
   static const baseUrl = 'comfyui_base_url';
-  static const defaultBaseUrl = 'http://0.0.0.0:8188';
+  static const defaultBaseUrl = 'http://100.122.23.46:8188';
 
   /// Loads only a user-configured ComfyUI endpoint.
   ///
@@ -32,10 +32,13 @@ class ComfyUiPrefs {
 class ComfyUi {
   ComfyUi._();
 
-  /// A filename with an image or video extension, preceded by a path separator
-  /// (so we don't pick up `"src":"foo.png"`-style JSON noise).
+  /// Captures an optional subfolder and a required filename with a media
+  /// extension. The subfolder is the single directory component immediately
+  /// before the filename (e.g. `Blockshot/frame_00001_.png`). Paths like
+  /// `output/Blockshot/frame_00001_.png` match with subfolder=`Blockshot`.
+  /// Root-level files (`output/frame_00001_.png`) match with subfolder=`''`.
   static final RegExp _mediaPathRe = RegExp(
-    r'(?:[\\/:]|\n|\t)([A-Za-z0-9_\-]+\.(?:png|jpe?g|webp|mp4|webm|mkv|mov|gif))',
+    r'(?:[\\/:]|\n|\t)(?:([A-Za-z0-9_\-]+)[\\/])?([A-Za-z0-9_\-]+\.(?:png|jpe?g|webp|mp4|webm|mkv|mov|gif))',
     caseSensitive: false,
   );
 
@@ -72,14 +75,29 @@ class ComfyUi {
 
   /// Pulls media filenames out of a tool-result string (which often looks like
   /// `{"output":"...rendered: C:\\...\\output\\TG_00084_.png..."}`).
-  static List<String> extractMediaFilenames(String content) {
-    final names = <String>{};
-    for (final m in _mediaPathRe.allMatches(content.replaceAll(_escapeRe, '\n'))) {
-      final name = m.group(1);
-      if (name != null && name.isNotEmpty) names.add(name);
+  /// Extracts media output references from tool-result content, preserving
+  /// subfolder so `/view` URLs include `subfolder=` and don't 404 on nested
+  /// outputs (e.g. `Blockshot/frame_00001_.png`).
+  static List<ComfyOutputRef> extractMediaOutputs(String content) {
+    final refs = <ComfyOutputRef>{};
+    final normalized = content.replaceAll(_escapeRe, '\n');
+    for (final m in _mediaPathRe.allMatches(normalized)) {
+      final subfolder = m.group(1) ?? '';
+      final filename = m.group(2);
+      if (filename == null || filename.isEmpty) continue;
+      try {
+        refs.add(ComfyOutputRef(filename: filename, subfolder: subfolder));
+      } on FormatException {
+        // Skip unsafe filenames that fail ComfyOutputRef validation.
+      }
     }
-    return names.toList();
+    return refs.toList();
   }
+
+  /// Legacy wrapper — returns bare filenames for callers that haven't been
+  /// migrated to [extractMediaOutputs] yet. Prefer the Ref-returning version.
+  static List<String> extractMediaFilenames(String content) =>
+      extractMediaOutputs(content).map((r) => r.filename).toList();
 
   /// True if the filename has a video extension.
   static bool isVideo(String filename) => _videoExtRe.hasMatch(filename);

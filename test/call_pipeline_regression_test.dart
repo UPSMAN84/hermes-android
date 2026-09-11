@@ -55,14 +55,14 @@ void main() {
     expect(speechErrorNeedsBackoff('error_client'), isTrue);
   });
 
-  test('handset listening releases native communication routing', () {
+  test('handset listening keeps native communication routing active', () {
     expect(
       callRouteForPhase(
         phase: CallAudioPhase.listening,
         bluetoothActive: false,
         speakerOn: false,
       ),
-      CallNativeRoute.released,
+      CallNativeRoute.handset,
     );
     expect(
       callRouteForPhase(

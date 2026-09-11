@@ -14,7 +14,8 @@ CallNativeRoute callRouteForPhase({
 }) {
   if (bluetoothActive) return CallNativeRoute.bluetooth;
   if (speakerOn) return CallNativeRoute.speaker;
-  return phase == CallAudioPhase.listening
-      ? CallNativeRoute.released
-      : CallNativeRoute.handset;
+  // Keep MODE_IN_COMMUNICATION active for both recognition and playback.
+  // Releasing it between turns resets the microphone/audio route and can make
+  // Android emit a recognizer transition sound.
+  return CallNativeRoute.handset;
 }
