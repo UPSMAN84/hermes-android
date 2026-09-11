@@ -456,6 +456,13 @@ class CallController extends ChangeNotifier {
       if (!speaking) {
         speaking = true;
         _setState(CallState.speaking);
+        // Route audio for playback before the first chunk is synthesized.
+        // Without this, TTS plays through whatever route was last active
+        // (often handset earpiece), and the subsequent _listenNow call to
+        // _prepareAudioPhase(listening) re-routes back — on some OEMs that
+        // triggers a brief SCO reconnect cycle that drops and re-opens the
+        // mic, producing the rapid on/off flicker.
+        unawaited(_prepareAudioPhase(CallAudioPhase.speaking));
       }
       for (final chunk in chunks) {
         _speechQueue.enqueue(chunk);
@@ -591,9 +598,13 @@ class CallController extends ChangeNotifier {
     if (muted) {
       _listenRetryTimer?.cancel();
       _listenRetryTimer = null;
+      // cancel(), not stop(): speech_to_text's stop() delivers one more final
+      // result asynchronously after returning, which races the epoch bump
+      // above and can leak a stale transcript into the gateway. cancel()
+      // guarantees no further results, matching the mute contract.
       await _queueSpeechTransition(() async {
         try {
-          await _speech.stop();
+          await _speech.cancel();
         } catch (_) {}
       });
     } else {
